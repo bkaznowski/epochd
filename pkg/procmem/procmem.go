@@ -53,6 +53,14 @@ func (t *Tracer) FollowChild(pid int) error {
 			err = fmt.Errorf("procmem: wait for ptrace child %d: %w", pid, e)
 			return
 		}
+		if !ws.Stopped() {
+			if ws.Exited() {
+				err = fmt.Errorf("procmem: ptrace child %d exited (code %d) before stopping; check exec permissions and ptrace_scope", pid, ws.ExitStatus())
+			} else {
+				err = fmt.Errorf("procmem: ptrace child %d did not stop as expected (status 0x%08x)", pid, uint32(ws))
+			}
+			return
+		}
 		t.pid = pid
 	})
 	return err

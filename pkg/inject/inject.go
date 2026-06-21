@@ -60,7 +60,7 @@ func inject(pid int, initialOffsetSec, initialOffsetNsec int64) (*Handle, error)
 	if err := tr.Attach(pid); err != nil {
 		return nil, fmt.Errorf("inject: Attach pid %d: %w", pid, err)
 	}
-	defer tr.Detach()
+	defer tr.Detach() //nolint:errcheck
 	return injectWithTracer(tr, pid, info.ClockGettimeAddr, initialOffsetSec, initialOffsetNsec)
 }
 
@@ -265,8 +265,8 @@ func remoteMmap(tr *procmem.Tracer, pid int, patchAddr, fixedAddr uintptr) (uint
 	restored := false
 	defer func() {
 		if !restored {
-			tr.PokeText(patchAddr, origBytes)
-			tr.SetRegs(origRegs)
+			tr.PokeText(patchAddr, origBytes) //nolint:errcheck
+			tr.SetRegs(origRegs)              //nolint:errcheck
 		}
 	}()
 

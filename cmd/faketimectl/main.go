@@ -70,7 +70,7 @@ func main() {
 	if *reset {
 		fmt.Printf("pid %d: clock reset to real time (state=0x%x)\n", h.PID, h.StateAddr)
 	} else {
-		offsetFromNow := target.Sub(time.Now()).Round(time.Second)
+		offsetFromNow := time.Until(target).Round(time.Second)
 		fmt.Printf("pid %d: clock set to %s (%+v from now, state=0x%x)\n",
 			h.PID, target.Format(time.RFC3339), offsetFromNow, h.StateAddr)
 	}

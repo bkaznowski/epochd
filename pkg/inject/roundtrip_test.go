@@ -83,7 +83,7 @@ func TestInjectRoundTrip(t *testing.T) {
 		if !ok {
 			continue
 		}
-		diff := ts.Sub(time.Now())
+		diff := time.Until(ts)
 		if diff < fakeOffset-tolerance || diff > fakeOffset+tolerance {
 			t.Errorf("phase A: printed time %v is %.3f h from now, want ~%.1f h",
 				ts, diff.Hours(), fakeOffset.Hours())
