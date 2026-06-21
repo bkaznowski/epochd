@@ -54,13 +54,18 @@ func (h *Handle) SetTime(target time.Time) error {
 // before exec and is stopped on its initial SIGTRAP; this function collects
 // that stop without issuing PTRACE_ATTACH. No elevated permissions required.
 func InjectAtTimeFollowChild(pid int, target time.Time) (*Handle, error) {
-	info, err := vdso.Locate(pid)
-	if err != nil {
-		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
-	}
 	tr := procmem.NewTracer()
+	// Wait for the child's exec-entry SIGTRAP before reading maps. There is a
+	// race between cmd.Start() returning and the child completing execve; reading
+	// /proc/<pid>/maps before the exec-stop may catch the address space mid-
+	// replacement, where [vdso] is not yet visible.
 	if err := tr.FollowChild(pid); err != nil {
 		return nil, fmt.Errorf("inject: FollowChild pid %d: %w", pid, err)
+	}
+	info, err := vdso.Locate(pid)
+	if err != nil {
+		tr.Detach() //nolint:errcheck
+		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
 	}
 	defer tr.Detach() //nolint:errcheck
 	sec, nsec := diffSecNsec(target, time.Now())
