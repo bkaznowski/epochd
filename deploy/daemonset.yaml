@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: epochd-agent
+  namespace: epochd
+  labels:
+    app: epochd-agent
+spec:
+  selector:
+    matchLabels:
+      app: epochd-agent
+  template:
+    metadata:
+      labels:
+        app: epochd-agent
+    spec:
+      # Share the host PID namespace so the agent can see all container PIDs
+      # via /proc and attach to them with ptrace.
+      hostPID: true
+      # Bind to the node's network so the controller can reach the agent
+      # at nodeIP:9100 (hostIP from pod.Status.HostIP).
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      tolerations:
+        - operator: Exists  # run on every node including control-plane
+
+      containers:
+        - name: agent
+          image: ghcr.io/bkaznowski/epochd-agent:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--listen=:9100"]
+          ports:
+            - name: grpc
+              containerPort: 9100
+              hostPort: 9100
+              protocol: TCP
+          securityContext:
+            # privileged gives CAP_SYS_PTRACE + CAP_SYS_ADMIN required for
+            # ptrace-attach across PID namespaces and process_vm_writev.
+            privileged: true
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"

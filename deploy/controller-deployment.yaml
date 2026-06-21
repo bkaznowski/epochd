@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: epochd-controller
+  namespace: epochd
+  labels:
+    app: epochd-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: epochd-controller
+  template:
+    metadata:
+      labels:
+        app: epochd-controller
+    spec:
+      serviceAccountName: epochd-controller
+
+      containers:
+        - name: controller
+          image: ghcr.io/bkaznowski/epochd-controller:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--listen=:8080"
+            - "--agent-port=9100"
+            - "--sweep-interval=30s"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: epochd-controller
+  namespace: epochd
+spec:
+  selector:
+    app: epochd-controller
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP

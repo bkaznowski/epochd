@@ -1,0 +1,22 @@
+# Binaries
+/agent
+/controller
+/faketimectl
+*.exe
+*.test
+*.out
+
+# Build artefacts
+/tmp/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Test cache (go test -count=1 bypasses this anyway)
+/testcache/

@@ -1,0 +1,20 @@
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+
+linters-settings:
+  errcheck:
+    # These are intentional fire-and-forget writes where the error genuinely
+    # cannot be handled (response already committed, or test output).
+    exclude-functions:
+      - (net/http.ResponseWriter).Write
+      - (*encoding/json.Encoder).Encode
+
+issues:
+  exclude-rules:
+    # Test files can use assert-style helpers that return errors we don't act on.
+    - path: _test\.go
+      linters: [errcheck]

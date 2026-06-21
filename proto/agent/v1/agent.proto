@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package epochd.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "epochd/pkg/agentpb";
+
+// AgentService is the gRPC API exposed by the node agent.
+// The controller calls it; the agent implements it.
+service AgentService {
+  // Inject installs the vDSO clock hook in a container and sets its initial
+  // fake time. Returns a handle ID used for all subsequent calls.
+  rpc Inject(InjectRequest) returns (InjectResponse);
+
+  // SetTime updates the fake time on an already-injected process via a single
+  // process_vm_writev — the target process is never stopped.
+  rpc SetTime(SetTimeRequest) returns (SetTimeResponse);
+
+  // Reset snaps the target back to the real clock (equivalent to SetTime(now)).
+  // The handle remains valid; SetTime can be called again after Reset.
+  rpc Reset(ResetRequest) returns (ResetResponse);
+
+  // Status returns the last target time and trampoline generation counter.
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message InjectRequest {
+  // container_id may include a runtime prefix, e.g. "containerd://abc123..."
+  // or be a bare 64-hex-char container ID.
+  string container_id = 1;
+
+  // target_time is the absolute fake wall-clock time to set. The agent
+  // converts this to an offset from time.Now() right before writing it into
+  // the trampoline's state struct.
+  google.protobuf.Timestamp target_time = 2;
+}
+
+message InjectResponse {
+  string handle_id = 1;
+}
+
+message SetTimeRequest {
+  string handle_id = 1;
+  google.protobuf.Timestamp target_time = 2;
+}
+
+message SetTimeResponse {}
+
+message ResetRequest {
+  string handle_id = 1;
+}
+
+message ResetResponse {}
+
+message StatusRequest {
+  string handle_id = 1;
+}
+
+message StatusResponse {
+  string handle_id              = 1;
+  google.protobuf.Timestamp last_target_time = 2;  // last time passed to Inject or SetTime
+  string state_addr             = 3;  // hex, e.g. "0x7ffd1234abcd" — for debugging
+  uint32 generation             = 4;  // bumped on each SetTime; 0 after Inject
+  int32  pid                    = 5;  // host PID of the injected process
+}
