@@ -1,9 +1,9 @@
-# epochd — implementation context (current phase: 18)
+# epochd — implementation context (current phase: 19)
 
 This file is a dense reference for an agent or developer continuing the project. It
-captures the state of the codebase after phases 0–18, the exact APIs that exist, every
-non-obvious decision that was made and why, and discovered gotchas. Phase 19
-(Prometheus metrics) is the next unstarted phase.
+captures the state of the codebase after phases 0–19, the exact APIs that exist, every
+non-obvious decision that was made and why, and discovered gotchas. All planned phases
+are complete; see `FUTURE.md` for longer-horizon improvements.
 
 ---
 
@@ -271,6 +271,7 @@ injection target with `faketimectl`. The inject tests use an in-binary helper in
 | `cmd/controller` | 8 | HTTP+JSON API: timeshifts CRUD, TTL sweeper, pod watcher |
 | `deploy/` | 9 | `rbac.yaml`, `daemonset.yaml`, `controller-deployment.yaml` |
 | `e2e/` | 15 | `//go:build e2e` end-to-end test (`TestTimeshiftDate`) |
+| metrics wiring | 19 | `cmd/controller/metrics.go`: Prometheus registry, 5 metrics; `/metrics` route via `promhttp`; per-route `track` middleware |
 
 ---
 
@@ -587,8 +588,9 @@ epochd/
 │   ├── agent/main.go                          # ✅ gRPC daemon: Inject/SetTime/Reset + handle map
 │   └── controller/
 │       ├── main.go                            # ✅ flags, k8s client, agent pool, HTTP server
-│       ├── controller.go                      # ✅ timeshift registry, CRUD, sweeper, re-injection
-│       ├── handlers.go                        # ✅ HTTP routes (/timeshifts, /healthz)
+│       ├── controller.go                      # ✅ timeshift registry, CRUD, sweeper, re-injection, metric increments
+│       ├── metrics.go                         # ✅ Prometheus registry + 5 metrics (gauge, counters)
+│       ├── handlers.go                        # ✅ HTTP routes (/timeshifts, /healthz, /metrics), track middleware
 │       ├── watcher.go                         # ✅ SharedInformer pod watcher (phase 18b)
 │       └── controller_test.go                 # ✅ unit tests for all controller logic
 │

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -657,6 +658,97 @@ func TestPodWatcherSkipsAlreadyHandled(t *testing.T) {
 	ctrl.mu.RUnlock()
 	if handleCount != 1 {
 		t.Errorf("handle count = %d, want 1 (no duplicates)", handleCount)
+	}
+}
+
+// TestMetrics verifies that the /metrics endpoint is wired up and reflects
+// real controller activity: inject counters, the active-timeshifts gauge, and
+// the HTTP request counter are all exercised by a create+delete cycle.
+func TestMetrics(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+	mux := ctrl.routes()
+
+	// Create a timeshift — increments inject counter and active gauge.
+	w := doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace:     "default",
+		LabelSelector: "app=web-1",
+		Time:          time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+		TTL:           "1h",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: got %d; body: %s", w.Code, w.Body.String())
+	}
+	var created api.TimeshiftResponse
+	decodeResponse(t, w, &created)
+
+	// Delete it — decrements active gauge.
+	w = doRequest(t, mux, http.MethodDelete, "/timeshifts/"+created.ID, nil)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("delete: got %d; body: %s", w.Code, w.Body.String())
+	}
+
+	// Fetch /metrics and verify key lines are present.
+	w = doRequest(t, mux, http.MethodGet, "/metrics", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("metrics: got %d; body: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+
+	checks := []string{
+		// Active gauge should be 0 after create+delete.
+		"epochd_timeshifts_active 0",
+		// Inject counter was incremented on create.
+		`epochd_inject_total{result="success"}`,
+		// API request counter recorded the POST /timeshifts → 201.
+		`epochd_api_requests_total{method="POST",path="/timeshifts",status="201"}`,
+		// API request counter recorded the DELETE /timeshifts/{id} → 204.
+		`epochd_api_requests_total{method="DELETE",path="/timeshifts/{id}",status="204"}`,
+	}
+	for _, want := range checks {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics missing %q\nbody:\n%s", want, body)
+		}
+	}
+}
+
+// TestSweepMetrics verifies that sweepExpired increments the sweep counter and
+// decrements the active gauge.
+func TestSweepMetrics(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+	mux := ctrl.routes()
+
+	w := doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace:     "default",
+		LabelSelector: "app=web-1",
+		Time:          time.Now().Add(time.Hour).Format(time.RFC3339),
+		TTL:           "1ms",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: got %d; body: %s", w.Code, w.Body.String())
+	}
+	var created api.TimeshiftResponse
+	decodeResponse(t, w, &created)
+
+	// Backdate expiresAt so it looks expired, then sweep.
+	ctrl.mu.Lock()
+	ctrl.timeshifts[created.ID].expiresAt = time.Now().Add(-time.Second)
+	ctrl.mu.Unlock()
+	ctrl.sweepExpired(context.Background())
+
+	w = doRequest(t, mux, http.MethodGet, "/metrics", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("metrics: got %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"epochd_timeshifts_active 0",
+		"epochd_sweep_expired_total 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics missing %q\nbody:\n%s", want, body)
+		}
 	}
 }
 

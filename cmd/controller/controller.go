@@ -76,17 +76,19 @@ func (s *timeshift) toResponse() api.TimeshiftResponse {
 
 // controller is the HTTP server's state.
 type controller struct {
-	k8s    kubernetes.Interface
-	agents AgentPool
-	mu     sync.RWMutex
-	timeshifts  map[string]*timeshift
+	k8s        kubernetes.Interface
+	agents     AgentPool
+	mu         sync.RWMutex
+	timeshifts map[string]*timeshift
+	met        *metrics
 }
 
 func newController(k8s kubernetes.Interface, agents AgentPool) *controller {
 	return &controller{
-		k8s:    k8s,
-		agents: agents,
-		timeshifts:  make(map[string]*timeshift),
+		k8s:        k8s,
+		agents:     agents,
+		timeshifts: make(map[string]*timeshift),
+		met:        newMetrics(),
 	}
 }
 
@@ -129,6 +131,8 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 	c.timeshifts[s.id] = s
 	c.mu.Unlock()
 
+	c.met.timeshiftsActive.Inc()
+
 	ttlStr := "none"
 	if ttl > 0 {
 		ttlStr = ttl.String()
@@ -152,8 +156,10 @@ func (c *controller) injectPod(ctx context.Context, pod *corev1.Pod, target time
 		if err != nil {
 			log.Printf("controller: inject pod=%s/%s container=%s: %v",
 				pod.Namespace, pod.Name, cs.Name, err)
+			c.met.injectTotal.WithLabelValues("error").Inc()
 			continue
 		}
+		c.met.injectTotal.WithLabelValues("success").Inc()
 		out = append(out, containerHandle{
 			pod:         pod.Name,
 			container:   cs.Name,
@@ -218,19 +224,24 @@ func (c *controller) updateTimeshift(ctx context.Context, id string, target time
 
 	for i, h := range handles {
 		if err := c.agents.SetTime(ctx, h.nodeIP, h.agentHandle, target); err == nil {
+			c.met.setTimeTotal.WithLabelValues("success").Inc()
 			continue
 		} else if !isAgentNotFound(err) {
 			log.Printf("controller: SetTime timeshift=%s handle=%s: %v", id[:8], h.agentHandle, err)
+			c.met.setTimeTotal.WithLabelValues("error").Inc()
 			continue
 		}
 		// Agent restarted — re-inject the container then retry.
+		c.met.setTimeTotal.WithLabelValues("error").Inc()
 		log.Printf("controller: handle %s not found on agent; re-injecting container %s",
 			h.agentHandle, h.containerID)
 		newHandle, injErr := c.agents.Inject(ctx, h.nodeIP, h.containerID, target)
 		if injErr != nil {
 			log.Printf("controller: re-inject container=%s: %v", h.containerID, injErr)
+			c.met.injectTotal.WithLabelValues("error").Inc()
 			continue
 		}
+		c.met.injectTotal.WithLabelValues("success").Inc()
 		updates = append(updates, update{i, newHandle})
 	}
 
@@ -256,6 +267,7 @@ func (c *controller) deleteTimeshift(ctx context.Context, id string) error {
 	if s == nil {
 		return &notFoundError{fmt.Sprintf("timeshift %q not found", id)}
 	}
+	c.met.timeshiftsActive.Dec()
 	c.resetHandles(ctx, s)
 	log.Printf("controller: deleted timeshift %s", id[:8])
 	return nil
@@ -309,6 +321,8 @@ func (c *controller) sweepExpired(ctx context.Context) {
 	for _, s := range expired {
 		log.Printf("controller: expiring timeshift %s (TTL exceeded by %v)",
 			s.id[:8], now.Sub(s.expiresAt).Round(time.Millisecond))
+		c.met.sweepExpiredTotal.Inc()
+		c.met.timeshiftsActive.Dec()
 		c.resetHandles(ctx, s)
 	}
 }

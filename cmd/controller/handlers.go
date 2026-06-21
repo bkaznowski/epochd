@@ -4,20 +4,53 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"epochd/pkg/api"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func (c *controller) routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /timeshifts", c.handleListTimeshifts)
-	mux.HandleFunc("POST /timeshifts", c.handleCreateTimeshift)
-	mux.HandleFunc("GET /timeshifts/{id}", c.handleGetTimeshift)
-	mux.HandleFunc("PATCH /timeshifts/{id}", c.handleUpdateTimeshift)
-	mux.HandleFunc("DELETE /timeshifts/{id}", c.handleDeleteTimeshift)
+	mux.Handle("GET /metrics", promhttp.HandlerFor(c.met.registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc("GET /healthz", c.track("GET", "/healthz", handleHealthz))
+	mux.HandleFunc("GET /timeshifts", c.track("GET", "/timeshifts", c.handleListTimeshifts))
+	mux.HandleFunc("POST /timeshifts", c.track("POST", "/timeshifts", c.handleCreateTimeshift))
+	mux.HandleFunc("GET /timeshifts/{id}", c.track("GET", "/timeshifts/{id}", c.handleGetTimeshift))
+	mux.HandleFunc("PATCH /timeshifts/{id}", c.track("PATCH", "/timeshifts/{id}", c.handleUpdateTimeshift))
+	mux.HandleFunc("DELETE /timeshifts/{id}", c.track("DELETE", "/timeshifts/{id}", c.handleDeleteTimeshift))
 	return mux
+}
+
+// statusRecorder captures the HTTP status code written by a handler.
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	if sr.code == 0 {
+		sr.code = code
+	}
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) statusCode() int {
+	if sr.code == 0 {
+		return http.StatusOK
+	}
+	return sr.code
+}
+
+// track wraps h, recording each request in the apiRequestsTotal counter.
+func (c *controller) track(method, path string, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sr := &statusRecorder{ResponseWriter: w}
+		h(sr, r)
+		c.met.apiRequestsTotal.WithLabelValues(method, path, strconv.Itoa(sr.statusCode())).Inc()
+	}
 }
 
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {

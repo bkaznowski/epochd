@@ -502,7 +502,7 @@ as closures over a channel and executed on that pinned thread.
 | 16 | List timeshifts (`GET /timeshifts`) | ✅ |
 | 17 | Health endpoint + `WithTimeT` SDK helper | ✅ |
 | 18 | Handle recovery (pod/agent restarts) | ✅ |
-| 19 | Prometheus metrics | 🔲 |
+| 19 | Prometheus metrics | ✅ |
 
 See `plan.md` for the detailed specification of all phases.
 See `FUTURE.md` for longer-horizon improvements (auth, multi-arch, Helm, HA).

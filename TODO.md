@@ -42,7 +42,7 @@ Things that require your input or manual action before the project is fully read
 - [x] **Phase 16 — List timeshifts** (`GET /timeshifts`, `ListTimeshifts` in SDK)
 - [x] **Phase 17 — Health endpoint + `WithTimeT`** (`/healthz`, ergonomic test helper)
 - [x] **Phase 18 — Handle recovery** (re-inject on agent restart; pod watcher for container restarts)
-- [ ] **Phase 19 — Prometheus metrics** (active timeshifts, inject/settime counters, sweep events)
+- [x] **Phase 19 — Prometheus metrics** (active timeshifts, inject/settime counters, sweep events)
 
 ---
 
