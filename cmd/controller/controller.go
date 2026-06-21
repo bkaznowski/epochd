@@ -160,6 +160,25 @@ func (c *controller) injectPod(ctx context.Context, pod *corev1.Pod, target time
 	return out
 }
 
+// listTimeshifts returns all active timeshifts sorted oldest-first.
+func (c *controller) listTimeshifts() []api.TimeshiftResponse {
+	c.mu.RLock()
+	out := make([]*timeshift, 0, len(c.timeshifts))
+	for _, s := range c.timeshifts {
+		out = append(out, s)
+	}
+	c.mu.RUnlock()
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].createdAt.Before(out[j].createdAt)
+	})
+	responses := make([]api.TimeshiftResponse, len(out))
+	for i, s := range out {
+		responses[i] = s.toResponse()
+	}
+	return responses
+}
+
 // getTimeshift returns the timeshift for id, or errNotFound.
 func (c *controller) getTimeshift(id string) (*timeshift, error) {
 	c.mu.RLock()

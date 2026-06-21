@@ -448,6 +448,85 @@ func TestHTTPCreateTimeshiftInvalidTTL(t *testing.T) {
 	}
 }
 
+// TestListTimeshifts verifies that listTimeshifts returns all active entries
+// sorted oldest-first.
+func TestListTimeshifts(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+
+	// Empty to start.
+	if got := ctrl.listTimeshifts(); len(got) != 0 {
+		t.Fatalf("expected empty list, got %d entries", len(got))
+	}
+
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	s1, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour)
+	if err != nil {
+		t.Fatalf("createTimeshift 1: %v", err)
+	}
+	// Ensure distinct createdAt values.
+	time.Sleep(time.Millisecond)
+	s2, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target.Add(time.Hour), 0)
+	if err != nil {
+		t.Fatalf("createTimeshift 2: %v", err)
+	}
+
+	list := ctrl.listTimeshifts()
+	if len(list) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(list))
+	}
+	// Oldest first.
+	if list[0].ID != s1.id {
+		t.Errorf("expected first entry to be s1 (%s), got %s", s1.id[:8], list[0].ID[:8])
+	}
+	if list[1].ID != s2.id {
+		t.Errorf("expected second entry to be s2 (%s), got %s", s2.id[:8], list[1].ID[:8])
+	}
+	// s1 has TTL → ExpiresAt present; s2 has no TTL → ExpiresAt absent.
+	if list[0].ExpiresAt == "" {
+		t.Error("s1 should have ExpiresAt set")
+	}
+	if list[1].ExpiresAt != "" {
+		t.Errorf("s2 should have no ExpiresAt, got %q", list[1].ExpiresAt)
+	}
+}
+
+func TestHTTPListTimeshifts(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+	mux := ctrl.routes()
+
+	// Empty list before any timeshifts.
+	w := doRequest(t, mux, http.MethodGet, "/timeshifts", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("empty list: got %d want 200", w.Code)
+	}
+	var empty api.ListTimeshiftsResponse
+	decodeResponse(t, w, &empty)
+	if len(empty.Timeshifts) != 0 {
+		t.Fatalf("expected empty slice, got %d", len(empty.Timeshifts))
+	}
+
+	// Create two timeshifts.
+	target := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace: "default", LabelSelector: "app=web-1", Time: target, TTL: "1h",
+	})
+	doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace: "default", LabelSelector: "app=web-1", Time: target,
+	})
+
+	w = doRequest(t, mux, http.MethodGet, "/timeshifts", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: got %d want 200; body: %s", w.Code, w.Body.String())
+	}
+	var resp api.ListTimeshiftsResponse
+	decodeResponse(t, w, &resp)
+	if len(resp.Timeshifts) != 2 {
+		t.Fatalf("expected 2 timeshifts, got %d", len(resp.Timeshifts))
+	}
+}
+
 // TestNewIDUniqueness verifies no collisions across many IDs.
 func TestNewIDUniqueness(t *testing.T) {
 	seen := make(map[string]struct{}, 10000)

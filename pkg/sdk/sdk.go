@@ -140,6 +140,23 @@ func (c *Client) CreateTimeshift(ctx context.Context, ns, labelSelector string, 
 	return timeshiftFromResponse(resp)
 }
 
+// ListTimeshifts returns all active timeshifts, sorted oldest-first.
+func (c *Client) ListTimeshifts(ctx context.Context) ([]Timeshift, error) {
+	var resp api.ListTimeshiftsResponse
+	if err := c.do(ctx, http.MethodGet, "/timeshifts", nil, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]Timeshift, 0, len(resp.Timeshifts))
+	for _, r := range resp.Timeshifts {
+		ts, err := timeshiftFromResponse(r)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *ts)
+	}
+	return out, nil
+}
+
 // GetTimeshift returns the timeshift with the given id.
 func (c *Client) GetTimeshift(ctx context.Context, id string) (*Timeshift, error) {
 	var resp api.TimeshiftResponse

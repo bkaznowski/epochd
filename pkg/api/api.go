@@ -26,6 +26,11 @@ type TimeshiftResponse struct {
 	AppliedTo []string `json:"appliedTo"`           // "pod-name/container-name", sorted
 }
 
+// ListTimeshiftsResponse is returned by GET /timeshifts.
+type ListTimeshiftsResponse struct {
+	Timeshifts []TimeshiftResponse `json:"timeshifts"`
+}
+
 // ErrorResponse is the JSON body of all 4xx/5xx responses.
 type ErrorResponse struct {
 	Error string `json:"error"`

@@ -27,6 +27,7 @@ type fakeServer struct {
 
 func newFakeServer() *fakeServer {
 	fs := &fakeServer{mux: http.NewServeMux()}
+	fs.mux.HandleFunc("GET /timeshifts", fs.handleList)
 	fs.mux.HandleFunc("POST /timeshifts", fs.handleCreate)
 	fs.mux.HandleFunc("GET /timeshifts/{id}", fs.handleGet)
 	fs.mux.HandleFunc("PATCH /timeshifts/{id}", fs.handleUpdate)
@@ -36,6 +37,16 @@ func newFakeServer() *fakeServer {
 
 func (fs *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fs.mux.ServeHTTP(w, r)
+}
+
+func (fs *fakeServer) handleList(w http.ResponseWriter, r *http.Request) {
+	resp := api.ListTimeshiftsResponse{}
+	if fs.stored != nil {
+		resp.Timeshifts = []api.TimeshiftResponse{*fs.stored}
+	} else {
+		resp.Timeshifts = []api.TimeshiftResponse{}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (fs *fakeServer) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -286,6 +297,63 @@ func TestWithTimeCleansUpOnFnError(t *testing.T) {
 	// timeshift must still be deleted even though fn failed
 	if fs.stored != nil {
 		t.Error("timeshift was not deleted after fn error")
+	}
+}
+
+func TestListTimeshiftsEmpty(t *testing.T) {
+	client, _ := startFake(t)
+
+	list, err := client.ListTimeshifts(context.Background())
+	if err != nil {
+		t.Fatalf("ListTimeshifts: %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("expected empty list, got %d entries", len(list))
+	}
+}
+
+func TestListTimeshiftsAfterCreate(t *testing.T) {
+	client, _ := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	created, err := client.CreateTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateTimeshift: %v", err)
+	}
+
+	list, err := client.ListTimeshifts(context.Background())
+	if err != nil {
+		t.Fatalf("ListTimeshifts: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(list))
+	}
+	if list[0].ID != created.ID {
+		t.Errorf("ID mismatch: got %q want %q", list[0].ID, created.ID)
+	}
+	if !list[0].Time.Equal(target) {
+		t.Errorf("Time mismatch: got %v want %v", list[0].Time, target)
+	}
+}
+
+func TestListTimeshiftsAfterDelete(t *testing.T) {
+	client, _ := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	created, err := client.CreateTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateTimeshift: %v", err)
+	}
+	if err := client.DeleteTimeshift(context.Background(), created.ID); err != nil {
+		t.Fatalf("DeleteTimeshift: %v", err)
+	}
+
+	list, err := client.ListTimeshifts(context.Background())
+	if err != nil {
+		t.Fatalf("ListTimeshifts after delete: %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("expected empty list after delete, got %d entries", len(list))
 	}
 }
 
