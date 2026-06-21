@@ -49,6 +49,24 @@ func (h *Handle) SetTime(target time.Time) error {
 	return h.setOffset(sec, nsec)
 }
 
+// InjectAtTimeFollowChild injects the trampoline into a child process that was
+// started with SysProcAttr{Ptrace: true}. The child called PTRACE_TRACEME
+// before exec and is stopped on its initial SIGTRAP; this function collects
+// that stop without issuing PTRACE_ATTACH. No elevated permissions required.
+func InjectAtTimeFollowChild(pid int, target time.Time) (*Handle, error) {
+	info, err := vdso.Locate(pid)
+	if err != nil {
+		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
+	}
+	tr := procmem.NewTracer()
+	if err := tr.FollowChild(pid); err != nil {
+		return nil, fmt.Errorf("inject: FollowChild pid %d: %w", pid, err)
+	}
+	defer tr.Detach() //nolint:errcheck
+	sec, nsec := diffSecNsec(target, time.Now())
+	return injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec)
+}
+
 // inject attaches to pid, writes the trampoline with the given initial offset,
 // patches the vDSO, and detaches. InjectAtTime is the preferred caller.
 func inject(pid int, initialOffsetSec, initialOffsetNsec int64) (*Handle, error) {
