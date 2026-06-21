@@ -503,6 +503,12 @@ as closures over a channel and executed on that pinned thread.
 | 17 | Health endpoint + `WithTimeT` SDK helper | ✅ |
 | 18 | Handle recovery (pod/agent restarts) | ✅ |
 | 19 | Prometheus metrics | ✅ |
+| 20 | Controller restart recovery (ConfigMap persistence) | 🔲 |
+| 21 | Graceful agent shutdown (SIGTERM drain) | 🔲 |
+| 22 | Dry-run / resolve mode (`GET /resolve`) | 🔲 |
+| 23 | Agent handle status RPC (`GetStatus`) | 🔲 |
+| 24 | Python SDK | 🔲 |
+| 25 | Local process injection (`pkg/localtime`, non-Kubernetes) | 🔲 |
 
 See `plan.md` for the detailed specification of all phases.
 See `FUTURE.md` for longer-horizon improvements (auth, multi-arch, Helm, HA).

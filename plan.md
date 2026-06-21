@@ -853,3 +853,511 @@ annotations:
 `/metrics` and asserts the relevant counter values are present in the response body. No
 Prometheus client needed in the test — a plain string search on the text exposition format
 is sufficient.
+
+---
+
+## Phase 20 — Controller restart recovery
+
+**Goal**: survive controller pod restarts without leaving injected containers permanently
+stuck on their fake clocks. Currently, a controller eviction or upgrade loses all
+in-memory timeshift state — the TTL sweeper can no longer clean up, `GET /timeshifts`
+returns empty, and updates fail — even though the trampoline is still live in every
+injected container.
+
+**Approach**: persist the timeshift registry to a Kubernetes ConfigMap on every write and
+reload it on startup. A ConfigMap is sufficient (no etcd, no leader election): the data is
+small, writes are infrequent, and a single-replica controller is the normal deployment.
+
+**Changes required**:
+
+1. **`cmd/controller/store.go`** (new) — a `store` type that wraps a ConfigMap:
+   ```go
+   type store struct {
+       k8s       kubernetes.Interface
+       namespace string
+       name      string  // e.g. "epochd-state"
+   }
+
+   // save serialises the timeshifts map to JSON and writes it to the ConfigMap's
+   // "state" key. Called under the controller's write lock.
+   func (s *store) save(ctx context.Context, timeshifts map[string]*timeshift) error
+
+   // load reads the ConfigMap and deserialises the timeshifts map. Called once at
+   // startup before serving requests.
+   func (s *store) load(ctx context.Context) (map[string]*timeshift, error)
+   ```
+   Use `CreateOrUpdate` (get + patch) rather than a blind create so restarts are
+   idempotent. The ConfigMap may not exist yet on first run — create it if absent.
+
+2. **`cmd/controller/controller.go`** — add a `store *store` field; call `store.save`
+   after every mutation (`createTimeshift`, `updateTimeshift`, `deleteTimeshift`,
+   `sweepExpired`). On startup (in `newController` or a new `controller.restore` method),
+   call `store.load` and populate the in-memory map before accepting requests.
+
+3. **`cmd/controller/main.go`** — construct the store with the controller's own namespace
+   (from the `CONTROLLER_NAMESPACE` env var or a `--namespace` flag) and pass it to
+   `newController`.
+
+4. **`deploy/rbac.yaml`** — extend the controller's `ClusterRole` (or add a `Role` in the
+   controller's namespace) to allow `get`, `create`, `update`, `patch` on `configmaps`.
+
+5. **`deploy/controller-deployment.yaml`** — add a `CONTROLLER_NAMESPACE` env var sourced
+   from the downward API:
+   ```yaml
+   env:
+     - name: CONTROLLER_NAMESPACE
+       valueFrom:
+         fieldRef:
+           fieldPath: metadata.namespace
+   ```
+
+**Serialisation note**: the `containerHandle` fields (`pod`, `container`, `nodeIP`,
+`containerID`, `agentHandle`) must all be exported or the struct must have explicit JSON
+tags for encoding/decoding to work correctly. Add `json:"..."` tags to both
+`containerHandle` and `timeshift`.
+
+**Tests** — unit-test `store.save` + `store.load` using the fake k8s client already used
+in `controller_test.go`. Verify a round-trip: save a registry, load it back, assert the
+timeshifts are identical. Add a controller-level test that saves state, creates a new
+controller that calls `restore`, and confirms the timeshifts are present.
+
+---
+
+## Phase 21 — Graceful agent shutdown
+
+**Goal**: when the agent pod is terminated (SIGTERM), reset all active handles before
+exiting so injected containers are left with their real clocks rather than a permanently
+drifting fake one.
+
+Currently an agent eviction leaves every injected container running the trampoline with
+a stale offset. The controller only discovers this on the next `SetTime` or `Reset` call
+(which returns `NOT_FOUND`), at which point it re-injects. Between eviction and that next
+call, the container's clock is wrong and silently drifting.
+
+**Changes required**:
+
+1. **`cmd/agent/main.go`** — replace the bare `signal.NotifyContext` with an explicit
+   drain step:
+   ```go
+   ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+   defer stop()
+
+   // ... serve ...
+
+   <-ctx.Done()
+   log.Printf("agent: received shutdown signal, resetting %d handles", len(handles))
+   drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+   defer cancel()
+   resetAll(drainCtx, handles)
+   ```
+   `resetAll` calls `h.SetTime(time.Now())` on every `*inject.Handle` in the map.
+   Errors are logged but not fatal — best-effort cleanup on shutdown is acceptable.
+
+2. **Handle map access** — `resetAll` needs a snapshot of all handles. Take a read lock,
+   copy the values, release the lock, then reset without holding the lock (the gRPC calls
+   in `SetTime` block).
+
+3. **Shutdown timeout** — 10 seconds is generous for `process_vm_writev`-based resets
+   (each is a single syscall). The Kubernetes `terminationGracePeriodSeconds` in
+   `deploy/daemonset.yaml` should be set to at least 15 s to give the drain time to
+   complete before the pod is force-killed.
+
+4. **`deploy/daemonset.yaml`** — add `terminationGracePeriodSeconds: 15` to the pod spec.
+
+**Tests** — unit-test that `resetAll` is called with the correct handles when the context
+is cancelled. Since the actual `SetTime` calls go through `process_vm_writev` (Linux-only),
+mock the handle's reset method in the test or test only the drain-loop logic.
+
+---
+
+## Phase 22 — Dry-run / resolve mode
+
+**Goal**: let callers see which pods and containers a given namespace + label selector
+would affect *without* performing any injection. This is the most common debugging step
+when a selector matches unexpectedly many or few pods.
+
+**Changes required**:
+
+1. **`pkg/api/api.go`** — add a response type:
+   ```go
+   type ResolveResponse struct {
+       Pods []ResolvedPod `json:"pods"`
+   }
+   type ResolvedPod struct {
+       Name       string   `json:"name"`
+       Namespace  string   `json:"namespace"`
+       NodeIP     string   `json:"nodeIP"`
+       Containers []string `json:"containers"` // running containers only
+   }
+   ```
+
+2. **`cmd/controller/handlers.go`** — register `"GET /resolve"` and implement
+   `handleResolve`:
+   - Parse `namespace` and `selector` query parameters.
+   - Call `c.k8s.CoreV1().Pods(ns).List(...)` with the selector.
+   - For each pod, collect running container names (same filter as `injectPod`).
+   - Return a `ResolveResponse` with HTTP 200. No agent calls, no state mutation.
+
+3. **`pkg/sdk/sdk.go`** — add `Resolve(ctx, namespace, selector string) ([]ResolvedPod, error)`.
+
+4. **Tests** — add to `controller_test.go`: create two pods, call `GET /resolve`, assert
+   both pods appear with their running containers. Verify no handles are created and no
+   agent calls are made.
+
+**Also consider**: a `?dry-run=true` query parameter on `POST /timeshifts` that runs
+the full resolution and returns what *would* be injected (same `ResolveResponse`) without
+mutating state. This is ergonomic for callers who already construct a
+`CreateTimeshiftRequest` and just want to preview it.
+
+---
+
+## Phase 23 — Agent handle status RPC
+
+**Goal**: surface the current observed state of an injected container — the live targetTime
+and generation counter from the trampoline's state struct — so operators can confirm
+injection is working and diagnose drift.
+
+Currently there is no way to verify from outside whether a container is actually seeing the
+injected time. The generation counter already exists in the trampoline state struct
+(`Handle.StateAddr`); it just needs to be read and surfaced.
+
+**Changes required**:
+
+1. **`proto/agent/v1/agent.proto`** — add a `GetStatus` RPC:
+   ```protobuf
+   message GetStatusRequest  { string handle_id = 1; }
+   message GetStatusResponse {
+     string handle_id    = 1;
+     string target_time  = 2; // RFC3339, last value written by SetTime
+     uint32 generation   = 3; // bumped on each SetTime; 0 = initial injection
+     string state_addr   = 4; // hex, for debugging
+   }
+   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+   ```
+   Regenerate `pkg/agentpb/` after editing the proto.
+
+2. **`cmd/agent/main.go`** — implement `GetStatus`: look up the handle by ID, call
+   `procmem.ReadMem(h.PID, h.StateAddr, stateBytes)`, decode with
+   `trampoline.DecodeState`, return the fields. Reading the state struct does not require
+   ptrace — `process_vm_readv` is sufficient.
+
+3. **`pkg/agentclient/agentclient.go`** — add `GetStatus(ctx, nodeIP, handleID string) (*api.HandleStatus, error)`.
+
+4. **`AgentPool` interface** (`cmd/controller/controller.go`) — add `GetStatus`.
+
+5. **`cmd/controller/handlers.go`** — add `GET /timeshifts/{id}/status` that calls
+   `GetStatus` for every handle in the timeshift and returns an augmented response
+   including per-container generation and last-seen targetTime.
+
+6. **`pkg/sdk/sdk.go`** — add `TimeshiftStatus(ctx, id string)`.
+
+**Tests** — unit-test the controller handler with a mock that returns a canned status.
+The agent-side read from the state struct is already covered by `TestInjectMechanics`.
+
+---
+
+## Phase 24 — Python SDK
+
+**Goal**: make epochd usable from Python test suites (pytest, unittest) without requiring
+callers to shell out to curl.
+
+The controller's API is plain HTTP+JSON, so the Python client is a thin wrapper with no
+generated code or binary dependencies.
+
+**Suggested layout** (`sdk/python/epochd/`):
+
+```python
+# epochd/client.py
+
+import os, requests
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+class Client:
+    def __init__(self, url: str | None = None):
+        self.url = (url or os.environ["EPOCHD_URL"]).rstrip("/")
+
+    def create_timeshift(self, namespace: str, selector: str,
+                         target: datetime, ttl: str | None = None) -> dict:
+        body = {"namespace": namespace, "labelSelector": selector,
+                "time": target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        if ttl:
+            body["ttl"] = ttl
+        r = requests.post(f"{self.url}/timeshifts", json=body, timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def delete_timeshift(self, id: str) -> None:
+        requests.delete(f"{self.url}/timeshifts/{id}", timeout=10).raise_for_status()
+
+    def list_timeshifts(self) -> list[dict]:
+        r = requests.get(f"{self.url}/timeshifts", timeout=10)
+        r.raise_for_status()
+        return r.json()["timeshifts"]
+
+    @contextmanager
+    def with_time(self, namespace: str, selector: str,
+                  target: datetime, ttl: str = "1h"):
+        ts = self.create_timeshift(namespace, selector, target, ttl)
+        try:
+            yield ts
+        finally:
+            try:
+                self.delete_timeshift(ts["id"])
+            except Exception:
+                pass
+```
+
+**Usage in a pytest test**:
+```python
+import pytest
+from datetime import datetime, timezone, timedelta
+from epochd import Client
+
+@pytest.fixture(scope="session")
+def epochd():
+    return Client()  # reads EPOCHD_URL from environment; skip if unset
+
+def test_cert_expiry(epochd, k8s_client):
+    future = datetime.now(timezone.utc) + timedelta(days=365)
+    with epochd.with_time("default", "app=my-service", future):
+        # ... assert the service correctly rejects an expired cert ...
+```
+
+**Packaging**:
+- `sdk/python/pyproject.toml` with `[project]` metadata: `name = "epochd"`,
+  `dependencies = ["requests>=2.28"]`, `python_requires = ">=3.10"`.
+- A `pytest` plugin entry point (`epochd_fixture`) that auto-skips tests when
+  `EPOCHD_URL` is not set, mirroring the Go SDK's `WithTimeT` behaviour.
+- Publish to PyPI as `epochd-client` once stable.
+
+**Tests** — use `responses` (the requests mock library) to unit-test the client methods
+without a real server. Mirror the Go SDK test structure: fake server, round-trip
+create/list/delete, verify skip behaviour when the env var is absent.
+
+---
+
+## Phase 25 — Local process time injection (`pkg/localtime`)
+
+**Goal**: make the vDSO injection usable directly in Go tests that start their own
+processes — postgres, redpanda, Go services, Python services — without Kubernetes. This
+is the non-cluster path: the test binary injects fake time directly into child processes
+on the same Linux host.
+
+This phase builds a `pkg/localtime` package on top of the existing `pkg/inject`
+primitives. No new injection mechanics are needed; the work is entirely in the API layer.
+
+---
+
+### Background: two injection paths
+
+| Path | How | Permissions | Use when |
+|------|-----|-------------|----------|
+| `FollowChild` | Child calls `PTRACE_TRACEME` before exec | None beyond spawning the process | Test starts the process itself via `exec.Cmd` |
+| `Attach` | Parent calls `PTRACE_ATTACH` on a running PID | `CAP_SYS_PTRACE` + `ptrace_scope ≤ 1` | Process was started externally (testcontainers, separate binary) |
+
+For containerised dependencies (postgres, redpanda via Docker), the PID required is the
+**host-namespace PID** from `docker inspect --format '{{.State.Pid}}' <container>`.
+testcontainers-go exposes this via `container.Inspect(ctx).State.Pid`. This works on a
+Linux host or a Linux CI runner; it does not work on macOS or Windows because Docker runs
+inside a Linux VM whose PID namespace is inaccessible from the host.
+
+---
+
+### Single-process API
+
+```go
+// pkg/localtime/localtime.go
+// //go:build linux
+
+// Handle holds an active time injection for one process.
+type Handle struct {
+    h *inject.Handle
+}
+
+// Start starts cmd with fake time injected from the moment the process begins.
+// It sets SysProcAttr{Ptrace: true} on cmd, calls cmd.Start(), waits for the
+// initial SIGTRAP via FollowChild, injects, then detaches. The process runs
+// freely after Start returns.
+// No elevated permissions required.
+func Start(cmd *exec.Cmd, target time.Time) (*Handle, error)
+
+// Attach injects fake time into an already-running process.
+// Requires CAP_SYS_PTRACE and /proc/sys/kernel/yama/ptrace_scope ≤ 1.
+func Attach(pid int, target time.Time) (*Handle, error)
+
+// SetTime updates the fake time without a ptrace stop (process_vm_writev only).
+func (h *Handle) SetTime(target time.Time) error
+
+// Reset snaps the process back to real time. Equivalent to SetTime(time.Now()).
+func (h *Handle) Reset() error
+```
+
+`Start` must set `SysProcAttr` before `cmd.Start()`, so it takes ownership of starting
+the process. The caller must not call `cmd.Start()` themselves.
+
+---
+
+### Multi-process Session
+
+A `Session` groups multiple handles under a single target time and updates them
+concurrently to minimise the inter-process race window.
+
+```go
+// Session manages fake time for a group of processes sharing the same target.
+type Session struct { /* unexported */ }
+
+// NewSession creates an empty session. Processes are added via Start and Attach.
+func NewSession(target time.Time) *Session
+
+// Start starts cmd with fake time and adds the resulting handle to the session.
+func (s *Session) Start(cmd *exec.Cmd) error
+
+// Attach attaches to an already-running process and adds it to the session.
+func (s *Session) Attach(pid int) error
+
+// SetTime updates the fake time for all processes in the session concurrently.
+// All process_vm_writev calls are issued in parallel; the total elapsed time
+// equals one write latency (~1 µs) regardless of session size. Errors from
+// individual processes are collected and returned as a joined error.
+func (s *Session) SetTime(target time.Time) error
+
+// Reset snaps all processes back to real time (calls SetTime(time.Now())).
+func (s *Session) Reset() error
+
+// Len returns the number of processes currently in the session.
+func (s *Session) Len() int
+```
+
+---
+
+### Testing helpers
+
+```go
+// WithProcess is a single-process testing helper using the FollowChild path.
+// It starts cmd with fake time, registers t.Cleanup to reset and wait, and
+// calls fn with the active handle. No elevated permissions required.
+func WithProcess(t *testing.T, cmd *exec.Cmd, target time.Time,
+    fn func(t *testing.T, h *Handle))
+
+// WithPID is a single-process testing helper using the Attach path.
+// It attaches to an already-running process and registers t.Cleanup to reset.
+// Requires CAP_SYS_PTRACE.
+func WithPID(t *testing.T, pid int, target time.Time,
+    fn func(t *testing.T, h *Handle))
+
+// WithSession is the multi-process testing helper.
+// setup is called first to add processes to the session; fn is called once all
+// additions succeed. t.Cleanup resets all processes and waits on any cmds
+// added via session.Start.
+//
+// Example:
+//
+//   localtime.WithSession(t, futureTime,
+//       func(s *localtime.Session) error {
+//           if err := s.Start(serviceCmd); err != nil { return err }
+//           return s.Attach(postgresPID)
+//       },
+//       func(t *testing.T, s *localtime.Session) {
+//           // all processes see futureTime here
+//           s.SetTime(futureTime.Add(24 * time.Hour))
+//           // assert expiry behaviour, etc.
+//       },
+//   )
+func WithSession(t *testing.T, target time.Time,
+    setup func(*Session) error,
+    fn func(t *testing.T, s *Session))
+```
+
+All three helpers call `t.Helper()` and use `t.Cleanup` (not `defer`) so cleanup runs
+even when `fn` calls `t.Fatal`.
+
+---
+
+### Progressive time advancement
+
+`Session.SetTime` enables stepping through time within a single test:
+
+```go
+localtime.WithSession(t, base,
+    func(s *localtime.Session) error {
+        s.Start(serviceCmd)
+        s.Attach(postgresPID)
+        return s.Attach(redpandaPID)
+    },
+    func(t *testing.T, s *localtime.Session) {
+        assertTokenValid(t, client)             // at base time
+
+        s.SetTime(base.Add(23 * time.Hour))
+        assertTokenValid(t, client)             // not expired yet
+
+        s.SetTime(base.Add(25 * time.Hour))
+        assertTokenExpired(t, client)           // should reject now
+    },
+)
+```
+
+Because `SetTime` completes in ~1 µs per process (issued concurrently), all processes
+have the new time before the next RPC or Kafka message reaches them.
+
+---
+
+### Build constraints and platform notes
+
+- All files in `pkg/localtime` carry `//go:build linux`.
+- On non-Linux platforms (`GOOS=darwin`, `GOOS=windows`) the package does not compile.
+  Tests that import it should be gated with the same build tag or use `t.Skip` behind a
+  runtime check. An alternative stub package (`//go:build !linux`) that provides the same
+  signatures but returns `errors.New("localtime: not supported on this platform")` is
+  worth adding so callers can compile cross-platform even if they can only run on Linux.
+- The `FollowChild` path (`Start`, `WithProcess`, `Session.Start`) works inside Docker
+  with `--cap-add SYS_PTRACE --security-opt seccomp=unconfined` — the same flags already
+  required for `pkg/inject` tests.
+- The `Attach` path (`Attach`, `WithPID`, `Session.Attach`) additionally requires
+  `ptrace_scope ≤ 1` on the host. In most CI environments (`ubuntu-latest` on GitHub
+  Actions) the default is 0, so this works without extra configuration.
+
+---
+
+### File layout
+
+```
+pkg/localtime/
+├── localtime.go          # //go:build linux — Handle, Session, Start, Attach
+├── localtime_stub.go     # //go:build !linux — same signatures, stub errors
+├── testing.go            # //go:build linux — WithProcess, WithPID, WithSession
+└── localtime_test.go     # //go:build linux — uses in-binary helper processes
+```
+
+---
+
+### Tests
+
+Follow the same in-binary helper pattern established in `pkg/inject`:
+
+```go
+const helperEnv = "EPOCHD_LOCALTIME_HELPER"
+
+// TestLocaltimeHelper is the clock-printing child reused by all localtime tests.
+func TestLocaltimeHelper(t *testing.T) {
+    if os.Getenv(helperEnv) != "1" { t.Skip() }
+    for { fmt.Println(time.Now().Format(time.RFC3339Nano)); time.Sleep(100*time.Millisecond) }
+}
+```
+
+**`TestStartSingleProcess`** — start the helper via `localtime.Start`, read timestamps
+from its stdout, assert they are approximately `target`, then `Reset` and assert they
+return to real time. This mirrors `TestInjectRoundTrip` in `pkg/inject`.
+
+**`TestSessionMultipleProcesses`** — start two helper instances in one session, read
+timestamps from both, assert both see `target`. Call `session.SetTime(target.Add(24h))`,
+assert both update. Assert the inter-process update window (time between first and last
+write) is under 10 ms.
+
+**`TestSessionPartialFailure`** — add one valid PID and one invalid PID (e.g. 0) to a
+session; assert `SetTime` returns an error that mentions the failing process but still
+updates the valid one.
+
+**`TestWithSession`** — end-to-end test of the `WithSession` helper: verify `t.Cleanup`
+fires correctly by tracking whether Reset was called when `fn` returns normally and when
+`fn` calls `t.Fatal`.
