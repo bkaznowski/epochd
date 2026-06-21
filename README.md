@@ -507,9 +507,15 @@ as closures over a channel and executed on that pinned thread.
 | 21 | Graceful agent shutdown (SIGTERM drain) | ✅ |
 | 22 | Dry-run / resolve mode (`GET /resolve`) | ✅ |
 | 23 | Agent handle status RPC (`GetStatus`) | ✅ |
-| 24 | Python SDK | 🔲 |
 | 25 | Local process injection (`pkg/localtime`, non-Kubernetes) | ✅ |
 | 26 | Conflict guard (reject overlapping timeshifts, `409 Conflict`) | ✅ |
+| 27 | `faketimectl` subcommand completeness (`update`, `status`) | 🔲 |
+| 28 | Structured logging (`log/slog`, JSON output, `LOG_LEVEL`) | 🔲 |
+| 29 | TTL expiry Kubernetes Events + `timeshift_expired_total` counter | 🔲 |
+| 30 | Lease-based leader election (`coordination.k8s.io/Lease`) | 🔲 |
+| 31 | Validating webhook admission controller | 🔲 |
+| 32 | `pkg/localtime` Attach path (`CAP_SYS_PTRACE`) | 🔲 |
+| 33 | Integration test harness (`make test-integration`, kind) | 🔲 |
 
 See `plan.md` for the detailed specification of all phases.
 See `FUTURE.md` for longer-horizon improvements (auth, multi-arch, Helm, HA).

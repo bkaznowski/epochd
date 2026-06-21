@@ -1056,87 +1056,6 @@ The agent-side read from the state struct is already covered by `TestInjectMecha
 
 ---
 
-## Phase 24 — Python SDK
-
-**Goal**: make epochd usable from Python test suites (pytest, unittest) without requiring
-callers to shell out to curl.
-
-The controller's API is plain HTTP+JSON, so the Python client is a thin wrapper with no
-generated code or binary dependencies.
-
-**Suggested layout** (`sdk/python/epochd/`):
-
-```python
-# epochd/client.py
-
-import os, requests
-from contextlib import contextmanager
-from datetime import datetime, timezone
-
-class Client:
-    def __init__(self, url: str | None = None):
-        self.url = (url or os.environ["EPOCHD_URL"]).rstrip("/")
-
-    def create_timeshift(self, namespace: str, selector: str,
-                         target: datetime, ttl: str | None = None) -> dict:
-        body = {"namespace": namespace, "labelSelector": selector,
-                "time": target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-        if ttl:
-            body["ttl"] = ttl
-        r = requests.post(f"{self.url}/timeshifts", json=body, timeout=10)
-        r.raise_for_status()
-        return r.json()
-
-    def delete_timeshift(self, id: str) -> None:
-        requests.delete(f"{self.url}/timeshifts/{id}", timeout=10).raise_for_status()
-
-    def list_timeshifts(self) -> list[dict]:
-        r = requests.get(f"{self.url}/timeshifts", timeout=10)
-        r.raise_for_status()
-        return r.json()["timeshifts"]
-
-    @contextmanager
-    def with_time(self, namespace: str, selector: str,
-                  target: datetime, ttl: str = "1h"):
-        ts = self.create_timeshift(namespace, selector, target, ttl)
-        try:
-            yield ts
-        finally:
-            try:
-                self.delete_timeshift(ts["id"])
-            except Exception:
-                pass
-```
-
-**Usage in a pytest test**:
-```python
-import pytest
-from datetime import datetime, timezone, timedelta
-from epochd import Client
-
-@pytest.fixture(scope="session")
-def epochd():
-    return Client()  # reads EPOCHD_URL from environment; skip if unset
-
-def test_cert_expiry(epochd, k8s_client):
-    future = datetime.now(timezone.utc) + timedelta(days=365)
-    with epochd.with_time("default", "app=my-service", future):
-        # ... assert the service correctly rejects an expired cert ...
-```
-
-**Packaging**:
-- `sdk/python/pyproject.toml` with `[project]` metadata: `name = "epochd"`,
-  `dependencies = ["requests>=2.28"]`, `python_requires = ">=3.10"`.
-- A `pytest` plugin entry point (`epochd_fixture`) that auto-skips tests when
-  `EPOCHD_URL` is not set, mirroring the Go SDK's `WithTimeT` behaviour.
-- Publish to PyPI as `epochd-client` once stable.
-
-**Tests** — use `responses` (the requests mock library) to unit-test the client methods
-without a real server. Mirror the Go SDK test structure: fake server, round-trip
-create/list/delete, verify skip behaviour when the env var is absent.
-
----
-
 ## Phase 25 — Local process time injection (`pkg/localtime`)
 
 **Goal**: make the vDSO injection usable directly in Go tests that start their own
@@ -1417,3 +1336,272 @@ returns `http.StatusConflict` when `isConflict` is true.
 Three pre-existing tests (`TestListTimeshifts`, `TestHTTPListTimeshifts`,
 `TestControllerRestoreGauge`) created two timeshifts for the same pod to exercise list /
 restore logic. These were updated to use two distinct pods with separate selectors.
+
+---
+
+## Phase 27 — `faketimectl` subcommand completeness
+
+**Goal**: make `faketimectl` a complete interface so operators never need to reach for curl.
+Currently only `create` and `delete` are implemented; `update` and `status` are missing.
+
+### New subcommands
+
+**`faketimectl update <id> --time=<RFC3339>`**  
+Calls `PATCH /timeshifts/<id>` and prints the updated timeshift. Accepts the same
+`--time` flag format as `create`.
+
+**`faketimectl status <id>`**  
+Calls `GET /timeshifts/<id>/status` and prints a table of container statuses:
+
+```
+NAMESPACE  POD        CONTAINER  GENERATION  TARGET TIME           LAG
+default    web-abc    app        4           2025-01-01T00:00:00Z  2ms
+default    web-def    app        4           2025-01-01T00:00:00Z  3ms
+```
+
+### Implementation
+
+- Add `updateCmd` and `statusCmd` to `cmd/faketimectl/main.go` (or split into subcommand
+  files if the file is getting long).
+- `updateCmd` reads `--time` flag, parses as RFC3339, calls `client.UpdateTimeshift`.
+- `statusCmd` calls `client.TimeshiftStatus` and formats the `ContainerStatuses` slice
+  as a tab-separated table using `text/tabwriter`.
+
+### Tests
+
+Unit tests mirroring the existing `create`/`delete` tests: fake HTTP server, assert the
+right HTTP method + path is called, assert stdout formatting.
+
+---
+
+## Phase 28 — Structured logging (`log/slog`)
+
+**Goal**: replace ad-hoc `fmt.Printf` / `log.Printf` calls in the controller and agent
+with structured JSON logging via `log/slog` (stdlib, Go 1.21+). Structured logs are
+consumable by Loki, Datadog, and Cloud Logging without custom parsing.
+
+### Conventions
+
+- One `*slog.Logger` per binary, constructed in `main` and threaded through via
+  `context.WithValue` or explicit parameter.
+- Log level controlled by `LOG_LEVEL` env var (`debug`, `info`, `warn`, `error`).
+- All log lines include `component` (e.g. `"controller"`, `"agent"`) and `timeshift_id`
+  where applicable.
+- HTTP request logging: method, path, status, duration — one line per request.
+- Injection events: `msg="inject"`, `pid`, `target_time`, `offset_sec`.
+
+### Implementation
+
+- `pkg/log/log.go`: thin helper that parses `LOG_LEVEL` and returns a `*slog.Logger`
+  with `slog.NewJSONHandler(os.Stderr, opts)`.
+- Replace all `fmt.Fprintf(os.Stderr, ...)` and `log.Printf` call sites.
+- Add `slog.With("timeshift_id", id)` logger to the controller request context so all
+  log lines within a single request share the ID.
+
+### Tests
+
+Log output is an observability concern, not a correctness concern — no dedicated log
+tests. Existing unit tests should continue to pass; spot-check that no `fmt.Print*` calls
+remain in hot paths via `go vet` or a grep assertion in CI.
+
+---
+
+## Phase 29 — TTL expiry events and counter
+
+**Goal**: make timeshift expiry visible to pod owners without requiring them to watch
+Prometheus. When the TTL sweep removes a timeshift, emit a Kubernetes `Event` on the
+relevant pods and increment a `timeshift_expired_total` counter.
+
+### Kubernetes Event
+
+```
+kubectl describe pod web-abc
+Events:
+  Type    Reason            Age   From               Message
+  Normal  TimeshiftExpired  2m    epochd-controller  Timeshift abc123 (target: 2025-01-01T00:00:00Z) expired after 1h0m0s
+```
+
+The event is posted via `client-go`'s `EventRecorder` with:
+- `Type`: `corev1.EventTypeNormal`
+- `Reason`: `"TimeshiftExpired"`
+- `Message`: human-readable string with timeshift ID, target time, and TTL duration.
+
+### Prometheus
+
+New counter `timeshift_expired_total` (no labels) incremented each time `sweepExpired`
+removes a timeshift. Existing sweep metric (`timeshift_sweep_events_total`) tracks sweep
+runs; this tracks individual expirations.
+
+### Implementation
+
+- Construct an `EventRecorder` in `main.go` using `record.NewEventRecorder`.
+- Thread it into the controller as a field.
+- In `sweepExpired`, after calling `Delete`, post an event on each pod that was targeted.
+- Add the counter registration alongside existing Prometheus registrations.
+
+### Tests
+
+- `TestSweepEmitsEvent`: fake pod list + fake event recorder; assert event is posted with
+  correct reason and message after TTL expires.
+- `TestExpiredCounterIncrements`: assert `timeshift_expired_total` counter value after sweep.
+
+---
+
+## Phase 30 — Lease-based leader election
+
+**Goal**: allow running two controller replicas without them stomping each other's
+ConfigMap state. Only the elected leader processes write requests; standby replicas
+return `503 Service Unavailable` immediately so clients can retry against the other
+replica (or via a load balancer with retry).
+
+### Mechanism
+
+Use `k8s.io/client-go/tools/leaderelection` with a `coordination.k8s.io/Lease` object
+named `epochd-leader` in the controller namespace.
+
+- On startup, begin competing for the lease.
+- Only start serving the HTTP API once the lease is held.
+- On lease loss, stop accepting write requests and begin draining in-flight ones.
+- On graceful shutdown, release the lease so the standby takes over immediately instead
+  of waiting for the lease TTL.
+
+### Configuration
+
+New env vars (or flags):
+- `LEADER_ELECTION=true/false` (default `false` — single-replica mode works as before)
+- `LEASE_DURATION=15s`
+- `RENEW_DEADLINE=10s`
+- `RETRY_PERIOD=2s`
+
+### Implementation
+
+- Wrap the existing `http.ServeMux` in a middleware that checks an `atomic.Bool isLeader`
+  flag and returns 503 for mutating requests when not the leader.
+- Leader election goroutine runs `leaderelection.RunOrDie` in the background.
+
+### Tests
+
+Leader election cannot easily be tested without multiple processes. Add a unit test for
+the middleware behaviour: when `isLeader=false`, `POST /timeshifts` returns 503; when
+`isLeader=true`, it passes through.
+
+---
+
+## Phase 31 — Validating webhook admission controller
+
+**Goal**: prevent new pods from being created (or restarted) into a namespace that has an
+active timeshift targeting them. Without this, a pod restart during an active timeshift
+causes it to start with the real clock until the agent re-injects it.
+
+### Mechanism
+
+A `ValidatingWebhookConfiguration` that intercepts `CREATE` and `UPDATE` (on restart)
+operations for `Pods`. The webhook checks whether the pod's labels match any active
+timeshift selector in its namespace, and if so — whether the pod is about to be created
+fresh (not restarted from an existing injection). If a match is found and the controller
+is not ready to immediately inject, the webhook rejects the admission.
+
+In practice this is a guard against the race window, not a permanent block: the webhook
+only rejects if the matching timeshift's agent is currently unreachable or the injection
+would be delayed more than a configurable threshold.
+
+### Configuration
+
+- `WEBHOOK_PORT` (default `9443`) for TLS.
+- TLS cert/key via mounted Secret or cert-manager `Certificate`.
+- `WEBHOOK_REJECTION_THRESHOLD` (default `5s`) — reject only if agent RTT exceeds this.
+
+### Implementation
+
+- New `cmd/webhook/main.go` binary.
+- `pkg/webhook/handler.go`: `AdmissionHandler` that calls the controller's `/resolve`
+  endpoint to check selector overlap, then checks agent reachability.
+- Kubernetes manifests: `deploy/webhook-deployment.yaml`,
+  `deploy/webhook-service.yaml`, `deploy/webhook-config.yaml`.
+
+### Tests
+
+- Unit test the admission handler with a fake controller HTTP server.
+- Integration test: kind cluster with the webhook deployed, assert that `kubectl create
+  pod` is rejected when a matching timeshift is active.
+
+---
+
+## Phase 32 — `pkg/localtime` Attach path
+
+**Goal**: complement Phase 25's `Start` (FollowChild) path with an `Attach` path that
+injects into an already-running process by PID. This is useful when the process was
+started by the test framework (testcontainers, `go test -exec`, an external binary) rather
+than by the test itself.
+
+### API addition to `pkg/localtime`
+
+```go
+// Attach injects fake time into an already-running process with the given pid.
+// Requires CAP_SYS_PTRACE and ptrace_scope ≤ 1 on the host.
+// Returns a Handle whose Close method resets the process to real time.
+func Attach(pid int, target time.Time) (*Handle, error)
+
+// WithPID is the testing helper equivalent of WithProcess for already-running PIDs.
+func WithPID(t testing.TB, pid int, target time.Time, fn func(h *Handle))
+```
+
+### Permissions note
+
+`Attach` wraps `inject.InjectAtTime` (which uses `PTRACE_ATTACH`). The caller needs:
+- `CAP_SYS_PTRACE`, or
+- the target process to be a child of the calling process, or
+- `ptrace_scope = 0` on the host (`/proc/sys/kernel/yama/ptrace_scope`).
+
+The docs and error messages should make this explicit.
+
+### Tests
+
+- `TestAttachSingleProcess`: spawn a helper, get its PID, call `Attach`, verify time
+  offset same as `TestStartSingleProcess`.
+- `TestWithPID`: use `WithPID` helper.
+- Tests are `//go:build linux` and skip if `ptrace_scope > 1` (read from
+  `/proc/sys/kernel/yama/ptrace_scope` with a helper).
+
+---
+
+## Phase 33 — Integration test harness
+
+**Goal**: add a `make test-integration` target that is fully self-contained — it spins up
+a kind cluster, builds and loads the controller and agent images, deploys epochd, runs the
+e2e suite, and tears everything down. Currently the e2e suite assumes an existing cluster.
+
+### Makefile targets
+
+```makefile
+test-integration: kind-up deploy-epochd e2e kind-down
+
+kind-up:
+	kind create cluster --name epochd-test --config deploy/kind-config.yaml
+
+kind-down:
+	kind delete cluster --name epochd-test
+
+deploy-epochd: docker-build
+	kind load docker-image epochd-controller:dev --name epochd-test
+	kind load docker-image epochd-agent:dev --name epochd-test
+	kubectl apply -f deploy/
+	kubectl -n epochd rollout status deployment/epochd-controller --timeout=60s
+	kubectl -n epochd rollout status daemonset/epochd-agent --timeout=60s
+
+e2e:
+	go test ./e2e/... -v -timeout 5m
+```
+
+### `deploy/kind-config.yaml`
+
+A minimal kind config that:
+- Uses a single control-plane node.
+- Mounts `/proc` so the agent's vDSO patching works inside containers.
+- Sets `ptrace_scope = 0` via a `extraMounts` / initContainer workaround.
+
+### CI integration
+
+Add a new GitHub Actions workflow `e2e.yml` that runs `make test-integration` on
+`push` to `main` and on PRs that touch `cmd/`, `pkg/`, or `deploy/`. Use a
+`ubuntu-latest` runner (kind works on GitHub Actions without Docker-in-Docker).
