@@ -11,12 +11,17 @@ import (
 
 func (c *controller) routes() *http.ServeMux {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /timeshifts", c.handleListTimeshifts)
 	mux.HandleFunc("POST /timeshifts", c.handleCreateTimeshift)
 	mux.HandleFunc("GET /timeshifts/{id}", c.handleGetTimeshift)
 	mux.HandleFunc("PATCH /timeshifts/{id}", c.handleUpdateTimeshift)
 	mux.HandleFunc("DELETE /timeshifts/{id}", c.handleDeleteTimeshift)
 	return mux
+}
+
+func handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (c *controller) handleListTimeshifts(w http.ResponseWriter, r *http.Request) {

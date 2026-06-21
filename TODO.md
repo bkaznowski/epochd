@@ -16,10 +16,10 @@ Things that require your input or manual action before the project is fully read
 - [x] **Update the LICENSE copyright line** — replace `"epochd contributors"` with your
   name or organisation name in `LICENSE`.
 
-- [ ] **Create the GitHub repository** — `https://github.com/bkaznowski/epochd`. Make it
+- [x] **Create the GitHub repository** — `https://github.com/bkaznowski/epochd`. Make it
   public when you're ready to open-source.
 
-- [ ] **Initialise git and push**:
+- [x] **Initialise git and push**:
   ```bash
   git init
   git add .

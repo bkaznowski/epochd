@@ -381,3 +381,22 @@ func TestWithTimeRejectsZeroTTL(t *testing.T) {
 		t.Fatal("expected error for zero TTL in WithTime, got nil")
 	}
 }
+
+func TestWithTimeTSkipsWithoutEnvVar(t *testing.T) {
+	t.Setenv("EPOCHD_URL", "") // ensure unset
+	client, _ := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	ran := false
+	// WithTimeT calls t.Skip on the sub-test's T, so the fn body must not run.
+	t.Run("inner", func(t *testing.T) {
+		sdk.WithTimeT(t, client, "default", "app=svc", target, time.Hour,
+			func(t *testing.T, ts *sdk.Timeshift) {
+				ran = true
+			},
+		)
+	})
+	if ran {
+		t.Error("WithTimeT fn body should not run when EPOCHD_URL is unset")
+	}
+}

@@ -527,6 +527,19 @@ func TestHTTPListTimeshifts(t *testing.T) {
 	}
 }
 
+func TestHTTPHealthz(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodGet, "/healthz", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200; body: %s", w.Code, w.Body.String())
+	}
+	var body map[string]string
+	decodeResponse(t, w, &body)
+	if body["status"] != "ok" {
+		t.Errorf("status: got %q want \"ok\"", body["status"])
+	}
+}
+
 // TestNewIDUniqueness verifies no collisions across many IDs.
 func TestNewIDUniqueness(t *testing.T) {
 	seen := make(map[string]struct{}, 10000)
