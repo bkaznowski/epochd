@@ -1,7 +1,7 @@
 # epochd
 
 [![CI](https://github.com/bkaznowski/epochd/actions/workflows/ci.yml/badge.svg)](https://github.com/bkaznowski/epochd/actions/workflows/ci.yml)
-[![Go 1.26](https://img.shields.io/badge/go-1.26-blue.svg)](https://go.dev/dl/)
+[![Go 1.25](https://img.shields.io/badge/go-1.25-blue.svg)](https://go.dev/dl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A Go tool that injects a fake wall-clock time into a running Linux process without
@@ -44,10 +44,10 @@ Because the vDSO is a normal mapped region, its code is writable under `PTRACE_P
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  Target process address space                                           │
 │                                                                         │
-│  [vdso]   0x7fff........  ← clock_gettime entry point                  │
+│  [vdso]   0x7fff........  ← clock_gettime entry point                   │
 │    │                                                                    │
-│    │  Before: original vDSO clock_gettime code                         │
-│    │  After:  E9 xx xx xx xx  ← JMP rel32 to trampoline page           │
+│    │  Before: original vDSO clock_gettime code                          │
+│    │  After:  E9 xx xx xx xx  ← JMP rel32 to trampoline page            │
 │    │                                                │                   │
 │    └────────────────────────────────────────────────▼                   │
 │                                                                         │
@@ -64,7 +64,7 @@ Because the vDSO is a normal mapped region, its code is writable under `PTRACE_P
 │    └─ state struct (32 bytes, at StateOffset = 86)                      │
 │         +0   int64  offsetSec                                           │
 │         +8   int64  offsetNsec                                          │
-│         +16  uint64 enabledMask  (bit 0 = CLOCK_REALTIME)              │
+│         +16  uint64 enabledMask  (bit 0 = CLOCK_REALTIME)               │
 │         +24  uint32 generation   (bumped on each SetTime)               │
 │         +28  uint32 _pad                                                │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -499,9 +499,9 @@ as closures over a channel and executed on that pinned thread.
 | 13 | GitHub open-source setup | ✅ |
 | 14 | GitHub Actions CI | ✅ |
 | 15 | Local cluster e2e (kind + Makefile) | ✅ |
-| 16 | List timeshifts (`GET /timeshifts`) | 🔲 |
-| 17 | Health endpoint + `WithTimeT` SDK helper | 🔲 |
-| 18 | Handle recovery (pod/agent restarts) | 🔲 |
+| 16 | List timeshifts (`GET /timeshifts`) | ✅ |
+| 17 | Health endpoint + `WithTimeT` SDK helper | ✅ |
+| 18 | Handle recovery (pod/agent restarts) | ✅ |
 | 19 | Prometheus metrics | 🔲 |
 
 See `plan.md` for the detailed specification of all phases.
