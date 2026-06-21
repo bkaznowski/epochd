@@ -45,7 +45,7 @@ Things that require your input or manual action before the project is fully read
 - [x] **Phase 19 — Prometheus metrics** (active timeshifts, inject/settime counters, sweep events)
 - [x] **Phase 20 — Controller restart recovery** (persist registry to ConfigMap; reload on startup)
 - [x] **Phase 21 — Graceful agent shutdown** (reset all handles on SIGTERM before exit)
-- [ ] **Phase 22 — Dry-run / resolve mode** (`GET /resolve?namespace=…&selector=…`)
+- [x] **Phase 22 — Dry-run / resolve mode** (`GET /resolve?namespace=…&selector=…`)
 - [ ] **Phase 23 — Agent handle status RPC** (`GetStatus` → live generation + targetTime from trampoline)
 - [ ] **Phase 24 — Python SDK** (`epochd-client` on PyPI; pytest fixture with auto-skip)
 - [ ] **Phase 25 — Local process injection** (`pkg/localtime`: `Session`, `Start`/`Attach`, `WithSession` helper; non-Kubernetes, Linux only)

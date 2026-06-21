@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"epochd/pkg/api"
@@ -182,6 +183,20 @@ func (c *Client) UpdateTimeshift(ctx context.Context, id string, target time.Tim
 // removes the timeshift from the controller registry.
 func (c *Client) DeleteTimeshift(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/timeshifts/"+id, nil, nil)
+}
+
+// Resolve returns the pods and running containers that would be targeted by a
+// timeshift with the given namespace and label selector. No injection is
+// performed and no controller state is changed.
+func (c *Client) Resolve(ctx context.Context, ns, labelSelector string) ([]api.ResolvedPod, error) {
+	q := url.Values{}
+	q.Set("namespace", ns)
+	q.Set("selector", labelSelector)
+	var resp api.ResolveResponse
+	if err := c.do(ctx, http.MethodGet, "/resolve?"+q.Encode(), nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Pods, nil
 }
 
 // ---------------------------------------------------------------------------

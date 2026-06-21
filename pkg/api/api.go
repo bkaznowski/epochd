@@ -31,6 +31,20 @@ type ListTimeshiftsResponse struct {
 	Timeshifts []TimeshiftResponse `json:"timeshifts"`
 }
 
+// ResolveResponse is returned by GET /resolve.
+type ResolveResponse struct {
+	Pods []ResolvedPod `json:"pods"`
+}
+
+// ResolvedPod describes one pod that would be affected by a timeshift with the
+// given namespace and label selector. Only running containers are included.
+type ResolvedPod struct {
+	Name       string   `json:"name"`
+	Namespace  string   `json:"namespace"`
+	NodeIP     string   `json:"nodeIP"`
+	Containers []string `json:"containers"` // running containers, sorted
+}
+
 // ErrorResponse is the JSON body of all 4xx/5xx responses.
 type ErrorResponse struct {
 	Error string `json:"error"`

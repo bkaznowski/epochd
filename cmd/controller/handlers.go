@@ -4,18 +4,21 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
 	"epochd/pkg/api"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func (c *controller) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.HandlerFor(c.met.registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("GET /healthz", c.track("GET", "/healthz", handleHealthz))
+	mux.HandleFunc("GET /resolve", c.track("GET", "/resolve", c.handleResolve))
 	mux.HandleFunc("GET /timeshifts", c.track("GET", "/timeshifts", c.handleListTimeshifts))
 	mux.HandleFunc("POST /timeshifts", c.track("POST", "/timeshifts", c.handleCreateTimeshift))
 	mux.HandleFunc("GET /timeshifts/{id}", c.track("GET", "/timeshifts/{id}", c.handleGetTimeshift))
@@ -155,6 +158,49 @@ func (c *controller) handleDeleteTimeshift(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *controller) handleResolve(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	sel := r.URL.Query().Get("selector")
+	if ns == "" {
+		writeError(w, http.StatusBadRequest, "namespace query parameter is required")
+		return
+	}
+	if sel == "" {
+		writeError(w, http.StatusBadRequest, "selector query parameter is required")
+		return
+	}
+
+	pods, err := c.k8s.CoreV1().Pods(ns).List(r.Context(), metav1.ListOptions{LabelSelector: sel})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list pods: "+err.Error())
+		return
+	}
+
+	resolved := make([]api.ResolvedPod, 0, len(pods.Items))
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		var containers []string
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.State.Running != nil {
+				containers = append(containers, cs.Name)
+			}
+		}
+		if len(containers) == 0 {
+			continue
+		}
+		sort.Strings(containers)
+		resolved = append(resolved, api.ResolvedPod{
+			Name:       pod.Name,
+			Namespace:  pod.Namespace,
+			NodeIP:     pod.Status.HostIP,
+			Containers: containers,
+		})
+	}
+	sort.Slice(resolved, func(i, j int) bool { return resolved[i].Name < resolved[j].Name })
+
+	writeJSON(w, http.StatusOK, api.ResolveResponse{Pods: resolved})
 }
 
 // ---------------------------------------------------------------------------

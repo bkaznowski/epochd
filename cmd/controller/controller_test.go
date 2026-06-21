@@ -938,6 +938,132 @@ func TestControllerRestoreGauge(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Resolve endpoint tests
+// ---------------------------------------------------------------------------
+
+// TestHTTPResolve verifies GET /resolve returns matched pods with their running
+// containers, makes no agent calls, and creates no timeshifts.
+func TestHTTPResolve(t *testing.T) {
+	ctx := context.Background()
+	k8s := fake.NewClientset()
+
+	for _, name := range []string{"web-1", "web-2"} {
+		pod := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels:    map[string]string{"tier": "frontend"},
+			},
+			Status: corev1.PodStatus{
+				HostIP: "10.0.0.1",
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name:        "server",
+					ContainerID: "containerd://aa" + name,
+					State:       corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				}},
+			},
+		}
+		if _, err := k8s.CoreV1().Pods("default").Create(ctx, &pod, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create pod %s: %v", name, err)
+		}
+	}
+
+	pool := &mockAgentPool{}
+	injectCalled := 0
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time) (string, error) {
+		injectCalled++
+		return "", nil
+	}
+
+	ctrl := newController(k8s, pool, nil)
+	mux := ctrl.routes()
+
+	w := doRequest(t, mux, http.MethodGet, "/resolve?namespace=default&selector=tier=frontend", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200; body: %s", w.Code, w.Body.String())
+	}
+	var resp api.ResolveResponse
+	decodeResponse(t, w, &resp)
+
+	if len(resp.Pods) != 2 {
+		t.Fatalf("expected 2 pods, got %d: %+v", len(resp.Pods), resp.Pods)
+	}
+	// Pods are sorted by name.
+	if resp.Pods[0].Name != "web-1" || resp.Pods[1].Name != "web-2" {
+		t.Errorf("pod names: got %q and %q", resp.Pods[0].Name, resp.Pods[1].Name)
+	}
+	if resp.Pods[0].NodeIP != "10.0.0.1" {
+		t.Errorf("nodeIP: got %q want %q", resp.Pods[0].NodeIP, "10.0.0.1")
+	}
+	if len(resp.Pods[0].Containers) != 1 || resp.Pods[0].Containers[0] != "server" {
+		t.Errorf("containers: got %v", resp.Pods[0].Containers)
+	}
+	if injectCalled != 0 {
+		t.Errorf("Inject called %d times; resolve must not touch agents", injectCalled)
+	}
+	ctrl.mu.RLock()
+	timeshiftCount := len(ctrl.timeshifts)
+	ctrl.mu.RUnlock()
+	if timeshiftCount != 0 {
+		t.Errorf("expected no timeshifts after resolve, got %d", timeshiftCount)
+	}
+}
+
+// TestHTTPResolveMissingParams verifies that both query parameters are required.
+func TestHTTPResolveMissingParams(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	mux := ctrl.routes()
+
+	w := doRequest(t, mux, http.MethodGet, "/resolve?selector=app=x", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing namespace: got %d want 400", w.Code)
+	}
+
+	w = doRequest(t, mux, http.MethodGet, "/resolve?namespace=default", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing selector: got %d want 400", w.Code)
+	}
+}
+
+// TestHTTPResolveExcludesNonRunning verifies that pods with no running
+// containers are omitted from the response.
+func TestHTTPResolveExcludesNonRunning(t *testing.T) {
+	ctx := context.Background()
+	k8s := fake.NewClientset()
+
+	// Pod with a terminated container — should be excluded.
+	pending := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "terminating",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "batch"},
+		},
+		Status: corev1.PodStatus{
+			HostIP: "10.0.0.9",
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:        "worker",
+				ContainerID: "containerd://deadbeef",
+				State:       corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}},
+			}},
+		},
+	}
+	if _, err := k8s.CoreV1().Pods("default").Create(ctx, &pending, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+
+	ctrl := newController(k8s, &mockAgentPool{}, nil)
+	w := doRequest(t, ctrl.routes(), http.MethodGet, "/resolve?namespace=default&selector=app=batch", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200; body: %s", w.Code, w.Body.String())
+	}
+	var resp api.ResolveResponse
+	decodeResponse(t, w, &resp)
+	if len(resp.Pods) != 0 {
+		t.Errorf("expected 0 pods (all non-running), got %d: %+v", len(resp.Pods), resp.Pods)
+	}
+}
+
 // TestNewIDUniqueness verifies no collisions across many IDs.
 func TestNewIDUniqueness(t *testing.T) {
 	seen := make(map[string]struct{}, 10000)
