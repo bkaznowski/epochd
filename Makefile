@@ -1,8 +1,9 @@
-CLUSTER          := epochd-dev
-TEST_CLUSTER     := epochd-test
-IMAGE_TAG        := dev
-AGENT_IMAGE      := epochd-agent:$(IMAGE_TAG)
-CONTROLLER_IMAGE := epochd-controller:$(IMAGE_TAG)
+CLUSTER              := epochd-dev
+TEST_CLUSTER         := epochd-test
+IMAGE_TAG            := dev
+AGENT_IMAGE          := epochd-agent:$(IMAGE_TAG)
+CONTROLLER_IMAGE     := epochd-controller:$(IMAGE_TAG)
+CLOCKPRINTER_IMAGE   := epochd-clockprinter:$(IMAGE_TAG)
 
 .PHONY: check-deps cluster delete-cluster images load deploy e2e \
         test-integration _integration-inner kind-up-test kind-down-test
@@ -80,8 +81,10 @@ kind-down-test:
 # set image patches each workload to use the locally built :dev images rather
 # than the ghcr.io tags in the production manifests.
 _integration-inner: images
-	kind load docker-image $(AGENT_IMAGE)      --name $(TEST_CLUSTER)
-	kind load docker-image $(CONTROLLER_IMAGE) --name $(TEST_CLUSTER)
+	docker build -f Dockerfile.clockprinter --platform linux/amd64 -t $(CLOCKPRINTER_IMAGE) .
+	kind load docker-image $(AGENT_IMAGE)          --name $(TEST_CLUSTER)
+	kind load docker-image $(CONTROLLER_IMAGE)     --name $(TEST_CLUSTER)
+	kind load docker-image $(CLOCKPRINTER_IMAGE)   --name $(TEST_CLUSTER)
 	kubectl apply -f deploy/rbac.yaml --context kind-$(TEST_CLUSTER)
 	kubectl apply -f deploy/daemonset.yaml --context kind-$(TEST_CLUSTER)
 	kubectl set image --context kind-$(TEST_CLUSTER) \
@@ -98,7 +101,7 @@ _integration-inner: images
 	    port-forward svc/epochd-controller 18080:80 -n epochd & \
 	PF_PID=$$!; \
 	sleep 2; \
-	EPOCHD_URL=http://localhost:18080 go test ./e2e/... -v -tags=e2e -timeout=5m; \
+	EPOCHD_URL=http://localhost:18080 CLOCKPRINTER_IMAGE=$(CLOCKPRINTER_IMAGE) go test ./e2e/... -v -tags=e2e -timeout=5m; \
 	TEST_EXIT=$$?; \
 	kill $$PF_PID 2>/dev/null || true; \
 	exit $$TEST_EXIT
