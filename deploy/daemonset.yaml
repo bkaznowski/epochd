@@ -22,6 +22,11 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
 
+      # Give the agent 15 s to finish draining handles before the kubelet
+      # force-kills the pod. The drain itself takes <1 ms (one process_vm_writev
+      # per handle), so 15 s is generous headroom for slow k8s signal delivery.
+      terminationGracePeriodSeconds: 15
+
       tolerations:
         - operator: Exists  # run on every node including control-plane
 

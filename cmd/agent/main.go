@@ -23,7 +23,10 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"epochd/pkg/agentpb"
@@ -31,10 +34,10 @@ import (
 	"epochd/pkg/k8sresolve"
 
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func main() {
@@ -46,14 +49,31 @@ func main() {
 		log.Fatalf("agent: listen %s: %v", *listen, err)
 	}
 
+	svc := newServer()
 	srv := grpc.NewServer()
-	agentpb.RegisterAgentServiceServer(srv, newServer())
+	agentpb.RegisterAgentServiceServer(srv, svc)
 	reflection.Register(srv) // lets grpcurl/grpc-health-probe work without a proto file
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		log.Printf("agent: received shutdown signal")
+		srv.GracefulStop()
+	}()
 
 	log.Printf("agent: listening on %s", *listen)
 	if err := srv.Serve(lis); err != nil {
 		log.Fatalf("agent: serve: %v", err)
 	}
+
+	// GracefulStop has drained in-flight RPCs; now reset all injected handles so
+	// target processes are not left running with a stale fake clock.
+	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	svc.drain(drainCtx)
+	log.Printf("agent: shutdown complete")
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +84,16 @@ type handleEntry struct {
 	handle      *inject.Handle
 	lastTarget  time.Time
 	containerID string // bare container ID, for Status
+	// resetFn overrides reset behaviour; nil means call handle.SetTime(time.Now()).
+	// Populated by tests to avoid needing a real PID for process_vm_writev.
+	resetFn func() error
+}
+
+func (e *handleEntry) resetNow() error {
+	if e.resetFn != nil {
+		return e.resetFn()
+	}
+	return e.handle.SetTime(time.Now())
 }
 
 type server struct {
@@ -75,6 +105,32 @@ type server struct {
 
 func newServer() *server {
 	return &server{handles: make(map[string]*handleEntry)}
+}
+
+// drain resets all active handles to the real clock. Called on shutdown so
+// injected processes are not left running with a stale fake clock after the
+// agent exits. Errors are logged but do not abort the remaining resets.
+func (s *server) drain(ctx context.Context) {
+	s.mu.RLock()
+	snapshot := make([]*handleEntry, 0, len(s.handles))
+	for _, e := range s.handles {
+		snapshot = append(snapshot, e)
+	}
+	s.mu.RUnlock()
+
+	if len(snapshot) == 0 {
+		return
+	}
+	log.Printf("agent: resetting %d handle(s) on shutdown", len(snapshot))
+	for _, e := range snapshot {
+		if ctx.Err() != nil {
+			log.Printf("agent: drain: timed out with handles remaining")
+			return
+		}
+		if err := e.resetNow(); err != nil {
+			log.Printf("agent: drain: %v", err)
+		}
+	}
 }
 
 // Inject installs the clock hook in the container and returns a handle ID.

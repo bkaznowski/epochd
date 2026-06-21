@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -11,11 +12,11 @@ import (
 	"epochd/pkg/agentpb"
 
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // startTestServer starts an in-process gRPC server backed by the real server
@@ -124,6 +125,77 @@ func TestHandleIDUniqueness(t *testing.T) {
 			t.Fatalf("duplicate handle ID after %d calls: %s", i, id)
 		}
 		seen[id] = struct{}{}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Drain tests
+// ---------------------------------------------------------------------------
+
+// TestDrain verifies that drain calls resetNow on every handle and continues
+// past errors (one failing handle must not abort the rest).
+func TestDrain(t *testing.T) {
+	s := newServer()
+
+	var resetCalls []string
+	addHandle := func(id string, fail bool) {
+		s.mu.Lock()
+		s.handles[id] = &handleEntry{
+			resetFn: func() error {
+				resetCalls = append(resetCalls, id)
+				if fail {
+					return fmt.Errorf("simulated reset failure for %s", id)
+				}
+				return nil
+			},
+		}
+		s.mu.Unlock()
+	}
+	addHandle("h1", false)
+	addHandle("h2", false)
+	addHandle("h3", true) // fails; drain must continue to h1 and h2
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.drain(ctx)
+
+	if len(resetCalls) != 3 {
+		t.Errorf("drain reset %d handle(s), want 3", len(resetCalls))
+	}
+}
+
+// TestDrainEmpty verifies drain on a server with no handles is a no-op.
+func TestDrainEmpty(t *testing.T) {
+	s := newServer()
+	s.drain(context.Background()) // must not panic
+}
+
+// TestDrainRespectsTimeout verifies that drain stops early when its context
+// expires. We use a pre-cancelled context to trigger the timeout immediately.
+func TestDrainRespectsTimeout(t *testing.T) {
+	s := newServer()
+
+	resetCalls := 0
+	for i := range 5 {
+		i := i
+		s.mu.Lock()
+		s.handles[fmt.Sprintf("h%d", i)] = &handleEntry{
+			resetFn: func() error { resetCalls++; return nil },
+		}
+		s.mu.Unlock()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled — drain should stop immediately
+
+	s.drain(ctx)
+
+	// With a pre-cancelled context, drain should exit after the first
+	// ctx.Err() check (before or after the first reset). Either 0 or 1
+	// resets may have occurred depending on scheduling; the key guarantee
+	// is that not all 5 ran.
+	if resetCalls == 5 {
+		t.Errorf("drain ran all 5 resets despite cancelled context")
 	}
 }
 
