@@ -48,12 +48,20 @@ func (sr *statusRecorder) statusCode() int {
 	return sr.code
 }
 
-// track wraps h, recording each request in the apiRequestsTotal counter.
+// track wraps h, recording each request in the apiRequestsTotal counter and
+// logging method, path, status, and duration.
 func (c *controller) track(method, path string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		sr := &statusRecorder{ResponseWriter: w}
 		h(sr, r)
-		c.met.apiRequestsTotal.WithLabelValues(method, path, strconv.Itoa(sr.statusCode())).Inc()
+		code := sr.statusCode()
+		c.met.apiRequestsTotal.WithLabelValues(method, path, strconv.Itoa(code)).Inc()
+		c.log.Info("http",
+			"method", method,
+			"path", r.URL.Path,
+			"status", code,
+			"duration_ms", time.Since(start).Milliseconds())
 	}
 }
 

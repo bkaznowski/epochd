@@ -21,7 +21,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -32,6 +32,7 @@ import (
 	"epochd/pkg/agentpb"
 	"epochd/pkg/inject"
 	"epochd/pkg/k8sresolve"
+	applog "epochd/pkg/log"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -44,12 +45,15 @@ func main() {
 	listen := flag.String("listen", ":9100", "gRPC listen address")
 	flag.Parse()
 
+	logger := applog.New().With("component", "agent")
+
 	lis, err := net.Listen("tcp", *listen)
 	if err != nil {
-		log.Fatalf("agent: listen %s: %v", *listen, err)
+		logger.Error("listen", "addr", *listen, "err", err)
+		os.Exit(1)
 	}
 
-	svc := newServer()
+	svc := newServer(logger)
 	srv := grpc.NewServer()
 	agentpb.RegisterAgentServiceServer(srv, svc)
 	reflection.Register(srv) // lets grpcurl/grpc-health-probe work without a proto file
@@ -59,13 +63,14 @@ func main() {
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("agent: received shutdown signal")
+		logger.Info("received shutdown signal")
 		srv.GracefulStop()
 	}()
 
-	log.Printf("agent: listening on %s", *listen)
+	logger.Info("listening", "addr", *listen)
 	if err := srv.Serve(lis); err != nil {
-		log.Fatalf("agent: serve: %v", err)
+		logger.Error("serve", "err", err)
+		os.Exit(1)
 	}
 
 	// GracefulStop has drained in-flight RPCs; now reset all injected handles so
@@ -73,7 +78,7 @@ func main() {
 	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	svc.drain(drainCtx)
-	log.Printf("agent: shutdown complete")
+	logger.Info("shutdown complete")
 }
 
 // ---------------------------------------------------------------------------
@@ -101,10 +106,14 @@ type server struct {
 
 	mu      sync.RWMutex
 	handles map[string]*handleEntry
+	log     *slog.Logger
 }
 
-func newServer() *server {
-	return &server{handles: make(map[string]*handleEntry)}
+func newServer(logger *slog.Logger) *server {
+	return &server{
+		handles: make(map[string]*handleEntry),
+		log:     logger,
+	}
 }
 
 // drain resets all active handles to the real clock. Called on shutdown so
@@ -121,14 +130,14 @@ func (s *server) drain(ctx context.Context) {
 	if len(snapshot) == 0 {
 		return
 	}
-	log.Printf("agent: resetting %d handle(s) on shutdown", len(snapshot))
+	s.log.Info("resetting handles on shutdown", "count", len(snapshot))
 	for _, e := range snapshot {
 		if ctx.Err() != nil {
-			log.Printf("agent: drain: timed out with handles remaining")
+			s.log.Warn("drain timed out with handles remaining")
 			return
 		}
 		if err := e.resetNow(); err != nil {
-			log.Printf("agent: drain: %v", err)
+			s.log.Warn("drain reset failed", "err", err)
 		}
 	}
 }
@@ -165,8 +174,11 @@ func (s *server) Inject(ctx context.Context, req *agentpb.InjectRequest) (*agent
 	}
 	s.mu.Unlock()
 
-	log.Printf("agent: Inject container=%s pid=%d target=%s handle=%s",
-		shortID(req.ContainerId), pid, target.UTC().Format(time.RFC3339), id[:8])
+	s.log.Info("inject",
+		"container", shortID(req.ContainerId),
+		"pid", pid,
+		"target", target.UTC().Format(time.RFC3339),
+		"handle", id[:8])
 
 	return &agentpb.InjectResponse{HandleId: id}, nil
 }
@@ -218,7 +230,7 @@ func (s *server) Reset(ctx context.Context, req *agentpb.ResetRequest) (*agentpb
 	entry.lastTarget = now
 	s.mu.Unlock()
 
-	log.Printf("agent: Reset handle=%s pid=%d", req.HandleId[:8], entry.handle.PID)
+	s.log.Info("reset", "handle", req.HandleId[:8], "pid", entry.handle.PID)
 	return &agentpb.ResetResponse{}, nil
 }
 

@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"bytes"
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"epochd/pkg/api"
+	applog "epochd/pkg/log"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -98,7 +99,7 @@ func newTestController(t *testing.T, pods ...corev1.Pod) (*controller, *mockAgen
 		}
 	}
 	pool := &mockAgentPool{}
-	return newController(k8s, pool, nil), pool
+	return newController(k8s, pool, nil, applog.Discard()), pool
 }
 
 func doRequest(t *testing.T, handler http.Handler, method, path string, body any) *httptest.ResponseRecorder {
@@ -195,7 +196,7 @@ func TestCreateTimeshiftConflictPartialOverlap(t *testing.T) {
 		t.Fatalf("first createTimeshift: %v", err)
 	}
 
-	// Second timeshift uses a broader selector that overlaps web-a — must conflict.
+	// Second timeshift uses a broader selector that overlaps web-a â€” must conflict.
 	_, err := ctrl.createTimeshift(context.Background(), "default", "app in (web-a,web-b)", target, 0)
 	if err == nil {
 		t.Fatal("expected conflict error, got nil")
@@ -599,7 +600,7 @@ func TestListTimeshifts(t *testing.T) {
 	if list[1].ID != s2.id {
 		t.Errorf("expected second entry to be s2 (%s), got %s", s2.id[:8], list[1].ID[:8])
 	}
-	// s1 has TTL → ExpiresAt present; s2 has no TTL → ExpiresAt absent.
+	// s1 has TTL â†’ ExpiresAt present; s2 has no TTL â†’ ExpiresAt absent.
 	if list[0].ExpiresAt == "" {
 		t.Error("s1 should have ExpiresAt set")
 	}
@@ -625,7 +626,7 @@ func TestHTTPListTimeshifts(t *testing.T) {
 		t.Fatalf("expected empty slice, got %d", len(empty.Timeshifts))
 	}
 
-	// Create two timeshifts — one per pod so they don't conflict.
+	// Create two timeshifts â€” one per pod so they don't conflict.
 	target := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
 	doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
 		Namespace: "default", LabelSelector: "app=web-1", Time: target, TTL: "1h",
@@ -762,7 +763,7 @@ func TestPodWatcherSkipsAlreadyHandled(t *testing.T) {
 		return "handle-extra", nil
 	}
 
-	// Same pod, same containerID — already handled.
+	// Same pod, same containerID â€” already handled.
 	ctrl.handlePodEvent(context.Background(), &pod)
 
 	if injectCalled != 0 {
@@ -784,7 +785,7 @@ func TestMetrics(t *testing.T) {
 	ctrl, _ := newTestController(t, pod)
 	mux := ctrl.routes()
 
-	// Create a timeshift — increments inject counter and active gauge.
+	// Create a timeshift â€” increments inject counter and active gauge.
 	w := doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
 		Namespace:     "default",
 		LabelSelector: "app=web-1",
@@ -797,7 +798,7 @@ func TestMetrics(t *testing.T) {
 	var created api.TimeshiftResponse
 	decodeResponse(t, w, &created)
 
-	// Delete it — decrements active gauge.
+	// Delete it â€” decrements active gauge.
 	w = doRequest(t, mux, http.MethodDelete, "/timeshifts/"+created.ID, nil)
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("delete: got %d; body: %s", w.Code, w.Body.String())
@@ -815,9 +816,9 @@ func TestMetrics(t *testing.T) {
 		"epochd_timeshifts_active 0",
 		// Inject counter was incremented on create.
 		`epochd_inject_total{result="success"}`,
-		// API request counter recorded the POST /timeshifts → 201.
+		// API request counter recorded the POST /timeshifts â†’ 201.
 		`epochd_api_requests_total{method="POST",path="/timeshifts",status="201"}`,
-		// API request counter recorded the DELETE /timeshifts/{id} → 204.
+		// API request counter recorded the DELETE /timeshifts/{id} â†’ 204.
 		`epochd_api_requests_total{method="DELETE",path="/timeshifts/{id}",status="204"}`,
 	}
 	for _, want := range checks {
@@ -883,7 +884,7 @@ func newTestControllerWithStore(t *testing.T, pods ...corev1.Pod) (*controller, 
 	}
 	pool := &mockAgentPool{}
 	st := newStore(k8s, "epochd")
-	return newController(k8s, pool, st), pool, k8s
+	return newController(k8s, pool, st, applog.Discard()), pool, k8s
 }
 
 // TestStoreRoundTrip saves a timeshift to a fake ConfigMap and loads it back.
@@ -977,7 +978,7 @@ func TestControllerRestore(t *testing.T) {
 	}
 
 	// Simulate controller restart: new controller, same backing store.
-	ctrl2 := newController(k8s, &mockAgentPool{}, newStore(k8s, "epochd"))
+	ctrl2 := newController(k8s, &mockAgentPool{}, newStore(k8s, "epochd"), applog.Discard())
 	ctrl2.restore(ctx)
 
 	ctrl2.mu.RLock()
@@ -1013,7 +1014,7 @@ func TestControllerRestoreAfterDelete(t *testing.T) {
 		t.Fatalf("deleteTimeshift: %v", err)
 	}
 
-	ctrl2 := newController(k8s, &mockAgentPool{}, newStore(k8s, "epochd"))
+	ctrl2 := newController(k8s, &mockAgentPool{}, newStore(k8s, "epochd"), applog.Discard())
 	ctrl2.restore(ctx)
 
 	ctrl2.mu.RLock()
@@ -1040,7 +1041,7 @@ func TestControllerRestoreGauge(t *testing.T) {
 		}
 	}
 
-	ctrl2 := newController(k8s, &mockAgentPool{}, newStore(k8s, "epochd"))
+	ctrl2 := newController(k8s, &mockAgentPool{}, newStore(k8s, "epochd"), applog.Discard())
 	ctrl2.restore(ctx)
 
 	// Read the gauge via /metrics.
@@ -1092,7 +1093,7 @@ func TestHTTPResolve(t *testing.T) {
 		return "", nil
 	}
 
-	ctrl := newController(k8s, pool, nil)
+	ctrl := newController(k8s, pool, nil, applog.Discard())
 	mux := ctrl.routes()
 
 	w := doRequest(t, mux, http.MethodGet, "/resolve?namespace=default&selector=tier=frontend", nil)
@@ -1148,7 +1149,7 @@ func TestHTTPResolveExcludesNonRunning(t *testing.T) {
 	ctx := context.Background()
 	k8s := fake.NewClientset()
 
-	// Pod with a terminated container — should be excluded.
+	// Pod with a terminated container â€” should be excluded.
 	pending := corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "terminating",
@@ -1168,7 +1169,7 @@ func TestHTTPResolveExcludesNonRunning(t *testing.T) {
 		t.Fatalf("create pod: %v", err)
 	}
 
-	ctrl := newController(k8s, &mockAgentPool{}, nil)
+	ctrl := newController(k8s, &mockAgentPool{}, nil, applog.Discard())
 	w := doRequest(t, ctrl.routes(), http.MethodGet, "/resolve?namespace=default&selector=app=batch", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("got %d want 200; body: %s", w.Code, w.Body.String())
@@ -1258,7 +1259,7 @@ func TestHTTPTimeshiftStatusNotFound(t *testing.T) {
 
 // TestHTTPTimeshiftStatusAgentError verifies that a GetStatus failure from the
 // agent is reflected per-container (error field set, status nil) rather than
-// causing a non-200 HTTP response — partial status is still useful.
+// causing a non-200 HTTP response â€” partial status is still useful.
 func TestHTTPTimeshiftStatusAgentError(t *testing.T) {
 	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
 	ctrl, pool := newTestController(t, pod)

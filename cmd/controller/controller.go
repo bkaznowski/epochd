@@ -9,7 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -84,15 +84,17 @@ type controller struct {
 	mu         sync.RWMutex
 	timeshifts map[string]*timeshift
 	met        *metrics
+	log        *slog.Logger
 }
 
-func newController(k8s kubernetes.Interface, agents AgentPool, st *store) *controller {
+func newController(k8s kubernetes.Interface, agents AgentPool, st *store, logger *slog.Logger) *controller {
 	return &controller{
 		k8s:        k8s,
 		agents:     agents,
 		store:      st,
 		timeshifts: make(map[string]*timeshift),
 		met:        newMetrics(),
+		log:        logger.With("component", "controller"),
 	}
 }
 
@@ -107,11 +109,11 @@ func (c *controller) persist(ctx context.Context) {
 	data, err := c.store.encode(c.timeshifts)
 	c.mu.RUnlock()
 	if err != nil {
-		log.Printf("controller: persist: encode: %v", err)
+		c.log.Error("persist: encode", "err", err)
 		return
 	}
 	if err := c.store.flush(ctx, data); err != nil {
-		log.Printf("controller: persist: %v", err)
+		c.log.Error("persist", "err", err)
 	}
 }
 
@@ -124,7 +126,7 @@ func (c *controller) restore(ctx context.Context) {
 	}
 	timeshifts, err := c.store.load(ctx)
 	if err != nil {
-		log.Printf("controller: restore: %v (starting with empty state)", err)
+		c.log.Warn("restore: starting with empty state", "err", err)
 		return
 	}
 	if len(timeshifts) == 0 {
@@ -134,7 +136,7 @@ func (c *controller) restore(ctx context.Context) {
 	c.timeshifts = timeshifts
 	c.mu.Unlock()
 	c.met.timeshiftsActive.Set(float64(len(timeshifts)))
-	log.Printf("controller: restored %d timeshift(s) from store", len(timeshifts))
+	c.log.Info("restored timeshifts from store", "count", len(timeshifts))
 }
 
 // createTimeshift lists pods matching ns+labelSel, injects target into each running
@@ -187,8 +189,13 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 	if ttl > 0 {
 		ttlStr = ttl.String()
 	}
-	log.Printf("controller: created timeshift %s ns=%s sel=%q target=%s ttl=%s containers=%d",
-		s.id[:8], ns, labelSel, target.UTC().Format(time.RFC3339), ttlStr, len(handles))
+	c.log.Info("created timeshift",
+		"timeshift_id", s.id[:8],
+		"namespace", ns,
+		"selector", labelSel,
+		"target", target.UTC().Format(time.RFC3339),
+		"ttl", ttlStr,
+		"containers", len(handles))
 	return s, nil
 }
 
@@ -204,8 +211,10 @@ func (c *controller) injectPod(ctx context.Context, pod *corev1.Pod, target time
 		}
 		hid, err := c.agents.Inject(ctx, nodeIP, cs.ContainerID, target)
 		if err != nil {
-			log.Printf("controller: inject pod=%s/%s container=%s: %v",
-				pod.Namespace, pod.Name, cs.Name, err)
+			c.log.Warn("inject failed",
+				"pod", pod.Namespace+"/"+pod.Name,
+				"container", cs.Name,
+				"err", err)
 			c.met.injectTotal.WithLabelValues("error").Inc()
 			continue
 		}
@@ -277,17 +286,19 @@ func (c *controller) updateTimeshift(ctx context.Context, id string, target time
 			c.met.setTimeTotal.WithLabelValues("success").Inc()
 			continue
 		} else if !isAgentNotFound(err) {
-			log.Printf("controller: SetTime timeshift=%s handle=%s: %v", id[:8], h.agentHandle, err)
+			c.log.Warn("SetTime failed", "timeshift_id", id[:8], "handle", h.agentHandle, "err", err)
 			c.met.setTimeTotal.WithLabelValues("error").Inc()
 			continue
 		}
 		// Agent restarted — re-inject the container then retry.
 		c.met.setTimeTotal.WithLabelValues("error").Inc()
-		log.Printf("controller: handle %s not found on agent; re-injecting container %s",
-			h.agentHandle, h.containerID)
+		c.log.Info("re-injecting container after agent restart",
+			"timeshift_id", id[:8],
+			"handle", h.agentHandle,
+			"container_id", h.containerID)
 		newHandle, injErr := c.agents.Inject(ctx, h.nodeIP, h.containerID, target)
 		if injErr != nil {
-			log.Printf("controller: re-inject container=%s: %v", h.containerID, injErr)
+			c.log.Warn("re-inject failed", "container_id", h.containerID, "err", injErr)
 			c.met.injectTotal.WithLabelValues("error").Inc()
 			continue
 		}
@@ -321,7 +332,7 @@ func (c *controller) deleteTimeshift(ctx context.Context, id string) error {
 	c.met.timeshiftsActive.Dec()
 	c.persist(ctx)
 	c.resetHandles(ctx, s)
-	log.Printf("controller: deleted timeshift %s", id[:8])
+	c.log.Info("deleted timeshift", "timeshift_id", id[:8])
 	return nil
 }
 
@@ -332,11 +343,11 @@ func (c *controller) resetHandles(ctx context.Context, s *timeshift) {
 	for _, h := range s.handles {
 		if err := c.agents.Reset(ctx, h.nodeIP, h.agentHandle); err != nil {
 			if isAgentNotFound(err) {
-				log.Printf("controller: reset timeshift=%s handle=%s: handle already gone (agent restarted)",
-					s.id[:8], h.agentHandle)
+				c.log.Info("reset skipped: handle already gone (agent restarted)",
+					"timeshift_id", s.id[:8], "handle", h.agentHandle)
 				continue
 			}
-			log.Printf("controller: reset timeshift=%s handle=%s: %v", s.id[:8], h.agentHandle, err)
+			c.log.Warn("reset failed", "timeshift_id", s.id[:8], "handle", h.agentHandle, "err", err)
 		}
 	}
 }
@@ -374,8 +385,9 @@ func (c *controller) sweepExpired(ctx context.Context) {
 		c.persist(ctx)
 	}
 	for _, s := range expired {
-		log.Printf("controller: expiring timeshift %s (TTL exceeded by %v)",
-			s.id[:8], now.Sub(s.expiresAt).Round(time.Millisecond))
+		c.log.Info("expiring timeshift",
+			"timeshift_id", s.id[:8],
+			"overdue", now.Sub(s.expiresAt).Round(time.Millisecond).String())
 		c.met.sweepExpiredTotal.Inc()
 		c.met.timeshiftsActive.Dec()
 		c.resetHandles(ctx, s)

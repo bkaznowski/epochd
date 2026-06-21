@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"epochd/pkg/agentclient"
+	applog "epochd/pkg/log"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -31,9 +31,12 @@ func main() {
 	sweepInterval := flag.Duration("sweep-interval", 30*time.Second, "how often to sweep expired skews")
 	flag.Parse()
 
+	logger := applog.New().With("component", "controller")
+
 	k8s, err := buildK8sClient(*kubeconfig)
 	if err != nil {
-		log.Fatalf("controller: build k8s client: %v", err)
+		logger.Error("build k8s client", "err", err)
+		os.Exit(1)
 	}
 
 	pool := agentclient.NewPool(*agentPort)
@@ -44,7 +47,7 @@ func main() {
 		st = newStore(k8s, ns)
 	}
 
-	ctrl := newController(k8s, pool, st)
+	ctrl := newController(k8s, pool, st, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -60,17 +63,18 @@ func main() {
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("controller: shutting down")
+		logger.Info("shutting down")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("controller: shutdown: %v", err)
+			logger.Warn("shutdown error", "err", err)
 		}
 	}()
 
-	log.Printf("controller: listening on %s", *listen)
+	logger.Info("listening", "addr", *listen)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("controller: serve: %v", err)
+		logger.Error("serve", "err", err)
+		os.Exit(1)
 	}
 }
 

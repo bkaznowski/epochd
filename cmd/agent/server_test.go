@@ -1,15 +1,17 @@
-//go:build linux
+﻿//go:build linux
 
 package main
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"testing"
 	"time"
 
 	"epochd/pkg/agentpb"
+	applog "epochd/pkg/log"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -19,13 +21,15 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+func testLogger() *slog.Logger { return applog.Discard() }
+
 // startTestServer starts an in-process gRPC server backed by the real server
 // implementation and returns a connected client. No network port is opened.
 func startTestServer(t *testing.T) agentpb.AgentServiceClient {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20) // 1 MiB in-memory buffer
 	srv := grpc.NewServer()
-	agentpb.RegisterAgentServiceServer(srv, newServer())
+	agentpb.RegisterAgentServiceServer(srv, newServer(testLogger()))
 
 	go srv.Serve(lis) //nolint:errcheck
 	t.Cleanup(srv.GracefulStop)
@@ -135,7 +139,7 @@ func TestHandleIDUniqueness(t *testing.T) {
 // TestDrain verifies that drain calls resetNow on every handle and continues
 // past errors (one failing handle must not abort the rest).
 func TestDrain(t *testing.T) {
-	s := newServer()
+	s := newServer(testLogger())
 
 	var resetCalls []string
 	addHandle := func(id string, fail bool) {
@@ -166,14 +170,14 @@ func TestDrain(t *testing.T) {
 
 // TestDrainEmpty verifies drain on a server with no handles is a no-op.
 func TestDrainEmpty(t *testing.T) {
-	s := newServer()
+	s := newServer(testLogger())
 	s.drain(context.Background()) // must not panic
 }
 
 // TestDrainRespectsTimeout verifies that drain stops early when its context
 // expires. We use a pre-cancelled context to trigger the timeout immediately.
 func TestDrainRespectsTimeout(t *testing.T) {
-	s := newServer()
+	s := newServer(testLogger())
 
 	resetCalls := 0
 	for i := range 5 {
@@ -186,7 +190,7 @@ func TestDrainRespectsTimeout(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already cancelled — drain should stop immediately
+	cancel() // already cancelled â€” drain should stop immediately
 
 	s.drain(ctx)
 

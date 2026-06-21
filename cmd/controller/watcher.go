@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -96,8 +95,10 @@ func (c *controller) handlePodEvent(ctx context.Context, pod *corev1.Pod) {
 		}
 		c.mu.Unlock()
 
-		log.Printf("controller: pod watcher re-injected pod=%s/%s for timeshift=%s (%d containers)",
-			pod.Namespace, pod.Name, m.id[:8], len(newHandles))
+		c.log.Info("pod watcher re-injected pod",
+			"pod", pod.Namespace+"/"+pod.Name,
+			"timeshift_id", m.id[:8],
+			"containers", len(newHandles))
 	}
 }
 
