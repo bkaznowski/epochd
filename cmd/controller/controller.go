@@ -78,18 +78,61 @@ func (s *timeshift) toResponse() api.TimeshiftResponse {
 type controller struct {
 	k8s        kubernetes.Interface
 	agents     AgentPool
+	store      *store
 	mu         sync.RWMutex
 	timeshifts map[string]*timeshift
 	met        *metrics
 }
 
-func newController(k8s kubernetes.Interface, agents AgentPool) *controller {
+func newController(k8s kubernetes.Interface, agents AgentPool, st *store) *controller {
 	return &controller{
 		k8s:        k8s,
 		agents:     agents,
+		store:      st,
 		timeshifts: make(map[string]*timeshift),
 		met:        newMetrics(),
 	}
+}
+
+// persist snapshots the current registry and writes it to the backing store.
+// Encoding happens under a read lock (µs); the ConfigMap write happens outside.
+// Errors are logged but not fatal — in-memory state is always authoritative.
+func (c *controller) persist(ctx context.Context) {
+	if c.store == nil {
+		return
+	}
+	c.mu.RLock()
+	data, err := c.store.encode(c.timeshifts)
+	c.mu.RUnlock()
+	if err != nil {
+		log.Printf("controller: persist: encode: %v", err)
+		return
+	}
+	if err := c.store.flush(ctx, data); err != nil {
+		log.Printf("controller: persist: %v", err)
+	}
+}
+
+// restore loads the timeshift registry from the backing store and resets the
+// Prometheus active gauge to match. A missing ConfigMap (first run) or a nil
+// store are both treated as no-ops. Load failures are logged but not fatal.
+func (c *controller) restore(ctx context.Context) {
+	if c.store == nil {
+		return
+	}
+	timeshifts, err := c.store.load(ctx)
+	if err != nil {
+		log.Printf("controller: restore: %v (starting with empty state)", err)
+		return
+	}
+	if len(timeshifts) == 0 {
+		return
+	}
+	c.mu.Lock()
+	c.timeshifts = timeshifts
+	c.mu.Unlock()
+	c.met.timeshiftsActive.Set(float64(len(timeshifts)))
+	log.Printf("controller: restored %d timeshift(s) from store", len(timeshifts))
 }
 
 // createTimeshift lists pods matching ns+labelSel, injects target into each running
@@ -132,6 +175,7 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 	c.mu.Unlock()
 
 	c.met.timeshiftsActive.Inc()
+	c.persist(ctx)
 
 	ttlStr := "none"
 	if ttl > 0 {
@@ -254,6 +298,7 @@ func (c *controller) updateTimeshift(ctx context.Context, id string, target time
 	}
 	s.targetTime = target
 	c.mu.Unlock()
+	c.persist(ctx)
 	return s, nil
 }
 
@@ -268,6 +313,7 @@ func (c *controller) deleteTimeshift(ctx context.Context, id string) error {
 		return &notFoundError{fmt.Sprintf("timeshift %q not found", id)}
 	}
 	c.met.timeshiftsActive.Dec()
+	c.persist(ctx)
 	c.resetHandles(ctx, s)
 	log.Printf("controller: deleted timeshift %s", id[:8])
 	return nil
@@ -318,6 +364,9 @@ func (c *controller) sweepExpired(ctx context.Context) {
 	}
 	c.mu.Unlock()
 
+	if len(expired) > 0 {
+		c.persist(ctx)
+	}
 	for _, s := range expired {
 		log.Printf("controller: expiring timeshift %s (TTL exceeded by %v)",
 			s.id[:8], now.Sub(s.expiresAt).Round(time.Millisecond))

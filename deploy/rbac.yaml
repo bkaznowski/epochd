@@ -23,6 +23,34 @@ rules:
     verbs: ["get", "list", "watch"]
 
 ---
+# ConfigMap access is namespace-scoped so a Role (not ClusterRole) is used.
+# The controller needs get/create/update to maintain the epochd-state ConfigMap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: epochd-controller
+  namespace: epochd
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: epochd-controller
+  namespace: epochd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: epochd-controller
+subjects:
+  - kind: ServiceAccount
+    name: epochd-controller
+    namespace: epochd
+
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:

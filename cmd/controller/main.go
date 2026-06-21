@@ -39,11 +39,17 @@ func main() {
 	pool := agentclient.NewPool(*agentPort)
 	defer pool.Close()
 
-	ctrl := newController(k8s, pool)
+	var st *store
+	if ns := os.Getenv("CONTROLLER_NAMESPACE"); ns != "" {
+		st = newStore(k8s, ns)
+	}
+
+	ctrl := newController(k8s, pool, st)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	ctrl.restore(ctx)
 	ctrl.startSweeper(ctx, *sweepInterval)
 	ctrl.startPodWatcher(ctx)
 

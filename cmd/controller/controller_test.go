@@ -83,7 +83,7 @@ func newTestController(t *testing.T, pods ...corev1.Pod) (*controller, *mockAgen
 		}
 	}
 	pool := &mockAgentPool{}
-	return newController(k8s, pool), pool
+	return newController(k8s, pool, nil), pool
 }
 
 func doRequest(t *testing.T, handler http.Handler, method, path string, body any) *httptest.ResponseRecorder {
@@ -749,6 +749,192 @@ func TestSweepMetrics(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics missing %q\nbody:\n%s", want, body)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Store / restart-recovery tests
+// ---------------------------------------------------------------------------
+
+// newTestControllerWithStore creates a controller backed by a real (fake) store
+// so persist/restore can be exercised in unit tests.
+func newTestControllerWithStore(t *testing.T, pods ...corev1.Pod) (*controller, *mockAgentPool, *fake.Clientset) {
+	t.Helper()
+	k8s := fake.NewClientset()
+	for i := range pods {
+		if _, err := k8s.CoreV1().Pods(pods[i].Namespace).Create(context.Background(), &pods[i], metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create pod: %v", err)
+		}
+	}
+	pool := &mockAgentPool{}
+	st := newStore(k8s, "epochd")
+	return newController(k8s, pool, st), pool, k8s
+}
+
+// TestStoreRoundTrip saves a timeshift to a fake ConfigMap and loads it back.
+func TestStoreRoundTrip(t *testing.T) {
+	k8s := fake.NewClientset()
+	st := newStore(k8s, "epochd")
+	ctx := context.Background()
+
+	target := time.Date(2030, 1, 15, 12, 0, 0, 0, time.UTC)
+	original := map[string]*timeshift{
+		"abc123": {
+			id:            "abc123",
+			namespace:     "staging",
+			labelSelector: "app=svc",
+			targetTime:    target,
+			ttl:           time.Hour,
+			expiresAt:     target.Add(time.Hour),
+			createdAt:     target.Add(-time.Minute),
+			handles: []containerHandle{
+				{
+					pod:         "svc-abc",
+					container:   "main",
+					nodeIP:      "10.0.0.5",
+					containerID: "containerd://aabb1122",
+					agentHandle: "handle-xyz",
+				},
+			},
+		},
+	}
+
+	if err := st.save(ctx, original); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	loaded, err := st.load(ctx)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	got, ok := loaded["abc123"]
+	if !ok {
+		t.Fatal("loaded map missing key abc123")
+	}
+	if got.id != "abc123" {
+		t.Errorf("id: got %q want %q", got.id, "abc123")
+	}
+	if got.namespace != "staging" {
+		t.Errorf("namespace: got %q want %q", got.namespace, "staging")
+	}
+	if !got.targetTime.Equal(target) {
+		t.Errorf("targetTime: got %v want %v", got.targetTime, target)
+	}
+	if got.ttl != time.Hour {
+		t.Errorf("ttl: got %v want %v", got.ttl, time.Hour)
+	}
+	if len(got.handles) != 1 {
+		t.Fatalf("handles: got %d want 1", len(got.handles))
+	}
+	h := got.handles[0]
+	if h.pod != "svc-abc" || h.container != "main" || h.agentHandle != "handle-xyz" {
+		t.Errorf("handle fields wrong: %+v", h)
+	}
+}
+
+// TestRestoreEmptyStore verifies that a missing ConfigMap (first run) returns an
+// empty map without error.
+func TestRestoreEmptyStore(t *testing.T) {
+	k8s := fake.NewClientset()
+	st := newStore(k8s, "epochd")
+	loaded, err := st.load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(loaded) != 0 {
+		t.Errorf("expected empty map, got %d entries", len(loaded))
+	}
+}
+
+// TestControllerRestore verifies the main recovery story: a controller creates a
+// timeshift (which persists to the ConfigMap), then a second controller using
+// the same backing store recovers that timeshift on startup.
+func TestControllerRestore(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl1, _, k8s := newTestControllerWithStore(t, pod)
+	ctx := context.Background()
+
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	s, err := ctrl1.createTimeshift(ctx, "default", "app=web-1", target, time.Hour)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+
+	// Simulate controller restart: new controller, same backing store.
+	ctrl2 := newController(k8s, &mockAgentPool{}, newStore(k8s, "epochd"))
+	ctrl2.restore(ctx)
+
+	ctrl2.mu.RLock()
+	restored, ok := ctrl2.timeshifts[s.id]
+	ctrl2.mu.RUnlock()
+
+	if !ok {
+		t.Fatal("timeshift not present after restore")
+	}
+	if !restored.targetTime.Equal(target) {
+		t.Errorf("targetTime: got %v want %v", restored.targetTime, target)
+	}
+	if restored.namespace != "default" {
+		t.Errorf("namespace: got %q want %q", restored.namespace, "default")
+	}
+	if len(restored.handles) != len(s.handles) {
+		t.Errorf("handles: got %d want %d", len(restored.handles), len(s.handles))
+	}
+}
+
+// TestControllerRestoreAfterDelete verifies that deleting a timeshift removes it
+// from the store so a restarted controller starts with an empty registry.
+func TestControllerRestoreAfterDelete(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl1, _, k8s := newTestControllerWithStore(t, pod)
+	ctx := context.Background()
+
+	s, err := ctrl1.createTimeshift(ctx, "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+	if err := ctrl1.deleteTimeshift(ctx, s.id); err != nil {
+		t.Fatalf("deleteTimeshift: %v", err)
+	}
+
+	ctrl2 := newController(k8s, &mockAgentPool{}, newStore(k8s, "epochd"))
+	ctrl2.restore(ctx)
+
+	ctrl2.mu.RLock()
+	count := len(ctrl2.timeshifts)
+	ctrl2.mu.RUnlock()
+
+	if count != 0 {
+		t.Errorf("expected empty registry after restore, got %d entry/entries", count)
+	}
+}
+
+// TestControllerRestoreGauge verifies that restore correctly initialises the
+// Prometheus active-timeshifts gauge.
+func TestControllerRestoreGauge(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl1, _, k8s := newTestControllerWithStore(t, pod)
+	ctx := context.Background()
+
+	// Create two timeshifts so the gauge must be 2 after restore.
+	for range 2 {
+		if _, err := ctrl1.createTimeshift(ctx, "default", "app=web-1", time.Now().Add(time.Hour), 0); err != nil {
+			t.Fatalf("createTimeshift: %v", err)
+		}
+	}
+
+	ctrl2 := newController(k8s, &mockAgentPool{}, newStore(k8s, "epochd"))
+	ctrl2.restore(ctx)
+
+	// Read the gauge via /metrics.
+	w := doRequest(t, ctrl2.routes(), "GET", "/metrics", nil)
+	if w.Code != 200 {
+		t.Fatalf("metrics: %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "epochd_timeshifts_active 2") {
+		t.Errorf("/metrics: expected epochd_timeshifts_active 2\nbody:\n%s", body)
 	}
 }
 

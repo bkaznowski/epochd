@@ -29,6 +29,11 @@ spec:
             - "--listen=:8080"
             - "--agent-port=9100"
             - "--sweep-interval=30s"
+          env:
+            - name: CONTROLLER_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: http
               containerPort: 8080
