@@ -75,14 +75,24 @@ kind-down-test:
 
 # Build, load, deploy, and test inside the ephemeral cluster.
 # Separated so that test-integration can always run kind-down-test after it.
+# Manifests are applied one-by-one in dependency order (rbac first so the
+# namespace exists before namespace-scoped resources are created). kubectl
+# set image patches each workload to use the locally built :dev images rather
+# than the ghcr.io tags in the production manifests.
 _integration-inner: images
 	kind load docker-image $(AGENT_IMAGE)      --name $(TEST_CLUSTER)
 	kind load docker-image $(CONTROLLER_IMAGE) --name $(TEST_CLUSTER)
-	kubectl apply -f deploy/ --context kind-$(TEST_CLUSTER)
-	kubectl --context kind-$(TEST_CLUSTER) -n epochd rollout status \
-	    deployment/epochd-controller --timeout=60s
-	kubectl --context kind-$(TEST_CLUSTER) -n epochd rollout status \
-	    daemonset/epochd-agent       --timeout=60s
+	kubectl apply -f deploy/rbac.yaml --context kind-$(TEST_CLUSTER)
+	kubectl apply -f deploy/daemonset.yaml --context kind-$(TEST_CLUSTER)
+	kubectl set image --context kind-$(TEST_CLUSTER) \
+	    daemonset/epochd-agent agent=$(AGENT_IMAGE) -n epochd
+	kubectl rollout status --context kind-$(TEST_CLUSTER) \
+	    daemonset/epochd-agent -n epochd --timeout=60s
+	kubectl apply -f deploy/controller-deployment.yaml --context kind-$(TEST_CLUSTER)
+	kubectl set image --context kind-$(TEST_CLUSTER) \
+	    deployment/epochd-controller controller=$(CONTROLLER_IMAGE) -n epochd
+	kubectl rollout status --context kind-$(TEST_CLUSTER) \
+	    deployment/epochd-controller -n epochd --timeout=60s
 	@echo "Starting port-forward to epochd-controller in kind-$(TEST_CLUSTER)..."
 	kubectl --context kind-$(TEST_CLUSTER) \
 	    port-forward svc/epochd-controller 18080:80 -n epochd & \
