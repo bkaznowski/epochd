@@ -28,15 +28,11 @@ jobs:
 
       - name: Install kind
         run: |
-          curl -Lo /usr/local/bin/kind \
+          sudo curl -Lo /usr/local/bin/kind \
             "https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64"
-          chmod +x /usr/local/bin/kind
+          sudo chmod +x /usr/local/bin/kind
 
-      - name: Install kubectl
-        run: |
-          curl -Lo /usr/local/bin/kubectl \
-            "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x /usr/local/bin/kubectl
+      # kubectl is pre-installed on ubuntu-latest runners.
 
       # The agent uses ptrace. ptrace_scope=1 is sufficient when the agent pod
       # has CAP_SYS_PTRACE (it runs as privileged), but set to 0 explicitly to
