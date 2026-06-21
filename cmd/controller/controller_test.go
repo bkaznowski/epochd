@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,9 +25,10 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockAgentPool struct {
-	injectFn  func(ctx context.Context, nodeIP, containerID string, target time.Time) (string, error)
-	setTimeFn func(ctx context.Context, nodeIP, handleID string, target time.Time) error
-	resetFn   func(ctx context.Context, nodeIP, handleID string) error
+	injectFn    func(ctx context.Context, nodeIP, containerID string, target time.Time) (string, error)
+	setTimeFn   func(ctx context.Context, nodeIP, handleID string, target time.Time) error
+	resetFn     func(ctx context.Context, nodeIP, handleID string) error
+	getStatusFn func(ctx context.Context, nodeIP, handleID string) (*api.HandleStatus, error)
 }
 
 func (m *mockAgentPool) Inject(ctx context.Context, nodeIP, containerID string, target time.Time) (string, error) {
@@ -48,6 +50,18 @@ func (m *mockAgentPool) Reset(ctx context.Context, nodeIP, handleID string) erro
 		return m.resetFn(ctx, nodeIP, handleID)
 	}
 	return nil
+}
+
+func (m *mockAgentPool) GetStatus(ctx context.Context, nodeIP, handleID string) (*api.HandleStatus, error) {
+	if m.getStatusFn != nil {
+		return m.getStatusFn(ctx, nodeIP, handleID)
+	}
+	return &api.HandleStatus{
+		Generation: 0,
+		LastTarget: time.Now().UTC().Format(time.RFC3339),
+		StateAddr:  "0x0",
+		PID:        1,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,6 +1075,121 @@ func TestHTTPResolveExcludesNonRunning(t *testing.T) {
 	decodeResponse(t, w, &resp)
 	if len(resp.Pods) != 0 {
 		t.Errorf("expected 0 pods (all non-running), got %d: %+v", len(resp.Pods), resp.Pods)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Timeshift status endpoint tests
+// ---------------------------------------------------------------------------
+
+// TestHTTPTimeshiftStatus verifies GET /timeshifts/{id}/status returns live
+// injection state from the agent for each container in the timeshift.
+func TestHTTPTimeshiftStatus(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, pool := newTestController(t, pod)
+	mux := ctrl.routes()
+
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	w := doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace:     "default",
+		LabelSelector: "app=web-1",
+		Time:          target.Format(time.RFC3339),
+		TTL:           "1h",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: got %d; body: %s", w.Code, w.Body.String())
+	}
+	var created api.TimeshiftResponse
+	decodeResponse(t, w, &created)
+
+	pool.getStatusFn = func(_ context.Context, _, _ string) (*api.HandleStatus, error) {
+		return &api.HandleStatus{
+			Generation: 3,
+			LastTarget: target.Format(time.RFC3339),
+			StateAddr:  "0x7ffd1234abcd",
+			PID:        1234,
+		}, nil
+	}
+
+	w = doRequest(t, mux, http.MethodGet, "/timeshifts/"+created.ID+"/status", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d; body: %s", w.Code, w.Body.String())
+	}
+	var resp api.TimeshiftStatusResponse
+	decodeResponse(t, w, &resp)
+
+	if resp.ID != created.ID {
+		t.Errorf("ID: got %q want %q", resp.ID, created.ID)
+	}
+	if resp.Namespace != "default" {
+		t.Errorf("namespace: got %q want %q", resp.Namespace, "default")
+	}
+	if len(resp.Containers) != 1 {
+		t.Fatalf("expected 1 container entry, got %d", len(resp.Containers))
+	}
+	entry := resp.Containers[0]
+	if entry.Pod != "web-1" {
+		t.Errorf("pod: got %q want %q", entry.Pod, "web-1")
+	}
+	if entry.Status == nil {
+		t.Fatal("status is nil")
+	}
+	if entry.Status.Generation != 3 {
+		t.Errorf("generation: got %d want 3", entry.Status.Generation)
+	}
+	if entry.Status.StateAddr != "0x7ffd1234abcd" {
+		t.Errorf("stateAddr: got %q want %q", entry.Status.StateAddr, "0x7ffd1234abcd")
+	}
+	if entry.Error != "" {
+		t.Errorf("unexpected error: %q", entry.Error)
+	}
+}
+
+// TestHTTPTimeshiftStatusNotFound verifies a 404 for an unknown timeshift ID.
+func TestHTTPTimeshiftStatusNotFound(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodGet, "/timeshifts/does-not-exist/status", nil)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("got %d want 404", w.Code)
+	}
+}
+
+// TestHTTPTimeshiftStatusAgentError verifies that a GetStatus failure from the
+// agent is reflected per-container (error field set, status nil) rather than
+// causing a non-200 HTTP response — partial status is still useful.
+func TestHTTPTimeshiftStatusAgentError(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, pool := newTestController(t, pod)
+	mux := ctrl.routes()
+
+	w := doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace:     "default",
+		LabelSelector: "app=web-1",
+		Time:          time.Now().Add(time.Hour).Format(time.RFC3339),
+		TTL:           "1h",
+	})
+	var created api.TimeshiftResponse
+	decodeResponse(t, w, &created)
+
+	pool.getStatusFn = func(_ context.Context, _, _ string) (*api.HandleStatus, error) {
+		return nil, fmt.Errorf("agent unreachable")
+	}
+
+	w = doRequest(t, mux, http.MethodGet, "/timeshifts/"+created.ID+"/status", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200 (errors are per-container, not HTTP-level)", w.Code)
+	}
+	var resp api.TimeshiftStatusResponse
+	decodeResponse(t, w, &resp)
+	if len(resp.Containers) != 1 {
+		t.Fatalf("expected 1 container entry, got %d", len(resp.Containers))
+	}
+	entry := resp.Containers[0]
+	if entry.Error == "" {
+		t.Error("expected error field when agent GetStatus fails")
+	}
+	if entry.Status != nil {
+		t.Error("expected status to be nil when agent GetStatus fails")
 	}
 }
 

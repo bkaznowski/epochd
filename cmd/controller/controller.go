@@ -29,6 +29,7 @@ type AgentPool interface {
 	Inject(ctx context.Context, nodeIP, containerID string, target time.Time) (string, error)
 	SetTime(ctx context.Context, nodeIP, handleID string, target time.Time) error
 	Reset(ctx context.Context, nodeIP, handleID string) error
+	GetStatus(ctx context.Context, nodeIP, handleID string) (*api.HandleStatus, error)
 }
 
 // containerHandle records the agent-issued handle for one injected container.

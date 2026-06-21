@@ -22,6 +22,7 @@ func (c *controller) routes() *http.ServeMux {
 	mux.HandleFunc("GET /timeshifts", c.track("GET", "/timeshifts", c.handleListTimeshifts))
 	mux.HandleFunc("POST /timeshifts", c.track("POST", "/timeshifts", c.handleCreateTimeshift))
 	mux.HandleFunc("GET /timeshifts/{id}", c.track("GET", "/timeshifts/{id}", c.handleGetTimeshift))
+	mux.HandleFunc("GET /timeshifts/{id}/status", c.track("GET", "/timeshifts/{id}/status", c.handleTimeshiftStatus))
 	mux.HandleFunc("PATCH /timeshifts/{id}", c.track("PATCH", "/timeshifts/{id}", c.handleUpdateTimeshift))
 	mux.HandleFunc("DELETE /timeshifts/{id}", c.track("DELETE", "/timeshifts/{id}", c.handleDeleteTimeshift))
 	return mux
@@ -158,6 +159,46 @@ func (c *controller) handleDeleteTimeshift(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *controller) handleTimeshiftStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	s, err := c.getTimeshift(id)
+	if err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	c.mu.RLock()
+	handles := make([]containerHandle, len(s.handles))
+	copy(handles, s.handles)
+	c.mu.RUnlock()
+
+	entries := make([]api.ContainerStatusEntry, len(handles))
+	for i, h := range handles {
+		entry := api.ContainerStatusEntry{
+			Pod:       h.pod,
+			Container: h.container,
+			NodeIP:    h.nodeIP,
+		}
+		hs, err := c.agents.GetStatus(r.Context(), h.nodeIP, h.agentHandle)
+		if err != nil {
+			entry.Error = err.Error()
+		} else {
+			entry.Status = hs
+		}
+		entries[i] = entry
+	}
+
+	writeJSON(w, http.StatusOK, api.TimeshiftStatusResponse{
+		ID:         s.id,
+		Namespace:  s.namespace,
+		Containers: entries,
+	})
 }
 
 func (c *controller) handleResolve(w http.ResponseWriter, r *http.Request) {

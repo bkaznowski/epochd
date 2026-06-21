@@ -185,6 +185,16 @@ func (c *Client) DeleteTimeshift(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/timeshifts/"+id, nil, nil)
 }
 
+// TimeshiftStatus returns the live injection state for every container in the
+// timeshift, as read from the trampoline state struct by each node agent.
+func (c *Client) TimeshiftStatus(ctx context.Context, id string) (*api.TimeshiftStatusResponse, error) {
+	var resp api.TimeshiftStatusResponse
+	if err := c.do(ctx, http.MethodGet, "/timeshifts/"+id+"/status", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Resolve returns the pods and running containers that would be targeted by a
 // timeshift with the given namespace and label selector. No injection is
 // performed and no controller state is changed.

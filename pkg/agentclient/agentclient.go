@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"epochd/pkg/agentpb"
+	"epochd/pkg/api"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -74,6 +75,24 @@ func (p *Pool) Reset(ctx context.Context, nodeIP, handleID string) error {
 		return fmt.Errorf("agentclient: Reset on %s: %w", nodeIP, err)
 	}
 	return nil
+}
+
+// GetStatus calls the agent's Status RPC and returns the live injection state.
+func (p *Pool) GetStatus(ctx context.Context, nodeIP, handleID string) (*api.HandleStatus, error) {
+	c, err := p.clientFor(nodeIP)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.Status(ctx, &agentpb.StatusRequest{HandleId: handleID})
+	if err != nil {
+		return nil, fmt.Errorf("agentclient: GetStatus on %s: %w", nodeIP, err)
+	}
+	return &api.HandleStatus{
+		Generation: resp.Generation,
+		LastTarget: resp.LastTargetTime.AsTime().UTC().Format(time.RFC3339),
+		StateAddr:  resp.StateAddr,
+		PID:        resp.Pid,
+	}, nil
 }
 
 // Close closes all pooled connections.

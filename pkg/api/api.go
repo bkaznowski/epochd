@@ -45,6 +45,32 @@ type ResolvedPod struct {
 	Containers []string `json:"containers"` // running containers, sorted
 }
 
+// HandleStatus is the live injection state for one container, as read directly
+// from the trampoline's state struct by the agent.
+type HandleStatus struct {
+	Generation uint32 `json:"generation"` // bumped on each SetTime; 0 after initial Inject
+	LastTarget string `json:"lastTarget"` // RFC3339, last time written by Inject or SetTime
+	StateAddr  string `json:"stateAddr"`  // hex address of the state struct, for debugging
+	PID        int32  `json:"pid"`        // host PID of the injected process
+}
+
+// ContainerStatusEntry is the live injection state for one container within a
+// timeshift. Error is set (and Status is nil) when the agent GetStatus call fails.
+type ContainerStatusEntry struct {
+	Pod       string        `json:"pod"`
+	Container string        `json:"container"`
+	NodeIP    string        `json:"nodeIP"`
+	Status    *HandleStatus `json:"status,omitempty"`
+	Error     string        `json:"error,omitempty"`
+}
+
+// TimeshiftStatusResponse is returned by GET /timeshifts/{id}/status.
+type TimeshiftStatusResponse struct {
+	ID         string                 `json:"id"`
+	Namespace  string                 `json:"namespace"`
+	Containers []ContainerStatusEntry `json:"containers"`
+}
+
 // ErrorResponse is the JSON body of all 4xx/5xx responses.
 type ErrorResponse struct {
 	Error string `json:"error"`
