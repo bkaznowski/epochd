@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 )
@@ -85,6 +86,7 @@ type controller struct {
 	timeshifts map[string]*timeshift
 	met        *metrics
 	log        *slog.Logger
+	recorder   record.EventRecorder // nil = no events posted
 }
 
 func newController(k8s kubernetes.Interface, agents AgentPool, st *store, logger *slog.Logger) *controller {
@@ -97,6 +99,10 @@ func newController(k8s kubernetes.Interface, agents AgentPool, st *store, logger
 		log:        logger.With("component", "controller"),
 	}
 }
+
+// setRecorder sets the Kubernetes EventRecorder used to post TTL-expiry events
+// on pods. Must be called before the sweeper starts.
+func (c *controller) setRecorder(r record.EventRecorder) { c.recorder = r }
 
 // persist snapshots the current registry and writes it to the backing store.
 // Encoding happens under a read lock (µs); the ConfigMap write happens outside.
@@ -390,7 +396,34 @@ func (c *controller) sweepExpired(ctx context.Context) {
 			"overdue", now.Sub(s.expiresAt).Round(time.Millisecond).String())
 		c.met.sweepExpiredTotal.Inc()
 		c.met.timeshiftsActive.Dec()
+		c.postExpiryEvents(s)
 		c.resetHandles(ctx, s)
+	}
+}
+
+// postExpiryEvents emits a Kubernetes Event on each unique pod targeted by s,
+// recording that the timeshift expired and which time it had been set to.
+// No-op when c.recorder is nil.
+func (c *controller) postExpiryEvents(s *timeshift) {
+	if c.recorder == nil {
+		return
+	}
+	msg := fmt.Sprintf("Timeshift %s (target: %s) expired after %s",
+		s.id[:8], s.targetTime.UTC().Format(time.RFC3339), s.ttl.String())
+
+	seen := make(map[string]bool, len(s.handles))
+	for _, h := range s.handles {
+		if seen[h.pod] {
+			continue
+		}
+		seen[h.pod] = true
+		podRef := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      h.pod,
+				Namespace: s.namespace,
+			},
+		}
+		c.recorder.Event(podRef, corev1.EventTypeNormal, "TimeshiftExpired", msg)
 	}
 }
 

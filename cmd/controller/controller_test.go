@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/record"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 )
@@ -865,6 +866,113 @@ func TestSweepMetrics(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics missing %q\nbody:\n%s", want, body)
 		}
+	}
+}
+
+// TestSweepEmitsEvent verifies that sweepExpired posts a Kubernetes Event for
+// each unique pod whose timeshift has expired.
+func TestSweepEmitsEvent(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+
+	fake := record.NewFakeRecorder(10)
+	ctrl.setRecorder(fake)
+
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+
+	ctrl.mu.Lock()
+	ctrl.timeshifts[s.id].expiresAt = time.Now().Add(-time.Second)
+	ctrl.mu.Unlock()
+	ctrl.sweepExpired(context.Background())
+
+	select {
+	case ev := <-fake.Events:
+		if !strings.Contains(ev, "TimeshiftExpired") {
+			t.Errorf("event reason missing TimeshiftExpired: %q", ev)
+		}
+		if !strings.Contains(ev, s.id[:8]) {
+			t.Errorf("event missing timeshift ID %s: %q", s.id[:8], ev)
+		}
+		if !strings.Contains(ev, target.Format(time.RFC3339)) {
+			t.Errorf("event missing target time %s: %q", target.Format(time.RFC3339), ev)
+		}
+		if !strings.Contains(ev, "1h0m0s") {
+			t.Errorf("event missing TTL duration: %q", ev)
+		}
+	default:
+		t.Fatal("expected an event to be emitted, but channel was empty")
+	}
+
+	// Only one event per pod even if the pod has multiple containers in the timeshift.
+	if len(fake.Events) != 0 {
+		t.Errorf("expected exactly 1 event, got %d extra", len(fake.Events))
+	}
+}
+
+// TestSweepEmitsOneEventPerPod verifies that a timeshift with two handles on the
+// same pod emits exactly one event, not one per container.
+func TestSweepEmitsOneEventPerPod(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+
+	fake := record.NewFakeRecorder(10)
+	ctrl.setRecorder(fake)
+
+	target := time.Now().Add(time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+	// Manually add a second handle on the same pod to simulate two containers.
+	ctrl.mu.Lock()
+	ctrl.timeshifts[s.id].handles = append(ctrl.timeshifts[s.id].handles, containerHandle{
+		pod: "web-1", container: "sidecar", nodeIP: "10.0.0.1",
+	})
+	ctrl.timeshifts[s.id].expiresAt = time.Now().Add(-time.Second)
+	ctrl.mu.Unlock()
+
+	ctrl.sweepExpired(context.Background())
+
+	if len(fake.Events) != 1 {
+		t.Errorf("expected 1 event for 1 pod, got %d", len(fake.Events))
+	}
+}
+
+// TestExpiredCounterIncrements verifies the Prometheus sweep counter increments
+// once per expired timeshift.
+func TestExpiredCounterIncrements(t *testing.T) {
+	pod1 := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	pod2 := makePod("web-2", "default", "10.0.0.2", "containerd://ddeeff445566")
+	ctrl, _ := newTestController(t, pod1, pod2)
+	mux := ctrl.routes()
+
+	for _, sel := range []string{"app=web-1", "app=web-2"} {
+		w := doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+			Namespace:     "default",
+			LabelSelector: sel,
+			Time:          time.Now().Add(time.Hour).Format(time.RFC3339),
+			TTL:           "1ms",
+		})
+		if w.Code != http.StatusCreated {
+			t.Fatalf("create %s: got %d; body: %s", sel, w.Code, w.Body.String())
+		}
+		var created api.TimeshiftResponse
+		decodeResponse(t, w, &created)
+		ctrl.mu.Lock()
+		ctrl.timeshifts[created.ID].expiresAt = time.Now().Add(-time.Second)
+		ctrl.mu.Unlock()
+	}
+
+	ctrl.sweepExpired(context.Background())
+
+	w := doRequest(t, mux, http.MethodGet, "/metrics", nil)
+	body := w.Body.String()
+	if !strings.Contains(body, "epochd_sweep_expired_total 2") {
+		t.Errorf("expected epochd_sweep_expired_total 2 in metrics; body:\n%s", body)
 	}
 }
 

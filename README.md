@@ -511,7 +511,7 @@ as closures over a channel and executed on that pinned thread.
 | 26 | Conflict guard (reject overlapping timeshifts, `409 Conflict`) | ✅ |
 | 27 | `faketimectl` subcommand completeness (`update`, `status`) | ✅ |
 | 28 | Structured logging (`log/slog`, JSON output, `LOG_LEVEL`) | ✅ |
-| 29 | TTL expiry Kubernetes Events + `timeshift_expired_total` counter | 🔲 |
+| 29 | TTL expiry Kubernetes Events + `timeshift_expired_total` counter | ✅ |
 | 30 | Lease-based leader election (`coordination.k8s.io/Lease`) | 🔲 |
 | 31 | Validating webhook admission controller | 🔲 |
 | 32 | `pkg/localtime` Attach path (`CAP_SYS_PTRACE`) | 🔲 |

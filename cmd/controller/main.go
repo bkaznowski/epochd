@@ -19,9 +19,13 @@ import (
 	"epochd/pkg/agentclient"
 	applog "epochd/pkg/log"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 )
 
 func main() {
@@ -48,6 +52,16 @@ func main() {
 	}
 
 	ctrl := newController(k8s, pool, st, logger)
+
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{
+		Interface: k8s.CoreV1().Events(""),
+	})
+	ctrl.setRecorder(broadcaster.NewRecorder(
+		scheme.Scheme,
+		corev1.EventSource{Component: "epochd-controller"},
+	))
+	defer broadcaster.Shutdown()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
