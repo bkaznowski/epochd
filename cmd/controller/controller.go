@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -147,6 +148,10 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 	}
 	if len(pods.Items) == 0 {
 		return nil, &notFoundError{fmt.Sprintf("no pods in namespace %q match selector %q", ns, labelSel)}
+	}
+
+	if err := c.checkConflicts(ns, pods.Items); err != nil {
+		return nil, err
 	}
 
 	var handles []containerHandle
@@ -382,6 +387,68 @@ func (c *controller) sweepExpired(ctx context.Context) {
 type notFoundError struct{ msg string }
 
 func (e *notFoundError) Error() string { return e.msg }
+
+// conflictError is returned by createTimeshift when one or more of the
+// resolved containers is already tracked by an active timeshift.
+type conflictError struct{ entries []conflictEntry }
+
+type conflictEntry struct {
+	pod         string
+	container   string
+	timeshiftID string
+}
+
+func (e *conflictError) Error() string {
+	parts := make([]string, len(e.entries))
+	for i, ce := range e.entries {
+		parts[i] = fmt.Sprintf("%s/%s (timeshift %s)", ce.pod, ce.container, ce.timeshiftID[:8])
+	}
+	return "containers already have an active timeshift: " + strings.Join(parts, ", ")
+}
+
+// occupiedContainers returns a map of "namespace\x00pod\x00container" → timeshiftID
+// for every container currently tracked by an active timeshift.
+// Must be called with c.mu held for reading.
+func (c *controller) occupiedContainers() map[string]string {
+	m := make(map[string]string)
+	for _, s := range c.timeshifts {
+		for _, h := range s.handles {
+			key := s.namespace + "\x00" + h.pod + "\x00" + h.container
+			m[key] = s.id
+		}
+	}
+	return m
+}
+
+// checkConflicts returns a conflictError if any running container in pods is
+// already tracked by another timeshift, nil otherwise.
+func (c *controller) checkConflicts(ns string, pods []corev1.Pod) error {
+	c.mu.RLock()
+	occupied := c.occupiedContainers()
+	c.mu.RUnlock()
+
+	var conflicts []conflictEntry
+	for i := range pods {
+		pod := &pods[i]
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.State.Running == nil || cs.ContainerID == "" {
+				continue
+			}
+			key := ns + "\x00" + pod.Name + "\x00" + cs.Name
+			if existingID, ok := occupied[key]; ok {
+				conflicts = append(conflicts, conflictEntry{
+					pod:         pod.Name,
+					container:   cs.Name,
+					timeshiftID: existingID,
+				})
+			}
+		}
+	}
+	if len(conflicts) > 0 {
+		return &conflictError{entries: conflicts}
+	}
+	return nil
+}
 
 // isAgentNotFound reports whether err (possibly wrapped) is a gRPC NOT_FOUND status,
 // indicating the agent restarted and lost its in-memory handle.

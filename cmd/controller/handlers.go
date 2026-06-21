@@ -102,6 +102,10 @@ func (c *controller) handleCreateTimeshift(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if isConflict(err) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -259,4 +263,9 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 func isNotFound(err error) bool {
 	var nf *notFoundError
 	return errors.As(err, &nf)
+}
+
+func isConflict(err error) bool {
+	var ce *conflictError
+	return errors.As(err, &ce)
 }

@@ -1361,3 +1361,59 @@ updates the valid one.
 **`TestWithSession`** — end-to-end test of the `WithSession` helper: verify `t.Cleanup`
 fires correctly by tracking whether Reset was called when `fn` returns normally and when
 `fn` calls `t.Fatal`.
+
+---
+
+## Phase 26 — Conflict guard (prevent overlapping timeshifts)
+
+**Goal**: reject `POST /timeshifts` when any container that would be targeted is already
+tracked by an active timeshift. This prevents the silent corruption described in the
+known-limitations section (two handles pointing at the same vDSO trampoline entry with one
+stale state struct).
+
+### Behaviour
+
+`createTimeshift` checks all running containers matched by the selector against the current
+registry before calling `agents.Inject`. If any container is already owned by a different
+timeshift the request fails immediately — no injection is attempted, no partial state is
+created.
+
+**HTTP response**: `409 Conflict` with a JSON error body naming each conflicting container
+and the timeshift ID that owns it.
+
+**SDK helper**: `sdk.IsConflict(err) bool` mirrors `sdk.IsNotFound`.
+
+### Implementation
+
+**`cmd/controller/controller.go`**:
+
+```go
+// occupiedContainers returns a map of "namespace\x00pod\x00container" → timeshiftID
+// for every container currently tracked by an active timeshift.
+// Must be called with c.mu held for reading.
+func (c *controller) occupiedContainers() map[string]string
+
+// checkConflicts returns a *conflictError if any running container in pods is
+// already tracked by another timeshift, nil otherwise.
+func (c *controller) checkConflicts(ns string, pods []corev1.Pod) error
+```
+
+`createTimeshift` calls `checkConflicts` after listing pods, before any `Inject` calls.
+
+**`cmd/controller/handlers.go`**: `isConflict(err) bool` helper; `handleCreateTimeshift`
+returns `http.StatusConflict` when `isConflict` is true.
+
+**`pkg/sdk/sdk.go`**: `IsConflict(err error) bool`.
+
+### Tests
+
+- `TestCreateTimeshiftConflictSamePod` — second timeshift with identical selector fails.
+- `TestCreateTimeshiftConflictPartialOverlap` — broader selector overlapping one already-owned container fails.
+- `TestCreateTimeshiftNoConflictAfterDelete` — after deleting first timeshift the same pod is targetable again.
+- `TestHTTPCreateTimeshiftConflict` — HTTP layer returns 409 with descriptive message.
+
+### Side-effects on existing tests
+
+Three pre-existing tests (`TestListTimeshifts`, `TestHTTPListTimeshifts`,
+`TestControllerRestoreGauge`) created two timeshifts for the same pod to exercise list /
+restore logic. These were updated to use two distinct pods with separate selectors.

@@ -509,6 +509,7 @@ as closures over a channel and executed on that pinned thread.
 | 23 | Agent handle status RPC (`GetStatus`) | ✅ |
 | 24 | Python SDK | 🔲 |
 | 25 | Local process injection (`pkg/localtime`, non-Kubernetes) | ✅ |
+| 26 | Conflict guard (reject overlapping timeshifts, `409 Conflict`) | ✅ |
 
 See `plan.md` for the detailed specification of all phases.
 See `FUTURE.md` for longer-horizon improvements (auth, multi-arch, Helm, HA).

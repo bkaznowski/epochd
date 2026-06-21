@@ -1,0 +1,1322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>epochd — fake time injection for Linux processes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" id="hljs-light">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" id="hljs-dark" disabled>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<style>
+:root {
+  --nav-width: 260px;
+  --header-h: 56px;
+  --color-bg: #ffffff;
+  --color-surface: #f6f8fa;
+  --color-border: #d0d7de;
+  --color-text: #1f2328;
+  --color-muted: #57606a;
+  --color-accent: #0969da;
+  --color-accent-bg: #ddf4ff;
+  --color-code-bg: #f6f8fa;
+  --color-code-border: #d0d7de;
+  --color-nav-bg: #1b1f24;
+  --color-nav-text: #c9d1d9;
+  --color-nav-active: #ffffff;
+  --color-nav-hover: #e6edf3;
+  --color-warn-bg: #fff8c5;
+  --color-warn-border: #d4a72c;
+  --color-warn-text: #633c01;
+  --color-danger-bg: #ffebe9;
+  --color-danger-border: #ff8182;
+  --color-danger-text: #82071e;
+  --color-success-bg: #dafbe1;
+  --color-success-border: #2da44e;
+  --color-success-text: #1a4f1e;
+  --radius: 6px;
+  --shadow: 0 1px 3px rgba(0,0,0,.08);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #0d1117;
+    --color-surface: #161b22;
+    --color-border: #30363d;
+    --color-text: #e6edf3;
+    --color-muted: #8b949e;
+    --color-accent: #58a6ff;
+    --color-accent-bg: #0d2d6b;
+    --color-code-bg: #161b22;
+    --color-code-border: #30363d;
+    --color-warn-bg: #2d2100;
+    --color-warn-border: #9e6a03;
+    --color-warn-text: #e3b341;
+    --color-danger-bg: #300c10;
+    --color-danger-border: #b62324;
+    --color-danger-text: #ff7b72;
+    --color-success-bg: #0d2b14;
+    --color-success-border: #238636;
+    --color-success-text: #3fb950;
+  }
+  #hljs-light { disabled: true; display: none; }
+  #hljs-dark { disabled: false; display: block; }
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+/* ── Top bar ──────────────────────────────── */
+.topbar {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 200;
+  height: var(--header-h);
+  background: var(--color-nav-bg);
+  display: flex; align-items: center;
+  padding: 0 1.25rem;
+  border-bottom: 1px solid #30363d;
+}
+.topbar-brand {
+  font-size: 17px; font-weight: 600; color: #fff;
+  text-decoration: none; letter-spacing: -.3px;
+  display: flex; align-items: center; gap: 10px;
+}
+.topbar-brand .badge {
+  font-size: 11px; font-weight: 500;
+  background: #238636; color: #fff;
+  padding: 1px 7px; border-radius: 20px;
+}
+.topbar-links {
+  margin-left: auto; display: flex; gap: 1.5rem;
+}
+.topbar-links a {
+  color: var(--color-nav-text); text-decoration: none;
+  font-size: 14px;
+  transition: color .15s;
+}
+.topbar-links a:hover { color: #fff; }
+.menu-btn {
+  display: none; background: none; border: none;
+  color: #fff; font-size: 22px; cursor: pointer;
+  margin-right: 12px; line-height: 1;
+}
+
+/* ── Sidebar nav ──────────────────────────── */
+.sidebar {
+  position: fixed; top: var(--header-h); left: 0; bottom: 0;
+  width: var(--nav-width);
+  background: var(--color-nav-bg);
+  overflow-y: auto; z-index: 100;
+  padding: 1.25rem 0;
+  border-right: 1px solid #30363d;
+}
+.nav-section-label {
+  font-size: 11px; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase;
+  color: #6e7681; padding: .6rem 1.25rem .3rem;
+  margin-top: .5rem;
+}
+.sidebar a {
+  display: block; padding: .38rem 1.25rem;
+  color: var(--color-nav-text); text-decoration: none;
+  font-size: 13.5px; border-left: 2px solid transparent;
+  transition: color .12s, background .12s;
+}
+.sidebar a:hover { color: var(--color-nav-hover); background: rgba(255,255,255,.04); }
+.sidebar a.active { color: var(--color-nav-active); border-left-color: var(--color-accent); font-weight: 500; }
+
+/* ── Main content ─────────────────────────── */
+.main {
+  margin-left: var(--nav-width);
+  padding-top: var(--header-h);
+  min-height: 100vh;
+}
+.content {
+  max-width: 820px;
+  padding: 3rem 2.5rem 5rem;
+}
+
+/* ── Typography ───────────────────────────── */
+h1 { font-size: 2rem; font-weight: 600; letter-spacing: -.4px; line-height: 1.25; margin-bottom: .5rem; }
+h2 { font-size: 1.4rem; font-weight: 600; letter-spacing: -.2px; margin: 3rem 0 .75rem; padding-top: 3rem; border-top: 1px solid var(--color-border); }
+h2:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+h3 { font-size: 1.05rem; font-weight: 600; margin: 1.75rem 0 .5rem; }
+h4 { font-size: .9rem; font-weight: 600; margin: 1.25rem 0 .35rem; color: var(--color-muted); text-transform: uppercase; letter-spacing: .04em; }
+p { margin: .75rem 0; color: var(--color-text); }
+strong { font-weight: 600; }
+a { color: var(--color-accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+ul, ol { margin: .75rem 0 .75rem 1.4rem; }
+li { margin: .3rem 0; }
+li li { margin: .15rem 0; }
+.lead { font-size: 1.05rem; color: var(--color-muted); margin: .5rem 0 1.5rem; line-height: 1.6; }
+
+/* ── Hero ─────────────────────────────────── */
+.hero { margin-bottom: 2rem; }
+.hero h1 { margin-bottom: .25rem; }
+.badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 1rem 0 1.5rem; }
+.badges img { height: 20px; }
+.pill-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px; margin: 1.5rem 0;
+}
+.pill {
+  background: var(--color-surface); border: 1px solid var(--color-border);
+  border-radius: var(--radius); padding: .7rem 1rem;
+  display: flex; align-items: flex-start; gap: .6rem;
+}
+.pill-icon { font-size: 18px; line-height: 1.5; flex-shrink: 0; }
+.pill p { margin: 0; font-size: 13.5px; }
+.pill strong { display: block; margin-bottom: 1px; }
+
+/* ── Code ─────────────────────────────────── */
+pre {
+  background: var(--color-code-bg); border: 1px solid var(--color-code-border);
+  border-radius: var(--radius); padding: 1rem 1.25rem;
+  overflow-x: auto; margin: 1rem 0;
+  font-size: 13px; line-height: 1.6;
+}
+code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, Consolas, monospace;
+}
+p code, li code, td code {
+  background: var(--color-code-bg); border: 1px solid var(--color-code-border);
+  border-radius: 3px; padding: .15em .4em; font-size: .88em;
+}
+pre code { background: none; border: none; padding: 0; font-size: 1em; }
+
+/* ── Callouts ─────────────────────────────── */
+.callout {
+  border-radius: var(--radius); padding: .85rem 1.1rem;
+  margin: 1.25rem 0; border-left: 3px solid;
+  display: flex; gap: .6rem;
+}
+.callout-icon { flex-shrink: 0; font-size: 16px; line-height: 1.7; }
+.callout-body { flex: 1; }
+.callout-body p { margin: .35rem 0; }
+.callout-body p:first-child { margin-top: 0; }
+.callout-body p:last-child { margin-bottom: 0; }
+.callout-title { font-weight: 600; margin-bottom: .25rem !important; }
+.callout.warn { background: var(--color-warn-bg); border-color: var(--color-warn-border); color: var(--color-warn-text); }
+.callout.danger { background: var(--color-danger-bg); border-color: var(--color-danger-border); color: var(--color-danger-text); }
+.callout.info { background: var(--color-accent-bg); border-color: var(--color-accent); color: var(--color-text); }
+.callout.success { background: var(--color-success-bg); border-color: var(--color-success-border); color: var(--color-success-text); }
+
+/* ── Tables ───────────────────────────────── */
+.table-wrap { overflow-x: auto; margin: 1rem 0; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+th {
+  background: var(--color-surface); text-align: left;
+  padding: .55rem .85rem; font-weight: 600; font-size: 12px;
+  letter-spacing: .03em; text-transform: uppercase; color: var(--color-muted);
+  border-bottom: 1px solid var(--color-border);
+}
+td {
+  padding: .55rem .85rem; border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+}
+tr:last-child td { border-bottom: none; }
+
+/* ── Steps ────────────────────────────────── */
+.steps { counter-reset: step; margin: 1.25rem 0; }
+.step {
+  display: flex; gap: 1rem; margin: 1.25rem 0;
+  counter-increment: step;
+}
+.step-num {
+  flex-shrink: 0; width: 28px; height: 28px;
+  background: var(--color-accent); color: #fff;
+  border-radius: 50%; display: flex; align-items: center;
+  justify-content: center; font-size: 13px; font-weight: 600;
+  margin-top: 3px;
+}
+.step-num::before { content: counter(step); }
+.step-body { flex: 1; }
+.step-body h3 { margin: 0 0 .4rem; }
+.step-body p, .step-body pre { margin-top: .4rem; }
+
+/* ── API endpoint list ─────────────────────── */
+.endpoint {
+  border: 1px solid var(--color-border); border-radius: var(--radius);
+  margin: 1rem 0; overflow: hidden;
+}
+.endpoint-header {
+  display: flex; align-items: center; gap: .7rem;
+  padding: .6rem 1rem; background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+.method {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; font-weight: 600;
+  padding: .2rem .5rem; border-radius: 4px;
+}
+.method.get { background: #dafbe1; color: #116329; }
+.method.post { background: #ddf4ff; color: #0550ae; }
+.method.patch { background: #fff8c5; color: #633c01; }
+.method.delete { background: #ffebe9; color: #82071e; }
+@media (prefers-color-scheme: dark) {
+  .method.get { background: #0d2b14; color: #3fb950; }
+  .method.post { background: #0d2d6b; color: #79c0ff; }
+  .method.patch { background: #2d2100; color: #e3b341; }
+  .method.delete { background: #300c10; color: #ff7b72; }
+}
+.endpoint-path { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 500; }
+.endpoint-desc { font-size: 13.5px; color: var(--color-muted); margin-left: auto; }
+.endpoint-body { padding: .85rem 1rem; }
+.endpoint-body p { margin: 0; font-size: 13.5px; }
+
+/* ── Arch diagram ─────────────────────────── */
+.arch {
+  background: var(--color-surface); border: 1px solid var(--color-border);
+  border-radius: var(--radius); padding: 1.25rem 1.5rem; margin: 1.25rem 0;
+  font-family: 'JetBrains Mono', monospace; font-size: 12.5px;
+  line-height: 1.8; overflow-x: auto; white-space: pre;
+  color: var(--color-text);
+}
+
+/* ── Two-column comparison ─────────────────── */
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.25rem 0; }
+.compare-card {
+  border: 1px solid var(--color-border); border-radius: var(--radius); padding: 1rem 1.1rem;
+}
+.compare-card h3 { margin: 0 0 .5rem; font-size: 1rem; }
+.compare-card ul { margin: .5rem 0 0 1.2rem; }
+.compare-card li { font-size: 13.5px; margin: .25rem 0; }
+
+/* ── Mode cards ───────────────────────────── */
+.mode-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin: 1.25rem 0; }
+.mode-card {
+  border: 1px solid var(--color-border); border-radius: var(--radius);
+  padding: 1.1rem 1.25rem; background: var(--color-surface);
+}
+.mode-card h3 { margin: 0 0 .35rem; font-size: .95rem; }
+.mode-card .tag {
+  display: inline-block; font-size: 11px; font-weight: 500;
+  padding: 1px 8px; border-radius: 20px; margin-bottom: .6rem;
+}
+.mode-card .tag.k8s { background: #ddf4ff; color: #0550ae; }
+.mode-card .tag.local { background: #dafbe1; color: #116329; }
+.mode-card .tag.cli { background: #fff8c5; color: #633c01; }
+@media (prefers-color-scheme: dark) {
+  .mode-card .tag.k8s { background: #0d2d6b; color: #79c0ff; }
+  .mode-card .tag.local { background: #0d2b14; color: #3fb950; }
+  .mode-card .tag.cli { background: #2d2100; color: #e3b341; }
+}
+.mode-card p { font-size: 13.5px; margin: .35rem 0 0; color: var(--color-muted); }
+
+/* ── Responsive ───────────────────────────── */
+@media (max-width: 900px) {
+  :root { --nav-width: 0px; }
+  .sidebar { transform: translateX(-260px); width: 260px; transition: transform .2s; }
+  .sidebar.open { transform: translateX(0); --nav-width: 260px; }
+  .menu-btn { display: block; }
+  .main { margin-left: 0; }
+  .content { padding: 2rem 1.25rem 4rem; }
+  .compare { grid-template-columns: 1fr; }
+  h2 { font-size: 1.25rem; }
+  h1 { font-size: 1.6rem; }
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">&#9776;</button>
+  <a href="#" class="topbar-brand">
+    <span>epochd</span>
+    <span class="badge">v1</span>
+  </a>
+  <nav class="topbar-links">
+    <a href="https://github.com/bkaznowski/epochd">GitHub</a>
+    <a href="https://github.com/bkaznowski/epochd/releases">Releases</a>
+  </nav>
+</header>
+
+<nav class="sidebar" id="sidebar" aria-label="Documentation navigation">
+  <a href="#overview">Overview</a>
+  <a href="#how-it-works">How it works</a>
+  <a href="#choose-your-path">Choose your path</a>
+
+  <div class="nav-section-label">Kubernetes cluster</div>
+  <a href="#k8s-prerequisites">Prerequisites</a>
+  <a href="#k8s-deploy">Deploy</a>
+  <a href="#k8s-usage">Using the SDK</a>
+  <a href="#k8s-api">HTTP API reference</a>
+
+  <div class="nav-section-label">Go tests (no cluster)</div>
+  <a href="#local-overview">Overview</a>
+  <a href="#local-quickstart">Quickstart</a>
+  <a href="#local-api">API reference</a>
+
+  <div class="nav-section-label">CLI tool</div>
+  <a href="#cli-install">Install &amp; run</a>
+
+  <div class="nav-section-label">Security</div>
+  <a href="#security-model">Security model</a>
+  <a href="#security-concerns">Concerns &amp; mitigations</a>
+
+  <div class="nav-section-label">Reference</div>
+  <a href="#limitations">Known limitations</a>
+  <a href="#requirements">Requirements</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#faq">FAQ</a>
+</nav>
+
+<main class="main">
+<div class="content">
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<section id="overview">
+<div class="hero">
+  <h1>epochd</h1>
+  <p class="lead">Inject a fake wall-clock time into any running Linux process — without restarting it, modifying its binary, or stopping it for more than a millisecond. Purpose-built for testing time-sensitive behaviour in Kubernetes pods and Go programs.</p>
+
+  <div class="badges">
+    <img src="https://github.com/bkaznowski/epochd/actions/workflows/ci.yml/badge.svg" alt="CI status">
+    <img src="https://img.shields.io/badge/go-1.26-blue.svg" alt="Go 1.26">
+    <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license">
+    <img src="https://img.shields.io/badge/platform-linux%20x86--64-lightgrey.svg" alt="linux x86-64">
+  </div>
+
+  <div class="pill-grid">
+    <div class="pill">
+      <span class="pill-icon">⚡</span>
+      <p><strong>Live updates in ~1 µs</strong>After the one-time injection, changing the time costs a single <code>process_vm_writev</code> call — no ptrace stop required.</p>
+    </div>
+    <div class="pill">
+      <span class="pill-icon">🎯</span>
+      <p><strong>Per-pod precision</strong>Target specific pods by label selector. Other pods on the same node see real time.</p>
+    </div>
+    <div class="pill">
+      <span class="pill-icon">🧪</span>
+      <p><strong>Test-first design</strong>Auto-cleanup on test failure, TTL-gated timeshifts, and a <code>WithTimeT</code> helper that self-skips when no cluster is available.</p>
+    </div>
+    <div class="pill">
+      <span class="pill-icon">📦</span>
+      <p><strong>Pure Go, no CGo</strong>Cross-compiles from any host. The trampoline is pre-assembled bytes embedded in the binary.</p>
+    </div>
+  </div>
+</div>
+
+<h3>What problem does it solve?</h3>
+<p>Many distributed systems have time-dependent behaviour that's hard to test: certificate expiry, token refresh, scheduled job execution, cache TTL, session timeouts. The typical approaches all have serious drawbacks:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Approach</th><th>Drawback</th></tr></thead>
+  <tbody>
+    <tr><td>Mock <code>time.Now()</code> in Go</td><td>Only works inside the same binary. Useless for testing behaviour across multiple services or in a running container.</td></tr>
+    <tr><td>Set the system clock</td><td>Affects every process on the machine. Breaks TLS, kube-scheduler, monitoring, and anything else that cares about real time.</td></tr>
+    <tr><td><code>libfaketime</code> / <code>LD_PRELOAD</code></td><td>Requires restarting the target process. Doesn't work with statically linked binaries (which includes most Go programs).</td></tr>
+    <tr><td>Wait for real time to pass</td><td>A test that waits for a 24-hour expiry to fire is not a practical test suite.</td></tr>
+    <tr><td>Intercept every <code>clock_gettime</code> syscall with ptrace</td><td>Stops the process on <em>every</em> call. Go's runtime calls <code>clock_gettime</code> tens of thousands of times per second. Completely unusable.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>epochd solves this by patching the vDSO's <code>clock_gettime</code> entry with a JMP to a small trampoline page that adds a fixed offset to the real time. The patch is invisible to the process, survives <code>fork</code>, and can be updated at any time without stopping the target.</p>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<section id="how-it-works">
+<h2>How it works</h2>
+
+<p>Modern Linux maps a shared library called the <strong>vDSO</strong> ("virtual dynamic shared object") into every process's address space. Glibc's <code>clock_gettime</code> doesn't issue a syscall — it calls a symbol in the vDSO which reads timekeeping data from a shared kernel memory page. This is why <code>clock_gettime</code> takes ~20 ns instead of ~200 ns.</p>
+
+<p>epochd exploits this by overwriting the first 5 bytes of the vDSO's <code>clock_gettime</code> entry with a <code>JMP rel32</code> instruction pointing to a small trampoline page. The trampoline:</p>
+
+<ol>
+  <li>Issues a real <code>syscall</code> to get the actual current time.</li>
+  <li>Reads an offset from a small state struct embedded in the same page.</li>
+  <li>Adds the offset to the returned <code>timespec</code>.</li>
+  <li>Returns. The calling code never sees the trampoline.</li>
+</ol>
+
+<div class="arch">  [vdso region]
+  clock_gettime entry:  E9 xx xx xx xx   ← JMP rel32 (patched by epochd)
+                              │
+                              ▼
+  [anon rwx page, allocated by the target itself via mmap]
+  ├─ trampoline code (86 bytes)
+  │    issue real syscall → get real time
+  │    load offsetSec / offsetNsec from state struct
+  │    add offset to timespec
+  │    return 0
+  └─ state struct (32 bytes, at byte offset 86)
+       offsetSec    int64  ← updated by SetTime()
+       offsetNsec   int64
+       enabledMask  uint64 (bit 0 = CLOCK_REALTIME)
+       generation   uint32 (bumped on each update)</div>
+
+<p>Updating the fake time after the initial injection only requires writing 32 bytes into the state struct using <code>process_vm_writev</code>. No ptrace stop. No signal. The target process continues running, and its <code>clock_gettime</code> calls immediately return the new time.</p>
+
+<h3>The injection sequence</h3>
+<p>The one-time setup (on first <code>InjectAtTime</code> or <code>Start</code> call) involves three brief ptrace stops:</p>
+<ol>
+  <li><strong>vDSO discovery</strong> — parse <code>/proc/&lt;pid&gt;/maps</code> for <code>[vdso]</code>, resolve the <code>clock_gettime</code> symbol via ELF.</li>
+  <li><strong>Remote mmap</strong> — while the target is ptrace-stopped, make it call <code>mmap</code> on its own behalf. The new page is allocated as close as possible to the vDSO entry (within the ±2 GB reach of <code>JMP rel32</code>).</li>
+  <li><strong>Patch and detach</strong> — write the trampoline payload, patch the 5-byte vDSO entry, then detach. The target resumes immediately.</li>
+</ol>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<section id="choose-your-path">
+<h2>Choose your path</h2>
+
+<div class="mode-cards">
+  <div class="mode-card">
+    <span class="tag k8s">Kubernetes</span>
+    <h3>Cluster deployment</h3>
+    <p>Deploy the DaemonSet agent and controller. Use the Go SDK or REST API from your e2e tests. Works with any language.</p>
+  </div>
+  <div class="mode-card">
+    <span class="tag local">Go test</span>
+    <h3>pkg/localtime</h3>
+    <p>Import the package directly into your Go tests. No cluster required. Injects into child processes you start or processes you attach to.</p>
+  </div>
+  <div class="mode-card">
+    <span class="tag cli">CLI</span>
+    <h3>faketimectl</h3>
+    <p>Command-line tool for manual injection into any running PID. Useful for debugging or scripts. Requires <code>CAP_SYS_PTRACE</code>.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>Scenario</th>
+      <th>Recommended path</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>e2e tests against services running in a Kubernetes cluster</td><td><a href="#k8s-deploy">Cluster deployment</a> + <a href="#k8s-usage">SDK</a></td></tr>
+    <tr><td>Unit / integration tests for a Go program that calls <code>time.Now()</code></td><td><a href="#local-quickstart">pkg/localtime</a></td></tr>
+    <tr><td>Testing two Go processes that need to share a fake clock</td><td><a href="#local-api">pkg/localtime Session</a></td></tr>
+    <tr><td>One-off injection into a running process for manual inspection</td><td><a href="#cli-install">faketimectl</a></td></tr>
+    <tr><td>Integrating from Python, Ruby, or another language</td><td><a href="#k8s-api">Controller HTTP API</a></td></tr>
+  </tbody>
+</table>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="k8s-prerequisites">Kubernetes cluster — prerequisites</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Requirement</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Kubernetes 1.28+</td><td>Uses standard pod listing and informers. Any managed cluster (EKS, GKE, AKS) works.</td></tr>
+    <tr><td>Linux x86-64 nodes</td><td>The trampoline is assembled for <code>x86_64</code> only. ARM64 nodes are not supported yet.</td></tr>
+    <tr><td>Privileged DaemonSet pods</td><td>The agent needs <code>CAP_SYS_PTRACE</code>, <code>hostPID: true</code>, and access to the containerd socket. The provided manifests set this up.</td></tr>
+    <tr><td>Container runtime: containerd</td><td>The agent resolves container IDs to PIDs by scanning <code>/proc/*/cgroup</code>. Works with any runtime that uses cgroup v1 or v2 naming.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <span class="callout-icon">⚠️</span>
+  <div class="callout-body">
+    <p class="callout-title">Production cluster advisory</p>
+    <p>Do not deploy epochd in a production cluster. The agent runs as a privileged pod with <code>hostPID: true</code> and the ability to inject code into any process on the node. It should only run in dedicated test clusters.</p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="k8s-deploy">Kubernetes cluster — deploy</h2>
+
+<div class="steps">
+  <div class="step">
+    <div class="step-num"></div>
+    <div class="step-body">
+      <h3>Create the namespace</h3>
+      <pre><code class="language-bash">kubectl create namespace epochd</code></pre>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num"></div>
+    <div class="step-body">
+      <h3>Apply RBAC, the agent DaemonSet, and the controller Deployment</h3>
+      <pre><code class="language-bash">kubectl apply -f https://raw.githubusercontent.com/bkaznowski/epochd/main/deploy/rbac.yaml
+kubectl apply -f https://raw.githubusercontent.com/bkaznowski/epochd/main/deploy/daemonset.yaml
+kubectl apply -f https://raw.githubusercontent.com/bkaznowski/epochd/main/deploy/controller-deployment.yaml</code></pre>
+      <p>Or from a local clone:</p>
+      <pre><code class="language-bash">kubectl apply -f deploy/</code></pre>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num"></div>
+    <div class="step-body">
+      <h3>Verify the rollout</h3>
+      <pre><code class="language-bash">kubectl -n epochd rollout status daemonset/epochd-agent
+kubectl -n epochd rollout status deployment/epochd-controller
+kubectl -n epochd get pods</code></pre>
+      <p>You should see one agent pod per node and one controller pod in <code>Running</code> state.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num"></div>
+    <div class="step-body">
+      <h3>Get the controller URL for your tests</h3>
+      <pre><code class="language-bash"># From inside the cluster (recommended):
+export EPOCHD_URL=http://epochd-controller.epochd.svc
+
+# From outside the cluster (for local development):
+kubectl -n epochd port-forward svc/epochd-controller 8080:80 &amp;
+export EPOCHD_URL=http://localhost:8080</code></pre>
+    </div>
+  </div>
+</div>
+
+<h3>Build and push your own images (optional)</h3>
+<p>The manifests default to <code>ghcr.io/bkaznowski/epochd-agent:latest</code> and <code>ghcr.io/bkaznowski/epochd-controller:latest</code>. To use your own registry:</p>
+<pre><code class="language-bash">docker build -f Dockerfile.agent     --platform linux/amd64 -t my-registry/epochd-agent:v1 .
+docker build -f Dockerfile.controller --platform linux/amd64 -t my-registry/epochd-controller:v1 .
+docker push my-registry/epochd-agent:v1
+docker push my-registry/epochd-controller:v1</code></pre>
+<p>Then update the <code>image:</code> fields in <code>deploy/daemonset.yaml</code> and <code>deploy/controller-deployment.yaml</code>.</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="k8s-usage">Kubernetes cluster — using the Go SDK</h2>
+
+<p>Import the SDK into your e2e test package:</p>
+<pre><code class="language-bash">go get epochd/pkg/sdk</code></pre>
+
+<h3>WithTimeT — the recommended test helper</h3>
+<p><code>WithTimeT</code> creates a timeshift, runs your assertions, then automatically deletes the timeshift via <code>t.Cleanup</code> — even if the test panics. It automatically skips when <code>EPOCHD_URL</code> is not set, so the same test can be run against a local unit test runner and a full cluster.</p>
+
+<pre><code class="language-go">func TestCertificateExpiry(t *testing.T) {
+    client := sdk.NewClient(os.Getenv("EPOCHD_URL"))
+
+    // Shift all pods matching app=my-service to one year in the future.
+    sdk.WithTimeT(t, client, "default", "app=my-service",
+        time.Now().Add(365*24*time.Hour),
+        30*time.Minute, // TTL — timeshift is auto-deleted after 30 min even if the test crashes
+        func(t *testing.T, ts *sdk.Timeshift) {
+            // Assertions run here. Pods matching "app=my-service" see time as ~1 year ahead.
+            resp, err := myClient.GetStatus()
+            if err != nil {
+                t.Fatalf("expected no error, got: %v", err)
+            }
+            if resp.CertExpired {
+                t.Error("certificate should not be expired yet")
+            }
+        },
+    )
+}</code></pre>
+
+<h3>Manual create / delete</h3>
+<p>For more control, use <code>CreateTimeshift</code> and <code>DeleteTimeshift</code> directly:</p>
+<pre><code class="language-go">client := sdk.NewClient(os.Getenv("EPOCHD_URL"))
+ctx := context.Background()
+
+// Create a timeshift targeting two years in the future, expiring in 1 hour.
+ts, err := client.CreateTimeshift(ctx, "default", "app=payment-service",
+    time.Now().Add(2*365*24*time.Hour), time.Hour)
+if err != nil {
+    log.Fatalf("create: %v", err)
+}
+fmt.Printf("timeshift %s applied to: %v\n", ts.ID, ts.AppliedTo)
+
+// Advance time further.
+ts, err = client.UpdateTimeshift(ctx, ts.ID, time.Now().Add(3*365*24*time.Hour))
+
+// Move time backwards.
+ts, err = client.UpdateTimeshift(ctx, ts.ID, time.Now().Add(24*time.Hour))
+
+// Clean up (resets all injected processes to real time).
+_ = client.DeleteTimeshift(ctx, ts.ID)</code></pre>
+
+<h3>Preview which pods will be affected (dry run)</h3>
+<p>Use <code>Resolve</code> to see which pods and containers match a selector before creating a timeshift:</p>
+<pre><code class="language-go">pods, err := client.Resolve(ctx, "default", "app=payment-service")
+for _, pod := range pods {
+    fmt.Printf("pod %s: containers %v\n", pod.Name, pod.Containers)
+}</code></pre>
+
+<h3>Inspect live injection state</h3>
+<p><code>TimeshiftStatus</code> queries each agent for the current trampoline state — useful to confirm the injection landed and what time each container currently sees:</p>
+<pre><code class="language-go">status, err := client.TimeshiftStatus(ctx, ts.ID)
+for _, c := range status.Containers {
+    if c.Error != "" {
+        fmt.Printf("%s/%s: ERROR %s\n", c.Pod, c.Container, c.Error)
+        continue
+    }
+    fmt.Printf("%s/%s: lastTarget=%s gen=%d\n",
+        c.Pod, c.Container, c.Status.LastTarget, c.Status.Generation)
+}</code></pre>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="k8s-api">Kubernetes cluster — HTTP API reference</h2>
+<p>The controller exposes a JSON REST API on port 80 (internal ClusterIP). All request and response bodies use <code>Content-Type: application/json</code>.</p>
+
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="method post">POST</span>
+    <span class="endpoint-path">/timeshifts</span>
+    <span class="endpoint-desc">Create a timeshift</span>
+  </div>
+  <div class="endpoint-body">
+    <pre><code class="language-json">// Request
+{
+  "namespace": "default",
+  "labelSelector": "app=my-service",
+  "time": "2030-01-01T00:00:00Z",
+  "ttl": "1h"           // optional; omit for no expiry
+}
+// Response 201
+{
+  "id": "b3f5c2d1-...",
+  "namespace": "default",
+  "labelSelector": "app=my-service",
+  "time": "2030-01-01T00:00:00Z",
+  "expiresAt": "2026-06-21T11:00:00Z",
+  "appliedTo": ["pod/my-service-abc/app", "pod/my-service-def/app"]
+}</code></pre>
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="method get">GET</span>
+    <span class="endpoint-path">/timeshifts</span>
+    <span class="endpoint-desc">List all active timeshifts</span>
+  </div>
+  <div class="endpoint-body">
+    <pre><code class="language-json">// Response 200
+{ "timeshifts": [ { "id": "...", "time": "...", ... } ] }</code></pre>
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="method get">GET</span>
+    <span class="endpoint-path">/timeshifts/{id}</span>
+    <span class="endpoint-desc">Get a timeshift by ID</span>
+  </div>
+  <div class="endpoint-body">
+    <p>Returns <code>404</code> if the timeshift does not exist or has expired.</p>
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="method patch">PATCH</span>
+    <span class="endpoint-path">/timeshifts/{id}</span>
+    <span class="endpoint-desc">Update the target time</span>
+  </div>
+  <div class="endpoint-body">
+    <pre><code class="language-json">// Request
+{ "time": "2035-06-01T00:00:00Z" }
+// Response 200 — updated timeshift object</code></pre>
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="method delete">DELETE</span>
+    <span class="endpoint-path">/timeshifts/{id}</span>
+    <span class="endpoint-desc">Delete a timeshift (resets all injected pods to real time)</span>
+  </div>
+  <div class="endpoint-body">
+    <p>Returns <code>204 No Content</code> on success. Each injected container's clock is reset via <code>process_vm_writev</code> before the timeshift is removed from the registry.</p>
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="method get">GET</span>
+    <span class="endpoint-path">/timeshifts/{id}/status</span>
+    <span class="endpoint-desc">Live injection status for each container</span>
+  </div>
+  <div class="endpoint-body">
+    <pre><code class="language-json">// Response 200
+{
+  "id": "b3f5c2d1-...",
+  "namespace": "default",
+  "containers": [
+    {
+      "pod": "my-service-abc",
+      "container": "app",
+      "nodeIP": "10.0.0.1",
+      "status": {
+        "generation": 3,
+        "lastTarget": "2030-01-01T00:00:00Z",
+        "stateAddr": "0x7ffe...",
+        "pid": 12345
+      }
+    }
+  ]
+}</code></pre>
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="method get">GET</span>
+    <span class="endpoint-path">/resolve?namespace=…&amp;selector=…</span>
+    <span class="endpoint-desc">Preview pods that would be targeted (no injection)</span>
+  </div>
+  <div class="endpoint-body">
+    <pre><code class="language-json">// Response 200
+{
+  "pods": [
+    { "name": "my-service-abc", "namespace": "default", "nodeIP": "10.0.0.1",
+      "containers": ["app", "sidecar"] }
+  ]
+}</code></pre>
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="method get">GET</span>
+    <span class="endpoint-path">/healthz</span>
+    <span class="endpoint-desc">Health check</span>
+  </div>
+  <div class="endpoint-body">
+    <pre><code class="language-json">// Response 200
+{ "status": "ok" }</code></pre>
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="method get">GET</span>
+    <span class="endpoint-path">/metrics</span>
+    <span class="endpoint-desc">Prometheus metrics</span>
+  </div>
+  <div class="endpoint-body">
+    <p>Returns Prometheus-format metrics. The controller deployment includes annotations for Prometheus scraping. Key metrics:</p>
+    <ul>
+      <li><code>epochd_timeshifts_active</code> — gauge: current number of active timeshifts</li>
+      <li><code>epochd_inject_total</code> — counter: successful injection calls</li>
+      <li><code>epochd_settime_total</code> — counter: successful SetTime calls</li>
+      <li><code>epochd_sweep_expired_total</code> — counter: timeshifts removed by TTL sweeper</li>
+      <li><code>epochd_api_requests_total{method,path,status}</code> — counter: HTTP requests by route</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="local-overview">Go tests (no cluster) — overview</h2>
+
+<p><code>pkg/localtime</code> provides the same injection capability without any Kubernetes infrastructure. You import the package directly into your Go tests and inject into processes you start yourself — no agent, no controller, no cluster.</p>
+
+<div class="compare">
+  <div class="compare-card">
+    <h3>When to use</h3>
+    <ul>
+      <li>Testing a binary that calls <code>time.Now()</code>, reads <code>clock_gettime</code>, or uses time-based logic</li>
+      <li>Injecting multiple cooperating processes that should share a fake clock</li>
+      <li>CI environments where spinning up a k8s cluster is too heavy</li>
+      <li>Local development and rapid iteration</li>
+    </ul>
+  </div>
+  <div class="compare-card">
+    <h3>Constraints</h3>
+    <ul>
+      <li>Linux x86-64 only (same as the cluster path)</li>
+      <li>Requires either running the tests natively with <code>CAP_SYS_PTRACE</code>, or in Docker with <code>--cap-add SYS_PTRACE --security-opt seccomp=unconfined</code></li>
+      <li>Only injects into processes you own — no injecting into arbitrary running PIDs without elevated permissions</li>
+    </ul>
+  </div>
+</div>
+
+<div class="callout info">
+  <span class="callout-icon">💡</span>
+  <div class="callout-body">
+    <p>The stub in <code>localtime_stub.go</code> (compiled on non-Linux platforms) makes all functions return errors and all test helpers call <code>t.Skip()</code>. Your test code compiles and runs cleanly on macOS and Windows — the tests are simply skipped unless running on Linux.</p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="local-quickstart">Go tests (no cluster) — quickstart</h2>
+
+<div class="steps">
+  <div class="step">
+    <div class="step-num"></div>
+    <div class="step-body">
+      <h3>Add the import</h3>
+      <pre><code class="language-go">import "epochd/pkg/localtime"</code></pre>
+      <p>No external dependency to add — <code>pkg/localtime</code> is part of the same module.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num"></div>
+    <div class="step-body">
+      <h3>Inject into a process you start</h3>
+      <p>Use <code>localtime.Start</code> to set a fake clock on a child process from the moment it begins executing:</p>
+      <pre><code class="language-go">func TestMyBinary(t *testing.T) {
+    cmd := exec.Command("./my-binary", "--some-flag")
+    // Do NOT call cmd.Start() — localtime.Start does it for you.
+
+    target := time.Now().Add(365 * 24 * time.Hour) // one year in the future
+    h, err := localtime.Start(cmd, target)
+    if err != nil {
+        t.Fatalf("localtime.Start: %v", err)
+    }
+    t.Cleanup(func() {
+        h.Reset()             // snap back to real time
+        cmd.Process.Kill()    // clean up the child
+        cmd.Wait()
+    })
+
+    // The process is now running with its clock set to target.
+    // Use cmd.Process.Pid, wait for output, etc.
+}</code></pre>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num"></div>
+    <div class="step-body">
+      <h3>Or use the WithProcess helper</h3>
+      <p><code>WithProcess</code> handles cleanup automatically via <code>t.Cleanup</code>, including on test failure:</p>
+      <pre><code class="language-go">func TestWithHelper(t *testing.T) {
+    cmd := exec.Command("./my-binary")
+    target := time.Now().Add(365 * 24 * time.Hour)
+
+    localtime.WithProcess(t, cmd, target, func(t *testing.T, h *localtime.Handle) {
+        // h.SetTime(newTarget) — update the fake time
+        // h.Reset()            — snap back to real time
+        // cmd is running; query it however you need
+    })
+    // Process is killed and time is reset before this line is reached,
+    // even if the test calls t.Fatal.
+}</code></pre>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num"></div>
+    <div class="step-body">
+      <h3>Running the tests</h3>
+      <p>On a Linux host with <code>CAP_SYS_PTRACE</code>:</p>
+      <pre><code class="language-bash">go test ./... -count=1</code></pre>
+      <p>In Docker (works on macOS and Windows):</p>
+      <pre><code class="language-bash">docker run --rm \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -v "$(pwd):/workspace" -w /workspace \
+  golang:1.26-alpine \
+  go test ./... -count=1</code></pre>
+      <div class="callout warn">
+        <span class="callout-icon">⚠️</span>
+        <div class="callout-body">
+          <p><strong>Both flags are required in Docker.</strong> <code>--cap-add SYS_PTRACE</code> alone is insufficient — Docker's default seccomp profile blocks the <code>ptrace</code> syscall family. You must also pass <code>--security-opt seccomp=unconfined</code>.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="local-api">Go tests (no cluster) — API reference</h2>
+
+<h3>Handle — single process</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Function / method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>Start(cmd *exec.Cmd, target time.Time) (*Handle, error)</code></td>
+      <td>Sets <code>cmd.SysProcAttr.Ptrace = true</code>, calls <code>cmd.Start()</code>, injects fake time using the FollowChild path (no elevated permissions required). Do not call <code>cmd.Start()</code> yourself.</td>
+    </tr>
+    <tr>
+      <td><code>Attach(pid int, target time.Time) (*Handle, error)</code></td>
+      <td>Injects into an already-running process using <code>PTRACE_ATTACH</code>. Requires <code>CAP_SYS_PTRACE</code> and <code>/proc/sys/kernel/yama/ptrace_scope ≤ 1</code>.</td>
+    </tr>
+    <tr>
+      <td><code>h.SetTime(target time.Time) error</code></td>
+      <td>Updates the fake time without stopping the process (<code>process_vm_writev</code> only, ~1 µs).</td>
+    </tr>
+    <tr>
+      <td><code>h.Reset() error</code></td>
+      <td>Snaps the process back to the real clock. Equivalent to <code>h.SetTime(time.Now())</code>.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Session — multiple processes sharing one clock</h3>
+<p>A <code>Session</code> groups multiple processes under a single target time. <code>SetTime</code> issues all <code>process_vm_writev</code> calls concurrently to minimise the inter-process race window.</p>
+
+<pre><code class="language-go">target := time.Now().Add(24 * time.Hour)
+s := localtime.NewSession(target)
+
+// Add processes via Start or Attach.
+if err := s.Start(cmd1); err != nil { ... }
+if err := s.Start(cmd2); err != nil { ... }
+
+fmt.Println("processes in session:", s.Len()) // 2
+
+// Move all processes to +48h simultaneously.
+if err := s.SetTime(time.Now().Add(48 * time.Hour)); err != nil { ... }
+
+// Reset all to real time.
+if err := s.Reset(); err != nil { ... }</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>NewSession(target time.Time) *Session</code></td><td>Creates an empty session with the given initial target.</td></tr>
+    <tr><td><code>s.Start(cmd *exec.Cmd) error</code></td><td>Starts the command and adds its handle to the session.</td></tr>
+    <tr><td><code>s.Attach(pid int) error</code></td><td>Attaches to a running process and adds it to the session.</td></tr>
+    <tr><td><code>s.SetTime(target time.Time) error</code></td><td>Updates all handles concurrently. Errors from individual handles are joined.</td></tr>
+    <tr><td><code>s.Reset() error</code></td><td>Resets all processes to real time.</td></tr>
+    <tr><td><code>s.Len() int</code></td><td>Returns the number of handles in the session.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Test helpers</h3>
+<p>These functions are defined in the main package (not in <code>_test.go</code>), so they can be imported by other packages' test files. All use <code>t.Cleanup</code> instead of <code>defer</code>, so cleanup runs even when the passed function calls <code>t.Fatal</code>.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Helper</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>WithProcess(t, cmd, target, fn)</code></td>
+      <td>Starts <code>cmd</code> with fake time, calls <code>fn(t, *Handle)</code>, then kills the process and resets the clock.</td>
+    </tr>
+    <tr>
+      <td><code>WithPID(t, pid, target, fn)</code></td>
+      <td>Attaches to <code>pid</code>, calls <code>fn(t, *Handle)</code>, then resets the clock. Requires <code>CAP_SYS_PTRACE</code>.</td>
+    </tr>
+    <tr>
+      <td><code>WithSession(t, target, setup, fn)</code></td>
+      <td>Creates a session, calls <code>setup(s)</code> to populate it, calls <code>fn(t, *Session)</code>, then resets and cleans up.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h4>WithSession example</h4>
+<pre><code class="language-go">func TestTwoServicesShareClock(t *testing.T) {
+    target := time.Now().Add(365 * 24 * time.Hour)
+
+    localtime.WithSession(t, target,
+        func(s *localtime.Session) error {
+            if err := s.Start(exec.Command("./service-a")); err != nil {
+                return err
+            }
+            return s.Start(exec.Command("./service-b"))
+        },
+        func(t *testing.T, s *localtime.Session) {
+            // Both service-a and service-b see time ~1 year in the future.
+            // s.SetTime(...) updates both simultaneously.
+        },
+    )
+}</code></pre>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="cli-install">CLI tool — faketimectl</h2>
+
+<h3>Build</h3>
+<pre><code class="language-bash">GOOS=linux go build -o faketimectl ./cmd/faketimectl</code></pre>
+
+<h3>Usage</h3>
+<pre><code class="language-bash">faketimectl --pid=&lt;PID&gt; --set-time=&lt;RFC3339&gt;   # inject fake time
+faketimectl --pid=&lt;PID&gt; --reset                 # snap back to real clock</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Flag</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>--pid</code></td><td>Target process PID (required)</td></tr>
+    <tr><td><code>--set-time</code></td><td>Fake wall-clock time in RFC3339 format, e.g. <code>2030-01-01T00:00:00Z</code></td></tr>
+    <tr><td><code>--reset</code></td><td>Snap the target back to the real clock</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Example</h3>
+<pre><code class="language-bash"># Terminal 1: run the sample clock-printer target
+./clockprinter
+# 2026-06-21T10:00:00Z
+# 2026-06-21T10:00:01Z
+
+# Terminal 2: inject a fake time (requires CAP_SYS_PTRACE or root)
+sudo ./faketimectl --pid=$(pgrep clockprinter) --set-time=2030-01-01T00:00:00Z
+
+# Terminal 1 now prints:
+# 2030-01-01T00:00:00Z
+# 2030-01-01T00:00:01Z
+
+# Terminal 2: reset to real time
+sudo ./faketimectl --pid=$(pgrep clockprinter) --reset</code></pre>
+
+<div class="callout warn">
+  <span class="callout-icon">⚠️</span>
+  <div class="callout-body">
+    <p><code>faketimectl</code> uses <code>PTRACE_ATTACH</code>. This requires either running as root, or having <code>CAP_SYS_PTRACE</code> and <code>/proc/sys/kernel/yama/ptrace_scope ≤ 1</code>. On Ubuntu/Debian, you can temporarily set: <code>echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope</code></p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="security-model">Security model</h2>
+
+<h3>What epochd can do</h3>
+<p>epochd's mechanism — patching vDSO bytes in a running process via <code>PTRACE_POKETEXT</code> and writing to its memory via <code>process_vm_writev</code> — grants significant power:</p>
+<ul>
+  <li>The agent can inject arbitrary code pages into any process running on the node (because it has <code>hostPID: true</code> and <code>CAP_SYS_PTRACE</code>).</li>
+  <li>The controller can instruct any agent to target any container in the cluster (because the controller has cluster-wide pod list access).</li>
+  <li>There is no authentication on the controller's HTTP API in v1. Any pod that can reach the controller service can shift the clock of any other pod.</li>
+</ul>
+
+<h3>What the cluster deployment requires</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Component</th><th>Privilege</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Agent DaemonSet</td><td><code>privileged: true</code></td><td>Needs <code>CAP_SYS_PTRACE</code> for <code>PTRACE_ATTACH</code> and <code>process_vm_writev</code> across PID namespaces.</td></tr>
+    <tr><td>Agent DaemonSet</td><td><code>hostPID: true</code></td><td>Must see all container PIDs on the node via <code>/proc</code>.</td></tr>
+    <tr><td>Agent DaemonSet</td><td>CRI socket mount</td><td>Resolves container IDs to PIDs by querying <code>/run/containerd/containerd.sock</code>.</td></tr>
+    <tr><td>Controller Deployment</td><td>ClusterRole: <code>get/list/watch pods</code></td><td>Resolves label selectors to pod objects and container IDs.</td></tr>
+    <tr><td>Controller Deployment</td><td>Role: <code>get/create/update ConfigMaps</code></td><td>Persists timeshift registry for restart recovery.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="security-concerns">Security — concerns and mitigations</h2>
+
+<div class="callout danger">
+  <span class="callout-icon">🔴</span>
+  <div class="callout-body">
+    <p class="callout-title">Deploy only in dedicated test clusters</p>
+    <p>The agent DaemonSet runs as a privileged pod with <code>hostPID: true</code>. An attacker who controls the controller API can instruct the agent to inject arbitrary code into any process on any node. Treat this as equivalent to having root on every node in the cluster.</p>
+  </div>
+</div>
+
+<h3>No controller authentication (v1 limitation)</h3>
+<p>The controller's HTTP API has no authentication in the current version. Any pod that can reach the <code>epochd-controller</code> service (or any user with <code>kubectl port-forward</code> access) can create, update, and delete timeshifts for any pod in the cluster.</p>
+<p><strong>Mitigation options:</strong></p>
+<ul>
+  <li><strong>Network policy</strong> — restrict access to the controller service to only the namespaces and pods that run your e2e tests. This is the simplest and most effective control in the short term.</li>
+  <li><strong>Dedicated namespace</strong> — deploy epochd in an isolated namespace with tight admission control.</li>
+  <li><strong>Shared token (future)</strong> — the roadmap includes an optional <code>--auth-token</code> flag. Clients pass the token in an <code>Authorization: Bearer</code> header.</li>
+</ul>
+
+<h3>Agent privileges are broad</h3>
+<p>The <code>privileged: true</code> flag gives the agent essentially full access to the host. The recommended mitigation is to only deploy epochd in clusters that are already treated as low-trust dev/test environments, and to apply Kubernetes admission policies (OPA/Gatekeeper, Kyverno) that prevent privileged pods from being created in other contexts.</p>
+
+<h3>pkg/localtime — local privilege requirements</h3>
+<p>When using <code>pkg/localtime</code> in Go tests:</p>
+<ul>
+  <li><code>localtime.Start</code> uses the FollowChild path (<code>PTRACE_TRACEME</code> from the child). This does not require elevated privileges — you don't need <code>CAP_SYS_PTRACE</code> or root. It works in Docker with only <code>--cap-add SYS_PTRACE --security-opt seccomp=unconfined</code>.</li>
+  <li><code>localtime.Attach</code> uses <code>PTRACE_ATTACH</code> and does require <code>CAP_SYS_PTRACE</code> and <code>ptrace_scope ≤ 1</code>. Prefer <code>Start</code> when you can control the target process's launch.</li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="limitations">Known limitations</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Limitation</th><th>Impact</th><th>Workaround / notes</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Linux x86-64 only</strong></td>
+      <td>Cannot run on ARM64, macOS, or Windows.</td>
+      <td>The trampoline is hand-assembled for <code>x86_64</code>. ARM64 support is on the roadmap. Tests can be cross-compiled on macOS/Windows and run in Docker or CI.</td>
+    </tr>
+    <tr>
+      <td><strong>CLOCK_REALTIME only</strong></td>
+      <td><code>CLOCK_MONOTONIC</code> and <code>CLOCK_BOOTTIME</code> are not intercepted. Go's <code>time.Since</code> / timer internals use monotonic time.</td>
+      <td>Go's <code>time.Now()</code> uses <code>CLOCK_REALTIME</code>, so most <code>time.Now()</code>-based tests work fine. Timeouts and rate limiters that use <code>CLOCK_MONOTONIC</code> are not affected by the injection. A future release will optionally intercept <code>CLOCK_MONOTONIC</code>.</td>
+    </tr>
+    <tr>
+      <td><strong>No clock uninstall</strong></td>
+      <td>The vDSO patch and trampoline page remain for the life of the process. There is no <code>Uninstall()</code> that restores original bytes.</td>
+      <td><code>h.Reset()</code> / <code>DeleteTimeshift</code> snap the clock back to real time using a single <code>process_vm_writev</code> call. For almost all test scenarios this is equivalent to a full uninstall.</td>
+    </tr>
+    <tr>
+      <td><strong>Re-injection leaks a trampoline page</strong></td>
+      <td>Calling <code>InjectAtTime</code> on the same PID twice allocates a second 4 KB page (the old one is not unmapped).</td>
+      <td>Acceptable for testing. The agent re-injects on handle recovery after a restart and does not do so repeatedly in normal operation.</td>
+    </tr>
+    <tr>
+      <td><strong>Race on time reads</strong></td>
+      <td>The trampoline reads the state struct with plain word loads. A <code>SetTime</code> call racing with a <code>clock_gettime</code> call can return a time between the old and new offsets.</td>
+      <td>The worst case is one slightly wrong timestamp. For test assertions, either read a timestamp after a short pause post-<code>SetTime</code>, or make the fake offset large enough that any in-between value is still clearly in the expected range.</td>
+    </tr>
+    <tr>
+      <td><strong>Forked children inherit the injection</strong></td>
+      <td>Processes forked after injection share the same vDSO mapping and see the same fake time. This is usually desirable.</td>
+      <td>Intended behaviour. The Go runtime's <code>os/exec</code> creates new processes, not forks, so child processes started via <code>exec.Command</code> do <em>not</em> inherit the injection unless you start them with <code>localtime.Start</code>.</td>
+    </tr>
+    <tr>
+      <td><strong>No HA for the controller</strong></td>
+      <td>The timeshift registry is in-memory and per-process. A controller pod restart causes all active timeshifts to reload from the ConfigMap backup, but handle state in agents is lost and must be re-injected.</td>
+      <td>Controller restart recovery (Phase 20) persists the registry to a ConfigMap. After a restart the controller re-injects via its pod watcher. Brief gaps (&lt; one sweep interval, default 30s) are possible during a restart.</td>
+    </tr>
+    <tr>
+      <td><strong>Single containerd runtime</strong></td>
+      <td>Container ID → PID resolution reads <code>/proc/*/cgroup</code> and matches the container ID string. This works for containerd but has not been tested with CRI-O or Docker's CRI shim.</td>
+      <td>The resolution path is in <code>pkg/k8sresolve</code> and can be extended for other runtimes.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="requirements">Requirements</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Component</th><th>Requirement</th></tr></thead>
+  <tbody>
+    <tr><td>Go</td><td>1.26+ (for building; not required at runtime — images use scratch base)</td></tr>
+    <tr><td>Runtime OS</td><td>Linux x86-64 only</td></tr>
+    <tr><td>Kubernetes</td><td>1.28+ (for cluster deployment)</td></tr>
+    <tr><td>Container runtime</td><td>containerd (for cluster deployment)</td></tr>
+    <tr><td>Docker</td><td>Any recent version, for building images or running tests on macOS/Windows</td></tr>
+    <tr><td>NASM</td><td>Only needed if editing <code>pkg/trampoline/trampoline.asm</code>. The pre-assembled <code>trampoline.bin</code> is committed to the repo.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="architecture">Architecture</h2>
+
+<div class="arch">
+  Your e2e test
+       │
+       │  EPOCHD_URL=http://epochd-controller.epochd.svc
+       ▼
+  ┌─────────────────────────────────┐
+  │  epochd-controller (Deployment) │
+  │                                 │
+  │  POST /timeshifts               │
+  │    1. list pods (client-go)     │
+  │    2. for each pod:             │
+  │       a. look up container PID  │
+  │       b. call agent gRPC Inject │
+  │    3. store handle IDs          │
+  │                                 │
+  │  PATCH /timeshifts/{id}         │
+  │    call agent gRPC SetTime      │
+  │                                 │
+  │  DELETE /timeshifts/{id}        │
+  │    call agent gRPC Reset        │
+  └──────────────┬──────────────────┘
+                 │  gRPC :9100
+          ┌──────┴──────┐
+          ▼             ▼
+  ┌──────────────┐  ┌──────────────┐
+  │ epochd-agent │  │ epochd-agent │  ... (one per node)
+  │ (DaemonSet)  │  │ (DaemonSet)  │
+  │              │  │              │
+  │ Inject →     │  │ Inject →     │
+  │  resolve PID │  │  resolve PID │
+  │  ptrace stop │  │  ptrace stop │
+  │  write tramp │  │  write tramp │
+  │  patch vDSO  │  │  patch vDSO  │
+  │  detach      │  │  detach      │
+  │              │  │              │
+  │ SetTime →    │  │ SetTime →    │
+  │  vm_writev   │  │  vm_writev   │
+  └──────┬───────┘  └──────┬───────┘
+         │                  │
+         ▼                  ▼
+  [target pods]      [target pods]</div>
+
+<h3>Component roles</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Component</th><th>Role</th><th>Privilege</th></tr></thead>
+  <tbody>
+    <tr><td><code>cmd/controller</code></td><td>Accepts API requests, resolves pods, dispatches to agents, manages timeshift registry, runs TTL sweeper and pod watcher.</td><td>Unprivileged. Standard Deployment with ClusterRole for pod reads.</td></tr>
+    <tr><td><code>cmd/agent</code></td><td>Receives gRPC calls from controller. Resolves container IDs to PIDs. Performs ptrace injection. Holds <code>inject.Handle</code> map. Drains handles gracefully on SIGTERM.</td><td>Privileged. DaemonSet with <code>hostPID: true</code> and <code>CAP_SYS_PTRACE</code>.</td></tr>
+    <tr><td><code>pkg/inject</code></td><td>Core injection library. <code>InjectAtTime</code> → one-time setup via ptrace. <code>SetTime</code> → live updates via <code>process_vm_writev</code>.</td><td>Needs <code>CAP_SYS_PTRACE</code>.</td></tr>
+    <tr><td><code>pkg/localtime</code></td><td>Wrapper around <code>pkg/inject</code> for use in Go tests without a cluster. <code>Start</code> uses FollowChild (no elevated perms); <code>Attach</code> uses PTRACE_ATTACH.</td><td><code>Start</code>: no extra perms. <code>Attach</code>: needs <code>CAP_SYS_PTRACE</code>.</td></tr>
+    <tr><td><code>pkg/sdk</code></td><td>Go client for the controller API. Used from e2e tests. No Linux dependency.</td><td>None — pure HTTP client.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="faq">FAQ</h2>
+
+<h3>Does this work with Go's <code>time.Now()</code>?</h3>
+<p>Yes. Go's <code>time.Now()</code> calls <code>clock_gettime(CLOCK_REALTIME, ...)</code> via the vDSO. epochd patches exactly that entry point, so <code>time.Now()</code> returns the fake time after injection.</p>
+
+<h3>Will <code>time.Since</code> / <code>time.Until</code> work correctly?</h3>
+<p>Yes and no. <code>time.Since(t)</code> and <code>time.Until(t)</code> in Go are computed from the monotonic component of the time (which is stored when <code>time.Now()</code> is called). If both the reference time <em>and</em> the current time are read after injection, the difference will be correct. If one was read before injection and the other after, the result may be surprising. For most test patterns (read a reference time, advance the clock, check relative to the reference) this works correctly.</p>
+
+<p><code>CLOCK_MONOTONIC</code> itself is not intercepted, so timeouts and rate limiters that use the monotonic clock internally won't be affected by the injection.</p>
+
+<h3>Can I use this with Python, Node.js, or Java?</h3>
+<p>For Kubernetes-deployed services: yes. The controller API is plain HTTP+JSON. Any language can use <code>POST /timeshifts</code> to shift the clock of any container regardless of what language that container is written in.</p>
+<p>For local process injection: only via the Go <code>pkg/localtime</code> API or the <code>faketimectl</code> CLI.</p>
+
+<h3>What happens if the target process calls <code>fork</code>?</h3>
+<p>Forked children inherit the parent's vDSO mapping, which includes the patched <code>JMP</code> and the trampoline page. Children see the same fake time as the parent. This is usually the desired behaviour when testing a multi-process server.</p>
+
+<h3>What if the agent restarts?</h3>
+<p>The agent holds the inject handle map in memory. When it restarts, the handles are gone. The controller detects this: a failed gRPC call returns "handle not found", which triggers re-injection. Additionally, the pod watcher detects the agent's container ID changing and proactively re-injects all affected timeshifts. A brief window (typically under a few seconds) where the target process sees real time is possible during an agent restart.</p>
+
+<h3>Can two timeshifts target the same pod?</h3>
+<p>No — the controller prevents it. If any container matched by a <code>POST /timeshifts</code> request is already owned by an active timeshift, the request is rejected with <code>409 Conflict</code> and a message identifying the conflicting containers and the timeshift ID that owns them. Delete or update the existing timeshift first.</p>
+<p>In the SDK: <code>sdk.IsConflict(err)</code> reports whether an error is a 409 response, so you can handle it explicitly:</p>
+<pre><code class="language-go">_, err := client.CreateTimeshift(ctx, ns, selector, target, ttl)
+if sdk.IsConflict(err) {
+    log.Printf("conflict: %v", err)
+    // list existing timeshifts to find the owner, or delete it first
+}</code></pre>
+
+<h3>Is there a Helm chart?</h3>
+<p>Not yet. The <code>deploy/</code> directory contains raw Kubernetes manifests. A Helm chart is on the roadmap.</p>
+
+<h3>Will this work on kind, minikube, or k3s?</h3>
+<p>Yes, with the right configuration. The cluster must allow privileged pods. On kind, the default configuration allows this. On minikube, you may need to pass <code>--extra-config=apiserver.enable-admission-plugins=PodSecurityAdmission</code> and configure the policy to allow privileged pods in the <code>epochd</code> namespace. The e2e tests in the repo target a kind cluster via the Makefile.</p>
+
+</div><!-- .content -->
+</main><!-- .main -->
+
+<script>
+hljs.highlightAll();
+
+const sidebar = document.getElementById('sidebar');
+const menuBtn = document.getElementById('menuBtn');
+menuBtn.addEventListener('click', () => sidebar.classList.toggle('open'));
+document.querySelector('.main').addEventListener('click', () => {
+  if (sidebar.classList.contains('open')) sidebar.classList.remove('open');
+});
+
+const links = document.querySelectorAll('.sidebar a');
+const sections = Array.from(links).map(a => {
+  const id = a.getAttribute('href').slice(1);
+  return { link: a, el: document.getElementById(id) };
+}).filter(x => x.el);
+
+const obs = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      links.forEach(l => l.classList.remove('active'));
+      const match = sections.find(s => s.el === e.target);
+      if (match) match.link.classList.add('active');
+    }
+  });
+}, { rootMargin: '-10% 0px -80% 0px' });
+
+sections.forEach(s => obs.observe(s.el));
+
+const darkMql = window.matchMedia('(prefers-color-scheme: dark)');
+function applyHljsTheme(dark) {
+  document.getElementById('hljs-light').disabled = dark;
+  document.getElementById('hljs-dark').disabled = !dark;
+}
+applyHljsTheme(darkMql.matches);
+darkMql.addEventListener('change', e => applyHljsTheme(e.matches));
+</script>
+</body>
+</html>

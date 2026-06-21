@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -153,6 +154,104 @@ func TestCreateTimeshiftNoMatchingPods(t *testing.T) {
 	}
 	if !isNotFound(err) {
 		t.Errorf("expected notFoundError, got %T: %v", err, err)
+	}
+}
+
+func TestCreateTimeshiftConflictSamePod(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+
+	target := time.Now().Add(24 * time.Hour)
+	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, 0); err != nil {
+		t.Fatalf("first createTimeshift: %v", err)
+	}
+
+	// Second timeshift targeting the same pod must be rejected.
+	_, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target.Add(time.Hour), 0)
+	if err == nil {
+		t.Fatal("expected conflict error, got nil")
+	}
+	var ce *conflictError
+	if !errors.As(err, &ce) {
+		t.Errorf("expected conflictError, got %T: %v", err, err)
+	}
+	if len(ce.entries) != 1 {
+		t.Errorf("expected 1 conflict entry, got %d", len(ce.entries))
+	}
+	if ce.entries[0].pod != "web-1" || ce.entries[0].container != "main" {
+		t.Errorf("unexpected conflict entry: %+v", ce.entries[0])
+	}
+}
+
+func TestCreateTimeshiftConflictPartialOverlap(t *testing.T) {
+	podA := makePod("web-a", "default", "10.0.0.1", "containerd://aaaa00000000")
+	podB := makePod("web-b", "default", "10.0.0.2", "containerd://bbbb00000000")
+	ctrl, _ := newTestController(t, podA, podB)
+
+	target := time.Now().Add(24 * time.Hour)
+
+	// First timeshift covers web-a only.
+	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-a", target, 0); err != nil {
+		t.Fatalf("first createTimeshift: %v", err)
+	}
+
+	// Second timeshift uses a broader selector that overlaps web-a — must conflict.
+	_, err := ctrl.createTimeshift(context.Background(), "default", "app in (web-a,web-b)", target, 0)
+	if err == nil {
+		t.Fatal("expected conflict error, got nil")
+	}
+	if !isConflict(err) {
+		t.Errorf("expected conflictError, got %T: %v", err, err)
+	}
+}
+
+func TestCreateTimeshiftNoConflictAfterDelete(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+
+	target := time.Now().Add(24 * time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, 0)
+	if err != nil {
+		t.Fatalf("first createTimeshift: %v", err)
+	}
+
+	if err := ctrl.deleteTimeshift(context.Background(), s.id); err != nil {
+		t.Fatalf("deleteTimeshift: %v", err)
+	}
+
+	// After deletion, the same pod must be targetable again.
+	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, 0); err != nil {
+		t.Fatalf("second createTimeshift after delete: %v", err)
+	}
+}
+
+func TestHTTPCreateTimeshiftConflict(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+	mux := ctrl.routes()
+
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	body := api.CreateTimeshiftRequest{
+		Namespace:     "default",
+		LabelSelector: "app=web-1",
+		Time:          target.Format(time.RFC3339),
+	}
+
+	// First request succeeds.
+	w := doRequest(t, mux, http.MethodPost, "/timeshifts", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("first POST /timeshifts: got %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Second request for the same pod returns 409.
+	w = doRequest(t, mux, http.MethodPost, "/timeshifts", body)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("second POST /timeshifts: got %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+	var errResp api.ErrorResponse
+	decodeResponse(t, w, &errResp)
+	if !strings.Contains(errResp.Error, "already have an active timeshift") {
+		t.Errorf("unexpected error message: %q", errResp.Error)
 	}
 }
 
@@ -468,8 +567,9 @@ func TestHTTPCreateTimeshiftInvalidTTL(t *testing.T) {
 // TestListTimeshifts verifies that listTimeshifts returns all active entries
 // sorted oldest-first.
 func TestListTimeshifts(t *testing.T) {
-	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
-	ctrl, _ := newTestController(t, pod)
+	pod1 := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	pod2 := makePod("web-2", "default", "10.0.0.2", "containerd://ddeeff445566")
+	ctrl, _ := newTestController(t, pod1, pod2)
 
 	// Empty to start.
 	if got := ctrl.listTimeshifts(); len(got) != 0 {
@@ -483,7 +583,7 @@ func TestListTimeshifts(t *testing.T) {
 	}
 	// Ensure distinct createdAt values.
 	time.Sleep(time.Millisecond)
-	s2, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target.Add(time.Hour), 0)
+	s2, err := ctrl.createTimeshift(context.Background(), "default", "app=web-2", target.Add(time.Hour), 0)
 	if err != nil {
 		t.Fatalf("createTimeshift 2: %v", err)
 	}
@@ -509,8 +609,9 @@ func TestListTimeshifts(t *testing.T) {
 }
 
 func TestHTTPListTimeshifts(t *testing.T) {
-	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
-	ctrl, _ := newTestController(t, pod)
+	pod1 := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	pod2 := makePod("web-2", "default", "10.0.0.2", "containerd://ddeeff445566")
+	ctrl, _ := newTestController(t, pod1, pod2)
 	mux := ctrl.routes()
 
 	// Empty list before any timeshifts.
@@ -524,13 +625,13 @@ func TestHTTPListTimeshifts(t *testing.T) {
 		t.Fatalf("expected empty slice, got %d", len(empty.Timeshifts))
 	}
 
-	// Create two timeshifts.
+	// Create two timeshifts — one per pod so they don't conflict.
 	target := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
 	doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
 		Namespace: "default", LabelSelector: "app=web-1", Time: target, TTL: "1h",
 	})
 	doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
-		Namespace: "default", LabelSelector: "app=web-1", Time: target,
+		Namespace: "default", LabelSelector: "app=web-2", Time: target,
 	})
 
 	w = doRequest(t, mux, http.MethodGet, "/timeshifts", nil)
@@ -927,13 +1028,14 @@ func TestControllerRestoreAfterDelete(t *testing.T) {
 // TestControllerRestoreGauge verifies that restore correctly initialises the
 // Prometheus active-timeshifts gauge.
 func TestControllerRestoreGauge(t *testing.T) {
-	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
-	ctrl1, _, k8s := newTestControllerWithStore(t, pod)
+	pod1 := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	pod2 := makePod("web-2", "default", "10.0.0.2", "containerd://ddeeff445566")
+	ctrl1, _, k8s := newTestControllerWithStore(t, pod1, pod2)
 	ctx := context.Background()
 
-	// Create two timeshifts so the gauge must be 2 after restore.
-	for range 2 {
-		if _, err := ctrl1.createTimeshift(ctx, "default", "app=web-1", time.Now().Add(time.Hour), 0); err != nil {
+	// Create two timeshifts (one per pod) so the gauge must be 2 after restore.
+	for _, sel := range []string{"app=web-1", "app=web-2"} {
+		if _, err := ctrl1.createTimeshift(ctx, "default", sel, time.Now().Add(time.Hour), 0); err != nil {
 			t.Fatalf("createTimeshift: %v", err)
 		}
 	}

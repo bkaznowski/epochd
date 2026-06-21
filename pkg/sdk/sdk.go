@@ -106,6 +106,17 @@ func IsNotFound(err error) bool {
 	return false
 }
 
+// IsConflict reports whether err is a 409 response from the controller,
+// meaning one or more containers in the request are already targeted by an
+// active timeshift. Delete or update the conflicting timeshift first.
+func IsConflict(err error) bool {
+	var ae *APIError
+	if ok := isAPIError(err, &ae); ok {
+		return ae.StatusCode == http.StatusConflict
+	}
+	return false
+}
+
 func isAPIError(err error, out **APIError) bool {
 	if err == nil {
 		return false

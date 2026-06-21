@@ -49,6 +49,7 @@ Things that require your input or manual action before the project is fully read
 - [x] **Phase 23 — Agent handle status RPC** (`GetStatus` → live generation + targetTime from trampoline)
 - [ ] **Phase 24 — Python SDK** (`epochd-client` on PyPI; pytest fixture with auto-skip)
 - [x] **Phase 25 — Local process injection** (`pkg/localtime`: `Session`, `Start`/`Attach`, `WithSession` helper; non-Kubernetes, Linux only)
+- [x] **Phase 26 — Conflict guard** (reject `POST /timeshifts` with `409 Conflict` when any matched container is already in an active timeshift; `sdk.IsConflict`)
 
 ---
 
