@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -18,6 +19,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 // AgentPool abstracts per-node gRPC connections to the epochd agent.
@@ -33,6 +36,7 @@ type containerHandle struct {
 	pod         string // pod name (namespace lives on the parent timeshift)
 	container   string
 	nodeIP      string
+	containerID string // CRI container ID — used to re-inject after an agent restart
 	agentHandle string // opaque ID returned by the agent's Inject RPC
 }
 
@@ -154,6 +158,7 @@ func (c *controller) injectPod(ctx context.Context, pod *corev1.Pod, target time
 			pod:         pod.Name,
 			container:   cs.Name,
 			nodeIP:      nodeIP,
+			containerID: cs.ContainerID,
 			agentHandle: hid,
 		})
 	}
@@ -191,20 +196,51 @@ func (c *controller) getTimeshift(id string) (*timeshift, error) {
 }
 
 // updateTimeshift calls SetTime on every agent handle for the timeshift and updates the
-// registered target time.
+// registered target time. If an agent handle is gone (agent restarted), it re-injects
+// the container and updates the stored handle before retrying.
 func (c *controller) updateTimeshift(ctx context.Context, id string, target time.Time) (*timeshift, error) {
 	s, err := c.getTimeshift(id)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, h := range s.handles {
-		if err := c.agents.SetTime(ctx, h.nodeIP, h.agentHandle, target); err != nil {
+	// Snapshot handles so gRPC calls happen outside the lock.
+	c.mu.RLock()
+	handles := make([]containerHandle, len(s.handles))
+	copy(handles, s.handles)
+	c.mu.RUnlock()
+
+	type update struct {
+		idx       int
+		newHandle string
+	}
+	var updates []update
+
+	for i, h := range handles {
+		if err := c.agents.SetTime(ctx, h.nodeIP, h.agentHandle, target); err == nil {
+			continue
+		} else if !isAgentNotFound(err) {
 			log.Printf("controller: SetTime timeshift=%s handle=%s: %v", id[:8], h.agentHandle, err)
+			continue
 		}
+		// Agent restarted — re-inject the container then retry.
+		log.Printf("controller: handle %s not found on agent; re-injecting container %s",
+			h.agentHandle, h.containerID)
+		newHandle, injErr := c.agents.Inject(ctx, h.nodeIP, h.containerID, target)
+		if injErr != nil {
+			log.Printf("controller: re-inject container=%s: %v", h.containerID, injErr)
+			continue
+		}
+		updates = append(updates, update{i, newHandle})
 	}
 
 	c.mu.Lock()
+	// Apply re-injected handle IDs; match by containerID in case handles shifted.
+	for _, u := range updates {
+		if u.idx < len(s.handles) && s.handles[u.idx].containerID == handles[u.idx].containerID {
+			s.handles[u.idx].agentHandle = u.newHandle
+		}
+	}
 	s.targetTime = target
 	c.mu.Unlock()
 	return s, nil
@@ -226,9 +262,16 @@ func (c *controller) deleteTimeshift(ctx context.Context, id string) error {
 }
 
 // resetHandles calls Reset on every handle in a timeshift; errors are logged only.
+// A NOT_FOUND response means the agent restarted and the handle is already gone — that
+// is treated as a successful reset since the container's clock is already at real time.
 func (c *controller) resetHandles(ctx context.Context, s *timeshift) {
 	for _, h := range s.handles {
 		if err := c.agents.Reset(ctx, h.nodeIP, h.agentHandle); err != nil {
+			if isAgentNotFound(err) {
+				log.Printf("controller: reset timeshift=%s handle=%s: handle already gone (agent restarted)",
+					s.id[:8], h.agentHandle)
+				continue
+			}
 			log.Printf("controller: reset timeshift=%s handle=%s: %v", s.id[:8], h.agentHandle, err)
 		}
 	}
@@ -275,6 +318,17 @@ func (c *controller) sweepExpired(ctx context.Context) {
 type notFoundError struct{ msg string }
 
 func (e *notFoundError) Error() string { return e.msg }
+
+// isAgentNotFound reports whether err (possibly wrapped) is a gRPC NOT_FOUND status,
+// indicating the agent restarted and lost its in-memory handle.
+func isAgentNotFound(err error) bool {
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if s, ok := grpcstatus.FromError(e); ok {
+			return s.Code() == codes.NotFound
+		}
+	}
+	return false
+}
 
 func newID() string {
 	var b [16]byte

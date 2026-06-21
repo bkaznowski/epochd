@@ -14,6 +14,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 // ---------------------------------------------------------------------------
@@ -537,6 +539,124 @@ func TestHTTPHealthz(t *testing.T) {
 	decodeResponse(t, w, &body)
 	if body["status"] != "ok" {
 		t.Errorf("status: got %q want \"ok\"", body["status"])
+	}
+}
+
+// TestUpdateTimeshiftReinjection verifies that when SetTime returns a gRPC
+// NOT_FOUND (agent restarted), updateTimeshift re-injects the container via
+// Inject and stores the new handle ID.
+func TestUpdateTimeshiftReinjection(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, pool := newTestController(t, pod)
+
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+	originalHandle := s.handles[0].agentHandle
+
+	// SetTime returns NOT_FOUND to simulate agent restart.
+	pool.setTimeFn = func(_ context.Context, _, _ string, _ time.Time) error {
+		return grpcstatus.Error(codes.NotFound, "handle not found")
+	}
+	newAgentHandle := "handle-reinjected"
+	injectCalled := 0
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time) (string, error) {
+		injectCalled++
+		return newAgentHandle, nil
+	}
+
+	newTarget := time.Now().Add(48 * time.Hour)
+	s2, err := ctrl.updateTimeshift(context.Background(), s.id, newTarget)
+	if err != nil {
+		t.Fatalf("updateTimeshift: %v", err)
+	}
+	if injectCalled != 1 {
+		t.Errorf("Inject called %d times, want 1", injectCalled)
+	}
+	if s2.handles[0].agentHandle == originalHandle {
+		t.Errorf("handle not updated: still %q", originalHandle)
+	}
+	if s2.handles[0].agentHandle != newAgentHandle {
+		t.Errorf("handle = %q, want %q", s2.handles[0].agentHandle, newAgentHandle)
+	}
+}
+
+// TestPodWatcherReinjection verifies that handlePodEvent re-injects a restarted
+// pod (new containerID) and replaces the stale handle in the timeshift.
+func TestPodWatcherReinjection(t *testing.T) {
+	oldCID := "containerd://aabbcc112233"
+	pod := makePod("web-1", "default", "10.0.0.1", oldCID)
+	pod.Status.Phase = corev1.PodRunning
+	ctrl, pool := newTestController(t, pod)
+
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+	if len(s.handles) != 1 {
+		t.Fatalf("expected 1 handle after create, got %d", len(s.handles))
+	}
+
+	// Simulate pod restart: same pod name, new containerID.
+	newCID := "containerd://ddeeff445566"
+	restarted := makePod("web-1", "default", "10.0.0.1", newCID)
+	restarted.Status.Phase = corev1.PodRunning
+
+	newAgentHandle := "handle-new"
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time) (string, error) {
+		return newAgentHandle, nil
+	}
+
+	ctrl.handlePodEvent(context.Background(), &restarted)
+
+	ctrl.mu.RLock()
+	ts := ctrl.timeshifts[s.id]
+	handles := make([]containerHandle, len(ts.handles))
+	copy(handles, ts.handles)
+	ctrl.mu.RUnlock()
+
+	if len(handles) != 1 {
+		t.Fatalf("expected 1 handle after re-injection, got %d", len(handles))
+	}
+	if handles[0].containerID != newCID {
+		t.Errorf("containerID = %q, want %q", handles[0].containerID, newCID)
+	}
+	if handles[0].agentHandle != newAgentHandle {
+		t.Errorf("agentHandle = %q, want %q", handles[0].agentHandle, newAgentHandle)
+	}
+}
+
+// TestPodWatcherSkipsAlreadyHandled verifies that handlePodEvent does not
+// re-inject a pod whose containers are already in the handles list.
+func TestPodWatcherSkipsAlreadyHandled(t *testing.T) {
+	cid := "containerd://aabbcc112233"
+	pod := makePod("web-1", "default", "10.0.0.1", cid)
+	pod.Status.Phase = corev1.PodRunning
+	ctrl, pool := newTestController(t, pod)
+
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+
+	injectCalled := 0
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time) (string, error) {
+		injectCalled++
+		return "handle-extra", nil
+	}
+
+	// Same pod, same containerID — already handled.
+	ctrl.handlePodEvent(context.Background(), &pod)
+
+	if injectCalled != 0 {
+		t.Errorf("Inject called %d times for already-handled pod, want 0", injectCalled)
+	}
+	ctrl.mu.RLock()
+	handleCount := len(ctrl.timeshifts[s.id].handles)
+	ctrl.mu.RUnlock()
+	if handleCount != 1 {
+		t.Errorf("handle count = %d, want 1 (no duplicates)", handleCount)
 	}
 }
 

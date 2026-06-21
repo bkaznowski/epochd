@@ -45,6 +45,7 @@ func main() {
 	defer stop()
 
 	ctrl.startSweeper(ctx, *sweepInterval)
+	ctrl.startPodWatcher(ctx)
 
 	srv := &http.Server{
 		Addr:    *listen,
