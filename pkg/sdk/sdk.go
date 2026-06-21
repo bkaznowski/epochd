@@ -221,12 +221,56 @@ func (c *Client) Resolve(ctx context.Context, ns, labelSelector string) ([]api.R
 }
 
 // ---------------------------------------------------------------------------
+// WaitForActive
+// ---------------------------------------------------------------------------
+
+// WaitForActive polls /timeshifts/{id}/status every 250 ms until every
+// container in the timeshift reports a successful injection (Status non-nil,
+// no Error field) or until ctx is cancelled.
+//
+// A per-container injection error is returned immediately rather than retried
+// — it indicates the agent rejected the injection and retrying is not useful.
+//
+// WaitForActive is called automatically by WithTime before the user callback
+// is invoked. Callers using CreateTimeshift directly can call this method to
+// confirm injection before making assertions.
+func (c *Client) WaitForActive(ctx context.Context, id string) error {
+	for {
+		st, err := c.TimeshiftStatus(ctx, id)
+		if err != nil {
+			return fmt.Errorf("sdk: WaitForActive: %w", err)
+		}
+
+		allReady := true
+		for _, cs := range st.Containers {
+			if cs.Error != "" {
+				return fmt.Errorf("sdk: WaitForActive: container %s/%s: %s",
+					cs.Pod, cs.Container, cs.Error)
+			}
+			if cs.Status == nil {
+				allReady = false
+			}
+		}
+		if allReady {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // WithTime helper
 // ---------------------------------------------------------------------------
 
-// WithTime creates a timeshift, calls fn, then deletes the timeshift — even
-// if fn returns an error. The timeshift id is available as ts.ID if fn needs
-// to call UpdateTimeshift mid-test.
+// WithTime creates a timeshift, waits for every targeted container to confirm
+// injection via WaitForActive, calls fn, then deletes the timeshift — even if
+// fn returns an error. The timeshift id is available as ts.ID if fn needs to
+// call UpdateTimeshift mid-test.
 //
 // ttl must be positive. WithTime is a scoped helper that always cleans up
 // after itself; use CreateTimeshift directly if you need a timeshift that
@@ -248,6 +292,11 @@ func WithTime(
 	ts, err := c.CreateTimeshift(ctx, ns, labelSelector, target, ttl)
 	if err != nil {
 		return fmt.Errorf("sdk: WithTime create: %w", err)
+	}
+
+	if err := c.WaitForActive(ctx, ts.ID); err != nil {
+		_ = c.DeleteTimeshift(ctx, ts.ID)
+		return fmt.Errorf("sdk: WithTime: %w", err)
 	}
 
 	fnErr := fn(ctx, ts)

@@ -33,9 +33,10 @@ func clockprinterImage() string {
 // forward via epochd, reads recent log output from the injected process, and
 // asserts the year in that output matches the shifted time.
 //
-// The clockprinter binary calls time.Now() directly (no fork+exec), so the
-// vDSO patch persists and the logs reflect fake time. kubectl exec would not
-// work because exec replaces the address space, discarding the vDSO patch.
+// sdk.WithTime calls WaitForActive internally, which confirms all containers
+// are injected before the callback runs — no sleep is needed after create.
+// The 2-second sleep that remains is purely to let the clockprinter print at
+// least one new line with fake time (it prints once per second).
 func TestTimeshiftDate(t *testing.T) {
 	controllerURL := os.Getenv("EPOCHD_URL")
 	if controllerURL == "" {
@@ -74,9 +75,9 @@ func TestTimeshiftDate(t *testing.T) {
 
 	err := sdk.WithTime(ctx, client, ns, "app=clocktest", target, 10*time.Minute,
 		func(ctx context.Context, ts *sdk.Timeshift) error {
-			// The clockprinter process prints once per second; wait long enough
-			// for at least two new lines to appear after the trampoline is live.
-			time.Sleep(3 * time.Second)
+			// WaitForActive (called by WithTime) confirmed the vDSO patch is live.
+			// Sleep long enough for the clockprinter to emit at least one new line.
+			time.Sleep(2 * time.Second)
 
 			logs := strings.TrimSpace(outputCmd(t,
 				"kubectl", "logs", "-n", ns, pod, "--tail=5",
@@ -135,7 +136,8 @@ func TestTimeshiftUpdate(t *testing.T) {
 
 	err := sdk.WithTime(ctx, client, ns, "app=updatetest", firstTarget, 10*time.Minute,
 		func(ctx context.Context, ts *sdk.Timeshift) error {
-			time.Sleep(3 * time.Second)
+			// WaitForActive confirmed the initial injection; wait for one print cycle.
+			time.Sleep(2 * time.Second)
 
 			logs := strings.TrimSpace(outputCmd(t,
 				"kubectl", "logs", "-n", ns, pod, "--tail=5",
@@ -146,11 +148,12 @@ func TestTimeshiftUpdate(t *testing.T) {
 					got, firstTarget.Year(), logs)
 			}
 
-			// Update to 5 years ahead.
+			// UpdateTimeshift writes the new offset via process_vm_writev (synchronous).
+			// Sleep 2 s so the clockprinter prints at least one line with the new time.
 			if _, err := client.UpdateTimeshift(ctx, ts.ID, secondTarget); err != nil {
 				return fmt.Errorf("UpdateTimeshift: %w", err)
 			}
-			time.Sleep(3 * time.Second)
+			time.Sleep(2 * time.Second)
 
 			logs = strings.TrimSpace(outputCmd(t,
 				"kubectl", "logs", "-n", ns, pod, "--tail=5",

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,15 @@ import (
 type fakeServer struct {
 	mux    *http.ServeMux
 	stored *api.TimeshiftResponse // nil = not found
+
+	// statusNotReadyCount controls how many times GET /status returns a
+	// not-yet-injected response (Status: nil) before becoming ready.
+	// Set before creating a timeshift; decremented atomically by the handler.
+	statusNotReadyCount atomic.Int32
+
+	// statusContainerError, if non-empty, is the Error field returned for the
+	// container in every status response. Takes precedence over notReadyCount.
+	statusContainerError string
 }
 
 func newFakeServer() *fakeServer {
@@ -32,6 +42,7 @@ func newFakeServer() *fakeServer {
 	fs.mux.HandleFunc("GET /timeshifts/{id}", fs.handleGet)
 	fs.mux.HandleFunc("PATCH /timeshifts/{id}", fs.handleUpdate)
 	fs.mux.HandleFunc("DELETE /timeshifts/{id}", fs.handleDelete)
+	fs.mux.HandleFunc("GET /timeshifts/{id}/status", fs.handleStatus)
 	return fs
 }
 
@@ -105,6 +116,39 @@ func (fs *fakeServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	fs.stored = nil
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (fs *fakeServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if fs.stored == nil || fs.stored.ID != id {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+
+	entry := api.ContainerStatusEntry{
+		Pod:       "pod-a",
+		Container: "main",
+		NodeIP:    "10.0.0.1",
+	}
+
+	switch {
+	case fs.statusContainerError != "":
+		entry.Error = fs.statusContainerError
+	case fs.statusNotReadyCount.Add(-1) >= 0:
+		// Status nil — injection not yet confirmed; leave Status unset.
+	default:
+		entry.Status = &api.HandleStatus{
+			Generation: 0,
+			LastTarget: fs.stored.Time,
+			PID:        12345,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, api.TimeshiftStatusResponse{
+		ID:         id,
+		Namespace:  fs.stored.Namespace,
+		Containers: []api.ContainerStatusEntry{entry},
+	})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -398,5 +442,119 @@ func TestWithTimeTSkipsWithoutEnvVar(t *testing.T) {
 	})
 	if ran {
 		t.Error("WithTimeT fn body should not run when EPOCHD_URL is unset")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WaitForActive tests
+// ---------------------------------------------------------------------------
+
+func TestWaitForActive(t *testing.T) {
+	client, _ := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	ts, err := client.CreateTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateTimeshift: %v", err)
+	}
+	// fakeServer returns ready status immediately (statusNotReadyCount = 0).
+	if err := client.WaitForActive(context.Background(), ts.ID); err != nil {
+		t.Fatalf("WaitForActive: %v", err)
+	}
+}
+
+func TestWaitForActiveRetries(t *testing.T) {
+	client, fs := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	// First two status calls return Status: nil; third returns ready.
+	fs.statusNotReadyCount.Store(2)
+
+	ts, err := client.CreateTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateTimeshift: %v", err)
+	}
+	if err := client.WaitForActive(context.Background(), ts.ID); err != nil {
+		t.Fatalf("WaitForActive after retries: %v", err)
+	}
+}
+
+func TestWaitForActiveContainerError(t *testing.T) {
+	client, fs := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	fs.statusContainerError = "ptrace attach failed: permission denied"
+
+	ts, err := client.CreateTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateTimeshift: %v", err)
+	}
+	err = client.WaitForActive(context.Background(), ts.ID)
+	if err == nil {
+		t.Fatal("expected error from WaitForActive, got nil")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("expected container error in message, got: %v", err)
+	}
+}
+
+func TestWaitForActiveContextCancelled(t *testing.T) {
+	client, fs := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	// Never becomes ready.
+	fs.statusNotReadyCount.Store(1000)
+
+	ts, err := client.CreateTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateTimeshift: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	err = client.WaitForActive(ctx, ts.ID)
+	if err == nil {
+		t.Fatal("expected error from WaitForActive after cancellation, got nil")
+	}
+}
+
+func TestWithTimeWaitsForActive(t *testing.T) {
+	client, fs := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	// Status reports not-ready on the first poll; fn should still receive a
+	// confirmed-active timeshift by the time it is called.
+	fs.statusNotReadyCount.Store(1)
+
+	called := false
+	err := sdk.WithTime(context.Background(), client, "default", "app=svc", target, time.Hour,
+		func(ctx context.Context, ts *sdk.Timeshift) error {
+			called = true
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("WithTime: %v", err)
+	}
+	if !called {
+		t.Error("WithTime fn was not called")
+	}
+}
+
+func TestWithTimeCleansUpOnWaitError(t *testing.T) {
+	client, fs := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	fs.statusContainerError = "inject failed"
+
+	err := sdk.WithTime(context.Background(), client, "default", "app=svc", target, time.Hour,
+		func(ctx context.Context, ts *sdk.Timeshift) error { return nil },
+	)
+	if err == nil {
+		t.Fatal("expected error from WithTime when WaitForActive fails")
+	}
+	if fs.stored != nil {
+		t.Error("timeshift was not deleted after WaitForActive failure")
 	}
 }
