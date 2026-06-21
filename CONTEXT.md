@@ -1,20 +1,25 @@
-# epochd — implementation context for phases 7–10
+# epochd — implementation context (current phase: 18)
 
 This file is a dense reference for an agent or developer continuing the project. It
-captures the state of the codebase after phases 0–6, the exact APIs that exist, every
-non-obvious decision that was made and why, discovered gotchas, and the spec for what
-phases 7–10 need to build.
+captures the state of the codebase after phases 0–18, the exact APIs that exist, every
+non-obvious decision that was made and why, and discovered gotchas. Phase 19
+(Prometheus metrics) is the next unstarted phase.
 
 ---
 
 ## Module and build facts
 
 - **Module**: `epochd`
-- **Go version**: 1.25.5 (in go.mod)
-- **Only dependency**: `golang.org/x/sys v0.46.0` (for `unix.ProcessVMReadv`, `unix.ProcessVMWritev`, `unix.PtraceRegs`, `unix.MAP_FIXED_NOREPLACE`, etc.)
-- **Build constraint on almost every file**: `//go:build linux` — the vDSO hook is Linux x86-64 only. `pkg/api` and `test/targets/clockprinter` are the exceptions (no build tag).
+- **Go version**: `go 1.26.4` (in go.mod)
+- **Direct dependencies**:
+  - `golang.org/x/sys v0.46.0` — ptrace, `process_vm_readv/writev`, `MAP_FIXED_NOREPLACE`
+  - `google.golang.org/grpc v1.81.1` — controller→agent gRPC transport
+  - `google.golang.org/protobuf v1.36.x` — generated protobuf types
+  - `k8s.io/api v0.32.5`, `k8s.io/apimachinery v0.32.5`, `k8s.io/client-go v0.32.5` — pod listing and informers
+- **Build constraint on most files**: `//go:build linux` — the vDSO hook is Linux x86-64 only. `pkg/api`, `pkg/sdk`, `pkg/agentclient`, `pkg/agentpb`, and `test/targets/clockprinter` have no build tag (cross-platform).
 - **No CGo anywhere.** The trampoline binary is embedded bytes; no native compilation at runtime.
 - **Cross-compile from Windows/Mac**: `GOOS=linux GOARCH=amd64 go build ./...` works fine; the `//go:build linux` tag is for runtime, not the host.
+- **golangci-lint**: configured in `.golangci.yml`; CI uses `install-mode: goinstall` so the linter is built with the project's own Go version (avoids version mismatch rejections from older pre-built linter binaries).
 
 ---
 
@@ -253,17 +258,19 @@ injection target with `faketimectl`. The inject tests use an in-binary helper in
 
 ---
 
-### Stubs (to be implemented in phases 7–10)
+### Packages added in phases 7–18
 
-| File | Phase | Status |
-|------|-------|--------|
-| `cmd/agent/main.go` | 7 | `func main() {}` |
-| `cmd/controller/main.go` | 8 | `func main() {}` |
-| `pkg/api/api.go` | 7/8 | empty package |
-| `pkg/k8sresolve/k8sresolve.go` | 8 | empty package, `//go:build linux` |
-| `deploy/daemonset.yaml` | 9 | `# placeholder` |
-| `deploy/rbac.yaml` | 9 | `# placeholder` |
-| `deploy/controller-deployment.yaml` | 9 | `# placeholder` |
+| Package | Phase | Summary |
+|---------|-------|---------|
+| `pkg/agentpb` | 7 | Generated gRPC types from `proto/agent/v1/agent.proto` |
+| `pkg/agentclient` | 7 | gRPC connection pool (`Pool`) satisfying `AgentPool` interface |
+| `pkg/k8sresolve` | 7 | Container ID → PID resolution by scanning `/proc/*/cgroup` |
+| `pkg/api` | 8 | Shared HTTP request/response types (no build tag) |
+| `pkg/sdk` | 10 | Go client library; `Client`, `Timeshift`, `WithTimeT`, `ListTimeshifts` |
+| `cmd/agent` | 7 | gRPC daemon: CRI→PID, inject, SetTime, Reset, handle map |
+| `cmd/controller` | 8 | HTTP+JSON API: timeshifts CRUD, TTL sweeper, pod watcher |
+| `deploy/` | 9 | `rbac.yaml`, `daemonset.yaml`, `controller-deployment.yaml` |
+| `e2e/` | 15 | `//go:build e2e` end-to-end test (`TestTimeshiftDate`) |
 
 ---
 
@@ -303,7 +310,7 @@ life of its process; there is no restart-safe persistence in v1.
 
 ---
 
-## What phases 7–10 need to build
+## Phases 7–10 (implemented — kept for reference)
 
 ### Phase 7 — Node agent (`cmd/agent`, `pkg/api`)
 
@@ -491,7 +498,7 @@ docker run --rm \
   --cap-add SYS_PTRACE \
   --security-opt seccomp=unconfined \
   -v "$(pwd):/workspace" -w /workspace \
-  golang:1.25-alpine \
+  golang:1.26-alpine \
   go test ./... -count=1
 ```
 
@@ -556,48 +563,79 @@ self-contained.
 
 ---
 
-## File tree as of phase 6
+## File tree as of phase 18
 
 ```
 epochd/
-├── go.mod                                     # module epochd, go 1.25.5
+├── go.mod                                     # module epochd, go 1.26.4
 ├── go.sum
-├── plan.md                                    # original rollout plan
+├── plan.md                                    # original rollout plan (phases 0–19)
 ├── README.md                                  # user-facing docs
 ├── CONTEXT.md                                 # this file
+├── TODO.md                                    # one-time setup + remaining phases
+├── FUTURE.md                                  # longer-horizon improvements
+├── Makefile                                   # cluster/load/deploy/e2e targets (kind)
+├── Dockerfile.agent                           # scratch image for cmd/agent
+├── Dockerfile.controller                      # scratch image for cmd/controller
+├── .golangci.yml                              # errcheck, staticcheck, unused, govet
+│
+├── .github/
+│   └── workflows/ci.yml                       # test + lint + build-images jobs
 │
 ├── cmd/
 │   ├── faketimectl/main.go                    # ✅ CLI: --pid, --set-time, --reset
-│   ├── agent/main.go                          # 🔲 stub
-│   └── controller/main.go                     # 🔲 stub
+│   ├── agent/main.go                          # ✅ gRPC daemon: Inject/SetTime/Reset + handle map
+│   └── controller/
+│       ├── main.go                            # ✅ flags, k8s client, agent pool, HTTP server
+│       ├── controller.go                      # ✅ timeshift registry, CRUD, sweeper, re-injection
+│       ├── handlers.go                        # ✅ HTTP routes (/timeshifts, /healthz)
+│       ├── watcher.go                         # ✅ SharedInformer pod watcher (phase 18b)
+│       └── controller_test.go                 # ✅ unit tests for all controller logic
 │
 ├── pkg/
 │   ├── vdso/
 │   │   ├── vdso.go                            # ✅ Locate(pid) → VDSOInfo
 │   │   └── locate_test.go                     # ✅
 │   ├── procmem/
-│   │   ├── procmem.go                         # ✅ Tracer, ReadMem, WriteMem, PokeText
+│   │   ├── procmem.go                         # ✅ Tracer, ReadMem, WriteMem, PokeText, FollowChild
 │   │   └── procmem_test.go                    # ✅ TestTracerBasic
 │   ├── trampoline/
-│   │   ├── trampoline.asm                     # ✅ NASM source
-│   │   ├── trampoline.bin                     # ✅ 118-byte assembled binary
-│   │   ├── trampoline.go                      # ✅ Payload, StateOffset, EncodeState, DecodeState
+│   │   ├── trampoline.asm                     # ✅ NASM source (118 bytes)
+│   │   ├── trampoline.bin                     # ✅ assembled binary (committed)
+│   │   ├── trampoline.go                      # ✅ Payload, StateOffset=86, EncodeState, DecodeState
 │   │   └── trampoline_test.go                 # ✅ regression + round-trip tests
 │   ├── inject/
 │   │   ├── inject.go                          # ✅ InjectAtTime, SetTime, injectWithTracer, remoteMmap
-│   │   ├── inject_test.go                     # ✅ TestRemoteMmap, TestInjectMechanics, TestInjectObserved
-│   │   └── roundtrip_test.go                  # ✅ TestInjectRoundTrip
+│   │   ├── inject_test.go                     # ✅ TestRemoteMmap, TestInjectMechanics, TestInjectObserved*
+│   │   └── roundtrip_test.go                  # ✅ TestInjectRoundTrip* (inject+verify+reset+verify)
+│   ├── agentpb/                               # ✅ generated from proto/agent/v1/agent.proto
+│   │   └── agent_grpc.pb.go, agent.pb.go
+│   ├── agentclient/
+│   │   └── agentclient.go                     # ✅ Pool: per-node gRPC connections, Inject/SetTime/Reset
+│   ├── k8sresolve/
+│   │   └── k8sresolve.go                      # ✅ LookupPID: container ID → PID via /proc/*/cgroup
 │   ├── api/
-│   │   └── api.go                             # 🔲 empty package (no build tag)
-│   └── k8sresolve/
-│       └── k8sresolve.go                      # 🔲 empty package (//go:build linux)
+│   │   └── api.go                             # ✅ HTTP request/response types (no build tag)
+│   └── sdk/
+│       ├── sdk.go                             # ✅ Client, Timeshift, CreateTimeshift, ListTimeshifts, …
+│       ├── testing.go                         # ✅ WithTimeT (isolated testing import)
+│       └── sdk_test.go                        # ✅ fake-server tests
+│
+├── proto/
+│   └── agent/v1/
+│       └── agent.proto                        # ✅ Inject/SetTime/Reset RPCs
 │
 ├── test/
 │   └── targets/
 │       └── clockprinter/main.go               # ✅ prints time.Now() every second
 │
+├── e2e/
+│   └── e2e_test.go                            # ✅ //go:build e2e; TestTimeshiftDate (kind cluster)
+│
 └── deploy/
-    ├── daemonset.yaml                          # 🔲 placeholder
-    ├── rbac.yaml                               # 🔲 placeholder
-    └── controller-deployment.yaml             # 🔲 placeholder
+    ├── rbac.yaml                              # ✅ ServiceAccount + ClusterRole for controller
+    ├── daemonset.yaml                         # ✅ agent: hostPID, SYS_PTRACE, CRI socket
+    └── controller-deployment.yaml            # ✅ controller Deployment + ClusterIP Service + /healthz probe
 ```
+
+\* `TestInjectObserved` is gated on `EPOCHD_INJECT_E2E=1` (skipped in CI; some environments consume the ptrace exec-stop before `FollowChild` can catch it). `TestInjectRoundTrip` runs unconditionally.

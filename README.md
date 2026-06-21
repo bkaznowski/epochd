@@ -1,7 +1,7 @@
 # epochd
 
 [![CI](https://github.com/bkaznowski/epochd/actions/workflows/ci.yml/badge.svg)](https://github.com/bkaznowski/epochd/actions/workflows/ci.yml)
-[![Go 1.25](https://img.shields.io/badge/go-1.25-blue.svg)](https://go.dev/dl/)
+[![Go 1.26](https://img.shields.io/badge/go-1.26-blue.svg)](https://go.dev/dl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A Go tool that injects a fake wall-clock time into a running Linux process without

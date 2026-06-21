@@ -39,9 +39,9 @@ Things that require your input or manual action before the project is fully read
 - [x] **Phase 14 — GitHub Actions CI** (`.github/workflows/ci.yml`, `.golangci.yml`)
 
 - [x] **Phase 15 — Local cluster e2e** (`Makefile`, `e2e/e2e_test.go`)
-- [ ] **Phase 16 — List timeshifts** (`GET /timeshifts`, `ListTimeshifts` in SDK)
-- [ ] **Phase 17 — Health endpoint + `WithTimeT`** (`/healthz`, ergonomic test helper)
-- [ ] **Phase 18 — Handle recovery** (re-inject on agent restart; pod watcher for container restarts)
+- [x] **Phase 16 — List timeshifts** (`GET /timeshifts`, `ListTimeshifts` in SDK)
+- [x] **Phase 17 — Health endpoint + `WithTimeT`** (`/healthz`, ergonomic test helper)
+- [x] **Phase 18 — Handle recovery** (re-inject on agent restart; pod watcher for container restarts)
 - [ ] **Phase 19 — Prometheus metrics** (active timeshifts, inject/settime counters, sweep events)
 
 ---
