@@ -24,6 +24,9 @@ import (
 //     ptrace stop; this is a single process_vm_writev call.
 //  4. Read several more timestamps and confirm they have returned to ~real time.
 func TestInjectRoundTrip(t *testing.T) {
+	if os.Getenv("EPOCHD_INJECT_E2E") == "" {
+		t.Skip("set EPOCHD_INJECT_E2E=1 to run full injection test")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
