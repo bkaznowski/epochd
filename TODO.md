@@ -49,7 +49,7 @@ Things that require your input or manual action before the project is fully read
 - [x] **Phase 23 — Agent handle status RPC** (`GetStatus` → live generation + targetTime from trampoline)
 - [x] **Phase 25 — Local process injection** (`pkg/localtime`: `Session`, `Start`/`Attach`, `WithSession` helper; non-Kubernetes, Linux only)
 - [x] **Phase 26 — Conflict guard** (reject `POST /timeshifts` with `409 Conflict` when any matched container is already in an active timeshift; `sdk.IsConflict`)
-- [ ] **Phase 27 — `faketimectl` subcommand completeness** (`update <id>` and `status <id>` subcommands; tabwriter output)
+- [x] **Phase 27 — `faketimectl` subcommand completeness** (`update <id>` and `status <id>` subcommands; tabwriter output)
 - [ ] **Phase 28 — Structured logging** (`log/slog` JSON handler; `LOG_LEVEL` env var; per-request logger with `timeshift_id`)
 - [ ] **Phase 29 — TTL expiry events and counter** (Kubernetes `Event` on pod when timeshift expires; `timeshift_expired_total` Prometheus counter)
 - [ ] **Phase 30 — Lease-based leader election** (`coordination.k8s.io/Lease`; standby replicas return `503`; `LEADER_ELECTION` env var)

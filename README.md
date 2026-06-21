@@ -509,7 +509,7 @@ as closures over a channel and executed on that pinned thread.
 | 23 | Agent handle status RPC (`GetStatus`) | ✅ |
 | 25 | Local process injection (`pkg/localtime`, non-Kubernetes) | ✅ |
 | 26 | Conflict guard (reject overlapping timeshifts, `409 Conflict`) | ✅ |
-| 27 | `faketimectl` subcommand completeness (`update`, `status`) | 🔲 |
+| 27 | `faketimectl` subcommand completeness (`update`, `status`) | ✅ |
 | 28 | Structured logging (`log/slog`, JSON output, `LOG_LEVEL`) | 🔲 |
 | 29 | TTL expiry Kubernetes Events + `timeshift_expired_total` counter | 🔲 |
 | 30 | Lease-based leader election (`coordination.k8s.io/Lease`) | 🔲 |
