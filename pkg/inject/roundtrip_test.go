@@ -111,11 +111,11 @@ func TestInjectRoundTrip(t *testing.T) {
 		}
 		// Skip timestamps still draining from the pipe buffer that were printed
 		// before SetTime reached the trampoline (they'll still be ~24 h ahead).
-		if ts.Sub(time.Now()).Abs() > fakeOffset/2 {
+		if time.Until(ts).Abs() > fakeOffset/2 {
 			t.Logf("phase B: discarding pre-reset timestamp %v", ts)
 			continue
 		}
-		diff := ts.Sub(time.Now()).Abs()
+		diff := time.Until(ts).Abs()
 		if diff > tolerance {
 			t.Errorf("phase B: printed time %v is %v from real now, want <%v",
 				ts, diff.Round(time.Millisecond), tolerance)
