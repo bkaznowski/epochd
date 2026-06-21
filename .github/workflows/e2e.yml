@@ -1,0 +1,53 @@
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - "cmd/**"
+      - "pkg/**"
+      - "deploy/**"
+      - "e2e/**"
+      - "Makefile"
+      - "Dockerfile.*"
+
+jobs:
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install kind
+        run: |
+          curl -Lo /usr/local/bin/kind \
+            "https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64"
+          chmod +x /usr/local/bin/kind
+
+      - name: Install kubectl
+        run: |
+          curl -Lo /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+
+      # The agent uses ptrace. ptrace_scope=1 is sufficient when the agent pod
+      # has CAP_SYS_PTRACE (it runs as privileged), but set to 0 explicitly to
+      # avoid any subtle restriction inside the kind node's PID namespace.
+      - name: Allow ptrace
+        run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+
+      - name: Run integration tests
+        run: make test-integration
+
+      # Always clean up the kind cluster, even if tests failed.
+      - name: Tear down cluster
+        if: always()
+        run: make kind-down-test || true

@@ -55,7 +55,7 @@ Things that require your input or manual action before the project is fully read
 - [ ] **Phase 30 — Lease-based leader election** (`coordination.k8s.io/Lease`; standby replicas return `503`; `LEADER_ELECTION` env var)
 - [ ] **Phase 31 — Validating webhook admission controller** (reject pod creation when matching timeshift is active and agent is unreachable; separate `cmd/webhook` binary)
 - [ ] **Phase 32 — `pkg/localtime` Attach path** (`Attach(pid, target)` + `WithPID` helper; requires `CAP_SYS_PTRACE`; skip test if `ptrace_scope > 1`)
-- [ ] **Phase 33 — Integration test harness** (`make test-integration`; kind cluster lifecycle; `e2e.yml` GitHub Actions workflow)
+- [x] **Phase 33 — Integration test harness** (`make test-integration`; kind cluster lifecycle; `e2e.yml` GitHub Actions workflow)
 
 ---
 

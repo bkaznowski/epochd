@@ -1,9 +1,11 @@
 CLUSTER          := epochd-dev
+TEST_CLUSTER     := epochd-test
 IMAGE_TAG        := dev
 AGENT_IMAGE      := epochd-agent:$(IMAGE_TAG)
 CONTROLLER_IMAGE := epochd-controller:$(IMAGE_TAG)
 
-.PHONY: check-deps cluster delete-cluster images load deploy e2e
+.PHONY: check-deps cluster delete-cluster images load deploy e2e \
+        test-integration _integration-inner kind-up-test kind-down-test
 
 check-deps:
 	@command -v kind    >/dev/null || (echo "ERROR: kind not found.    Install: https://kind.sigs.k8s.io"; exit 1)
@@ -52,3 +54,48 @@ e2e: deploy
 	TEST_EXIT=$$?; \
 	kill $$PF_PID 2>/dev/null || true; \
 	exit $$TEST_EXIT
+
+# ---------------------------------------------------------------------------
+# Self-contained integration test harness (Phase 33)
+#
+# Spins up a dedicated kind cluster, builds and loads images, deploys epochd,
+# runs the e2e suite, and tears the cluster down — even on failure.
+#
+# Usage:
+#   make test-integration
+# ---------------------------------------------------------------------------
+
+# Create the integration-test cluster using the checked-in kind config.
+kind-up-test: check-deps
+	kind create cluster --name $(TEST_CLUSTER) --config deploy/kind-config.yaml
+
+# Tear down the integration-test cluster.
+kind-down-test:
+	kind delete cluster --name $(TEST_CLUSTER)
+
+# Build, load, deploy, and test inside the ephemeral cluster.
+# Separated so that test-integration can always run kind-down-test after it.
+_integration-inner: images
+	kind load docker-image $(AGENT_IMAGE)      --name $(TEST_CLUSTER)
+	kind load docker-image $(CONTROLLER_IMAGE) --name $(TEST_CLUSTER)
+	kubectl apply -f deploy/ --context kind-$(TEST_CLUSTER)
+	kubectl --context kind-$(TEST_CLUSTER) -n epochd rollout status \
+	    deployment/epochd-controller --timeout=60s
+	kubectl --context kind-$(TEST_CLUSTER) -n epochd rollout status \
+	    daemonset/epochd-agent       --timeout=60s
+	@echo "Starting port-forward to epochd-controller in kind-$(TEST_CLUSTER)..."
+	kubectl --context kind-$(TEST_CLUSTER) \
+	    port-forward svc/epochd-controller 18080:80 -n epochd & \
+	PF_PID=$$!; \
+	sleep 2; \
+	EPOCHD_URL=http://localhost:18080 go test ./e2e/... -v -tags=e2e -timeout=5m; \
+	TEST_EXIT=$$?; \
+	kill $$PF_PID 2>/dev/null || true; \
+	exit $$TEST_EXIT
+
+# Fully self-contained: create cluster, run tests, delete cluster.
+# The cluster is deleted even when tests fail.
+test-integration: check-deps
+	$(MAKE) kind-up-test
+	$(MAKE) _integration-inner || ($(MAKE) kind-down-test; exit 1)
+	$(MAKE) kind-down-test
