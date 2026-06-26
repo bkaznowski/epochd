@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"epochd/pkg/procmem"
-	"epochd/pkg/trampoline"
-	"epochd/pkg/vdso"
+	"github.com/bkaznowski/epochd/pkg/procmem"
+	"github.com/bkaznowski/epochd/pkg/trampoline"
+	"github.com/bkaznowski/epochd/pkg/vdso"
 )
 
 // TestInjectRoundTrip is the phase-6 integration test for the complete

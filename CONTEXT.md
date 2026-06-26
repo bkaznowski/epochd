@@ -9,7 +9,7 @@ are complete; see `FUTURE.md` for longer-horizon improvements.
 
 ## Module and build facts
 
-- **Module**: `epochd`
+- **Module**: `github.com/bkaznowski/epochd`
 - **Go version**: `go 1.26.4` (in go.mod)
 - **Direct dependencies**:
   - `golang.org/x/sys v0.46.0` — ptrace, `process_vm_readv/writev`, `MAP_FIXED_NOREPLACE`
@@ -299,8 +299,8 @@ injection target with `faketimectl`. The inject tests use an in-binary helper in
 
 ### `pkg/faketime`
 
-**Module**: `github.com/bkaznowski/faketime` (standalone `go.mod` at `pkg/faketime/go.mod`; `replace epochd => ../..` for local development)
-**Import**: `import "github.com/bkaznowski/faketime"` — `go get github.com/bkaznowski/faketime` for external consumers
+**Module**: `github.com/bkaznowski/epochd/pkg/faketime` (standalone `go.mod` at `pkg/faketime/go.mod`; `replace github.com/bkaznowski/epochd => ../..` for local development)
+**Import**: `import "github.com/bkaznowski/epochd/pkg/faketime"` — `go get github.com/bkaznowski/epochd/pkg/faketime` for external consumers
 **File**: `pkg/faketime/faketime.go` — `//go:build linux`
 
 Wraps `pkg/inject` for use in Go tests and CLI tooling without a Kubernetes cluster or
@@ -744,9 +744,9 @@ epochd/
 │   │   ├── inject.go                          # ✅ InjectAtTime, InjectFrozen, InjectAtTimeFollowChild, InjectFrozenFollowChild, SetTime, Freeze
 │   │   ├── inject_test.go                     # ✅ TestRemoteMmap, TestInjectMechanics (uses writeState + MaskEnabled), TestInjectObserved*
 │   │   └── roundtrip_test.go                  # ✅ TestInjectRoundTrip* (inject+verify+reset+verify; uses MaskEnabled)
-│   ├── faketime/                              # standalone module: github.com/bkaznowski/faketime
+│   ├── faketime/                              # standalone module: github.com/bkaznowski/epochd/pkg/faketime
 │   │   ├── faketime.go                       # ✅ Start, StartFrozen, Attach, AttachFrozen, Handle (Advance/Freeze/SetTime/Reset), Session
-│   │   └── go.mod                            # module github.com/bkaznowski/faketime; replace epochd => ../..
+│   │   └── go.mod                            # module github.com/bkaznowski/epochd/pkg/faketime; replace github.com/bkaznowski/epochd => ../..
 │   ├── agentpb/                               # ✅ generated from proto/agent/v1/agent.proto (freeze=field 3)
 │   │   └── agent_grpc.pb.go, agent.pb.go
 │   ├── agentclient/

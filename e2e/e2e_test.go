@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"epochd/pkg/sdk"
+	"github.com/bkaznowski/epochd/pkg/sdk"
 )
 
 // clockprinterImage returns the container image used for e2e test pods.

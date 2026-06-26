@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"epochd/pkg/inject"
+	"github.com/bkaznowski/epochd/pkg/inject"
 )
 
 // Handle holds an active time injection for a single process.

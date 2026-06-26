@@ -1,4 +1,4 @@
-module epochd
+module github.com/bkaznowski/epochd
 
 go 1.26.4
 

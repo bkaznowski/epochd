@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"epochd/pkg/inject"
+	"github.com/bkaznowski/epochd/pkg/inject"
 )
 
 func cmdInject(args []string) error {

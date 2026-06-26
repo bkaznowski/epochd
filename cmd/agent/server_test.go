@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"epochd/pkg/agentpb"
-	applog "epochd/pkg/log"
+	"github.com/bkaznowski/epochd/pkg/agentpb"
+	applog "github.com/bkaznowski/epochd/pkg/log"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

@@ -22,7 +22,7 @@ import (
 	"net/url"
 	"time"
 
-	"epochd/pkg/api"
+	"github.com/bkaznowski/epochd/pkg/api"
 )
 
 // Client talks to the epochd controller over HTTP+JSON.

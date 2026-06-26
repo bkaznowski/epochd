@@ -9,8 +9,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"epochd/pkg/api"
-	"epochd/pkg/sdk"
+	"github.com/bkaznowski/epochd/pkg/api"
+	"github.com/bkaznowski/epochd/pkg/sdk"
 )
 
 // ---------------------------------------------------------------------------

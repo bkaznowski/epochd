@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"epochd/pkg/agentpb"
-	"epochd/pkg/api"
+	"github.com/bkaznowski/epochd/pkg/agentpb"
+	"github.com/bkaznowski/epochd/pkg/api"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

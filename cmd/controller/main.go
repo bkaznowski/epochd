@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"epochd/pkg/agentclient"
-	applog "epochd/pkg/log"
+	"github.com/bkaznowski/epochd/pkg/agentclient"
+	applog "github.com/bkaznowski/epochd/pkg/log"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"

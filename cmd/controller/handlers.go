@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"epochd/pkg/api"
+	"github.com/bkaznowski/epochd/pkg/api"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

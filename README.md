@@ -123,7 +123,7 @@ epochd/
 │   ├── procmem/          # ptrace wrapper + process_vm_readv/writev
 │   ├── trampoline/       # Assembled payload bytes + state struct helpers
 │   ├── inject/           # Injection orchestration; public API
-│   ├── faketime/         # Non-Kubernetes injection (standalone module: github.com/bkaznowski/faketime)
+│   ├── faketime/         # Non-Kubernetes injection (standalone module: github.com/bkaznowski/epochd/pkg/faketime)
 │   ├── agentpb/          # Generated gRPC types (agent.proto)
 │   ├── agentclient/      # gRPC connection pool (controller → agents)
 │   ├── k8sresolve/       # Container ID → PID resolution via /proc

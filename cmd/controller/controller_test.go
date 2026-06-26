@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"epochd/pkg/api"
-	applog "epochd/pkg/log"
+	"github.com/bkaznowski/epochd/pkg/api"
+	applog "github.com/bkaznowski/epochd/pkg/log"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

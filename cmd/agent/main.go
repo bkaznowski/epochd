@@ -29,10 +29,10 @@ import (
 	"syscall"
 	"time"
 
-	"epochd/pkg/agentpb"
-	"epochd/pkg/inject"
-	"epochd/pkg/k8sresolve"
-	applog "epochd/pkg/log"
+	"github.com/bkaznowski/epochd/pkg/agentpb"
+	"github.com/bkaznowski/epochd/pkg/inject"
+	"github.com/bkaznowski/epochd/pkg/k8sresolve"
+	applog "github.com/bkaznowski/epochd/pkg/log"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

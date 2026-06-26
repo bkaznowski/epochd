@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"epochd/pkg/api"
+	"github.com/bkaznowski/epochd/pkg/api"
 )
 
 // ---------------------------------------------------------------------------
