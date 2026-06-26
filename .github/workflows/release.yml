@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. v0.1.0)"
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Validate version
+        run: |
+          if ! echo "${{ inputs.version }}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Version must be vX.Y.Z"; exit 1
+          fi
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Tag root module
+        run: |
+          git tag "${{ inputs.version }}"
+          git push origin "${{ inputs.version }}"
+
+      - name: Pin faketime → epochd version and tidy
+        run: |
+          sed -i "s|require github.com/bkaznowski/epochd .*|require github.com/bkaznowski/epochd ${{ inputs.version }}|" pkg/faketime/go.mod
+          GOWORK=off go mod tidy -C pkg/faketime
+
+      - name: Commit go.mod update
+        run: |
+          git add pkg/faketime/go.mod pkg/faketime/go.sum
+          git commit -m "chore: bump pkg/faketime dependency to ${{ inputs.version }}"
+          git push origin HEAD:main
+
+      - name: Tag faketime submodule
+        run: |
+          git tag "pkg/faketime/${{ inputs.version }}"
+          git push origin "pkg/faketime/${{ inputs.version }}"
+
+      - name: Create GitHub Release for epochd
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.version }}" \
+            --title "epochd ${{ inputs.version }}" \
+            --generate-notes
+
+      - name: Create GitHub Release for pkg/faketime
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "pkg/faketime/${{ inputs.version }}" \
+            --title "pkg/faketime ${{ inputs.version }}" \
+            --generate-notes
