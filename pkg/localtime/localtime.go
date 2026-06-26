@@ -28,7 +28,7 @@ type Handle struct {
 }
 
 func newAdvancingHandle(h *inject.Handle, target time.Time) *Handle {
-	return &Handle{h: h, offset: target.Sub(time.Now())}
+	return &Handle{h: h, offset: time.Until(target)}
 }
 
 func newFrozenHandle(h *inject.Handle, target time.Time) *Handle {
@@ -111,7 +111,7 @@ func (h *Handle) SetTime(target time.Time) error {
 		return err
 	}
 	h.mu.Lock()
-	h.offset = target.Sub(time.Now())
+	h.offset = time.Until(target)
 	h.frozenAt = time.Time{}
 	h.frozen = false
 	h.mu.Unlock()
@@ -171,7 +171,7 @@ type Session struct {
 
 // NewSession creates an empty session with the given initial target time.
 func NewSession(target time.Time) *Session {
-	return &Session{offset: target.Sub(time.Now())}
+	return &Session{offset: time.Until(target)}
 }
 
 // effectiveTarget returns the current effective fake time for new injections.
@@ -234,7 +234,7 @@ func (s *Session) Attach(pid int) error {
 // successful handles at the new target.
 func (s *Session) SetTime(target time.Time) error {
 	return s.applyAll(func(h *Handle) error { return h.SetTime(target) }, func() {
-		s.offset = target.Sub(time.Now())
+		s.offset = time.Until(target)
 		s.frozenAt = time.Time{}
 		s.frozen = false
 	})
