@@ -1,4 +1,4 @@
-//go:build linux
+﻿//go:build linux
 
 // Package inject ties vDSO discovery, ptrace, and the trampoline payload into
 // the public injection API.
@@ -21,32 +21,30 @@ import (
 )
 
 // Handle represents an active time-offset injection in a target process.
-// Obtain one via InjectAtTime; update the fake time with SetTime.
+// Obtain one via InjectAtTime or InjectFrozen; update with SetTime or Freeze.
 type Handle struct {
 	PID       int
 	StateAddr uintptr // address of the trampoline's mutable state struct in the target
 	origBytes [5]byte // original vDSO clock_gettime bytes before our JMP patch
-	gen       uint32  // monotonically incremented on every SetOffset/SetTime call
+	gen       uint32  // monotonically incremented on every SetOffset/SetTime/Freeze call
 }
 
 // InjectAtTime injects the trampoline into pid and sets its clock to target,
 // after which time flows forward at the real rate. This is the primary entry
-// point for external callers; it converts the absolute timestamp to an internal
-// offset as close to the actual write as possible.
+// point for advancing-mode injection; it converts the absolute timestamp to an
+// internal offset as close to the actual write as possible.
 func InjectAtTime(pid int, target time.Time) (*Handle, error) {
 	sec, nsec := diffSecNsec(target, time.Now())
-	return inject(pid, sec, nsec)
+	return injectCore(pid, sec, nsec, trampoline.MaskEnabled)
 }
 
-// Generation returns the current write-generation counter. It is incremented
-// on each SetTime call and can be used by callers to confirm a write landed.
-func (h *Handle) Generation() uint32 { return h.gen }
-
-// SetTime updates the fake time to target without stopping the process.
-// The offset conversion happens immediately before the write to minimise drift.
-func (h *Handle) SetTime(target time.Time) error {
-	sec, nsec := diffSecNsec(target, time.Now())
-	return h.setOffset(sec, nsec)
+// InjectFrozen injects the trampoline into pid with the clock frozen at target.
+// Unlike InjectAtTime, the returned time never advances — every call to
+// clock_gettime returns exactly target until SetTime or Freeze changes it.
+func InjectFrozen(pid int, target time.Time) (*Handle, error) {
+	sec := target.Unix()
+	nsec := int64(target.Nanosecond())
+	return injectCore(pid, sec, nsec, trampoline.MaskFrozen)
 }
 
 // InjectAtTimeFollowChild injects the trampoline into a child process that was
@@ -54,6 +52,41 @@ func (h *Handle) SetTime(target time.Time) error {
 // before exec and is stopped on its initial SIGTRAP; this function collects
 // that stop without issuing PTRACE_ATTACH. No elevated permissions required.
 func InjectAtTimeFollowChild(pid int, target time.Time) (*Handle, error) {
+	sec, nsec := diffSecNsec(target, time.Now())
+	return injectFollowChild(pid, sec, nsec, trampoline.MaskEnabled)
+}
+
+// InjectFrozenFollowChild is like InjectAtTimeFollowChild but starts the clock
+// in freeze mode so time never advances.
+func InjectFrozenFollowChild(pid int, target time.Time) (*Handle, error) {
+	sec := target.Unix()
+	nsec := int64(target.Nanosecond())
+	return injectFollowChild(pid, sec, nsec, trampoline.MaskFrozen)
+}
+
+// Generation returns the current write-generation counter. It is incremented
+// on each SetTime or Freeze call and can be used by callers to confirm a write landed.
+func (h *Handle) Generation() uint32 { return h.gen }
+
+// SetTime updates the fake time to target in advancing mode. After this call
+// time.Now() in the target process returns target + elapsed_real_time.
+// The offset conversion happens immediately before the write to minimise drift.
+func (h *Handle) SetTime(target time.Time) error {
+	sec, nsec := diffSecNsec(target, time.Now())
+	return h.writeState(sec, nsec, trampoline.MaskEnabled)
+}
+
+// Freeze sets the target process's clock to target and stops it advancing.
+// After this call every invocation of clock_gettime returns exactly target
+// until SetTime or Freeze is called again.
+func (h *Handle) Freeze(target time.Time) error {
+	sec := target.Unix()
+	nsec := int64(target.Nanosecond())
+	return h.writeState(sec, nsec, trampoline.MaskFrozen)
+}
+
+// injectFollowChild is the FollowChild variant of the core inject path.
+func injectFollowChild(pid int, sec, nsec int64, mask uint64) (*Handle, error) {
 	tr := procmem.NewTracer()
 	// Wait for the child's exec-entry SIGTRAP before reading maps. There is a
 	// race between cmd.Start() returning and the child completing execve; reading
@@ -68,13 +101,12 @@ func InjectAtTimeFollowChild(pid int, target time.Time) (*Handle, error) {
 		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
 	}
 	defer tr.Detach() //nolint:errcheck
-	sec, nsec := diffSecNsec(target, time.Now())
-	return injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec)
+	return injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
 }
 
-// inject attaches to pid, writes the trampoline with the given initial offset,
-// patches the vDSO, and detaches. InjectAtTime is the preferred caller.
-func inject(pid int, initialOffsetSec, initialOffsetNsec int64) (*Handle, error) {
+// injectCore attaches to pid, writes the trampoline with the given state values,
+// patches the vDSO, and detaches. InjectAtTime and InjectFrozen are the preferred callers.
+func injectCore(pid int, sec, nsec int64, mask uint64) (*Handle, error) {
 	info, err := vdso.Locate(pid)
 	if err != nil {
 		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
@@ -84,13 +116,14 @@ func inject(pid int, initialOffsetSec, initialOffsetNsec int64) (*Handle, error)
 		return nil, fmt.Errorf("inject: Attach pid %d: %w", pid, err)
 	}
 	defer tr.Detach() //nolint:errcheck
-	return injectWithTracer(tr, pid, info.ClockGettimeAddr, initialOffsetSec, initialOffsetNsec)
+	return injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
 }
 
 // injectWithTracer is the core injection sequence. tr must already be attached to pid.
-// Separated from inject so tests can supply a FollowChild-based tracer instead of
+// mask selects advancing (MaskEnabled) or freeze (MaskFrozen) mode.
+// Separated from injectCore so tests can supply a FollowChild-based tracer instead of
 // one that required PTRACE_ATTACH.
-func injectWithTracer(tr *procmem.Tracer, pid int, cgtAddr uintptr, initialOffsetSec, initialOffsetNsec int64) (*Handle, error) {
+func injectWithTracer(tr *procmem.Tracer, pid int, cgtAddr uintptr, sec, nsec int64, mask uint64) (*Handle, error) {
 	// Find a free page in the target's address space within ±2 GB of the vDSO
 	// entry point.  The process is ptrace-stopped so /proc/<pid>/maps is stable.
 	// We then use MAP_FIXED_NOREPLACE to guarantee the allocation lands there.
@@ -107,7 +140,7 @@ func injectWithTracer(tr *procmem.Tracer, pid int, cgtAddr uintptr, initialOffse
 	// Build the payload with the initial state values pre-written.
 	payload := make([]byte, len(trampoline.Payload))
 	copy(payload, trampoline.Payload)
-	copy(payload[trampoline.StateOffset:], trampoline.EncodeState(initialOffsetSec, initialOffsetNsec, 1, 0))
+	copy(payload[trampoline.StateOffset:], trampoline.EncodeState(sec, nsec, mask, 0))
 
 	// Write the trampoline into the new rwx page.
 	if _, err := procmem.WriteMem(pid, newPage, payload); err != nil {
@@ -143,15 +176,14 @@ func injectWithTracer(tr *procmem.Tracer, pid int, cgtAddr uintptr, initialOffse
 	}, nil
 }
 
-// setOffset writes a new (offsetSec, offsetNsec) into the trampoline's state
-// struct using process_vm_writev — no ptrace stop required. SetTime is the
-// preferred caller.
-func (h *Handle) setOffset(offsetSec, offsetNsec int64) error {
+// writeState writes new trampoline state via process_vm_writev without stopping
+// the target process. mask controls advancing vs freeze mode.
+func (h *Handle) writeState(sec, nsec int64, mask uint64) error {
 	h.gen++
-	encoded := trampoline.EncodeState(offsetSec, offsetNsec, 1, h.gen)
+	encoded := trampoline.EncodeState(sec, nsec, mask, h.gen)
 	if _, err := procmem.WriteMem(h.PID, h.StateAddr, encoded); err != nil {
 		h.gen-- // revert so the next call retries with the same generation
-		return fmt.Errorf("inject: setOffset: %w", err)
+		return fmt.Errorf("inject: writeState: %w", err)
 	}
 	return nil
 }

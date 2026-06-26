@@ -34,6 +34,10 @@ message InjectRequest {
   // converts this to an offset from time.Now() right before writing it into
   // the trampoline's state struct.
   google.protobuf.Timestamp target_time = 2;
+
+  // freeze, if true, instructs the agent to start the clock in freeze mode:
+  // clock_gettime always returns exactly target_time rather than advancing.
+  bool freeze = 3;
 }
 
 message InjectResponse {
@@ -43,6 +47,10 @@ message InjectResponse {
 message SetTimeRequest {
   string handle_id = 1;
   google.protobuf.Timestamp target_time = 2;
+
+  // freeze, if true, switches the clock to freeze mode at target_time.
+  // If false (default), the clock advances from target_time at the real rate.
+  bool freeze = 3;
 }
 
 message SetTimeResponse {}

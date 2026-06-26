@@ -1,4 +1,4 @@
-// Package main implements the epochd controller: an HTTP+JSON service that
+﻿// Package main implements the epochd controller: an HTTP+JSON service that
 // resolves pods via the Kubernetes API and orchestrates clock injection via
 // per-node gRPC agents.
 package main
@@ -28,8 +28,8 @@ import (
 // AgentPool abstracts per-node gRPC connections to the epochd agent.
 // agentclient.Pool satisfies this interface; tests use a mock.
 type AgentPool interface {
-	Inject(ctx context.Context, nodeIP, containerID string, target time.Time) (string, error)
-	SetTime(ctx context.Context, nodeIP, handleID string, target time.Time) error
+	Inject(ctx context.Context, nodeIP, containerID string, target time.Time, freeze bool) (string, error)
+	SetTime(ctx context.Context, nodeIP, handleID string, target time.Time, freeze bool) error
 	Reset(ctx context.Context, nodeIP, handleID string) error
 	GetStatus(ctx context.Context, nodeIP, handleID string) (*api.HandleStatus, error)
 }
@@ -49,6 +49,7 @@ type timeshift struct {
 	namespace     string
 	labelSelector string
 	targetTime    time.Time
+	frozen        bool
 	ttl           time.Duration
 	expiresAt     time.Time
 	createdAt     time.Time
@@ -69,6 +70,7 @@ func (s *timeshift) toResponse() api.TimeshiftResponse {
 		ID:        s.id,
 		Namespace: s.namespace,
 		Time:      s.targetTime.UTC().Format(time.RFC3339),
+		Frozen:    s.frozen,
 		AppliedTo: s.appliedTo(),
 	}
 	if !s.expiresAt.IsZero() {
@@ -147,7 +149,7 @@ func (c *controller) restore(ctx context.Context) {
 
 // createTimeshift lists pods matching ns+labelSel, injects target into each running
 // container via the per-node agent, and registers the timeshift.
-func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, target time.Time, ttl time.Duration) (*timeshift, error) {
+func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, target time.Time, ttl time.Duration, freeze bool) (*timeshift, error) {
 	pods, err := c.k8s.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
 		LabelSelector: labelSel,
 	})
@@ -164,7 +166,7 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 
 	var handles []containerHandle
 	for i := range pods.Items {
-		handles = append(handles, c.injectPod(ctx, &pods.Items[i], target)...)
+		handles = append(handles, c.injectPod(ctx, &pods.Items[i], target, freeze)...)
 	}
 	if len(handles) == 0 {
 		return nil, fmt.Errorf("no running containers found in matched pods")
@@ -176,6 +178,7 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 		namespace:     ns,
 		labelSelector: labelSel,
 		targetTime:    target,
+		frozen:        freeze,
 		ttl:           ttl,
 		createdAt:     now,
 		handles:       handles,
@@ -195,11 +198,16 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 	if ttl > 0 {
 		ttlStr = ttl.String()
 	}
+	mode := "advancing"
+	if freeze {
+		mode = "frozen"
+	}
 	c.log.Info("created timeshift",
 		"timeshift_id", s.id[:8],
 		"namespace", ns,
 		"selector", labelSel,
 		"target", target.UTC().Format(time.RFC3339),
+		"mode", mode,
 		"ttl", ttlStr,
 		"containers", len(handles))
 	return s, nil
@@ -208,14 +216,14 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 // injectPod injects target into every running container of pod and returns the
 // resulting handles. Per-container errors are logged but not fatal so that one
 // bad container does not abort the rest.
-func (c *controller) injectPod(ctx context.Context, pod *corev1.Pod, target time.Time) []containerHandle {
+func (c *controller) injectPod(ctx context.Context, pod *corev1.Pod, target time.Time, freeze bool) []containerHandle {
 	nodeIP := pod.Status.HostIP
 	var out []containerHandle
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.State.Running == nil || cs.ContainerID == "" {
 			continue
 		}
-		hid, err := c.agents.Inject(ctx, nodeIP, cs.ContainerID, target)
+		hid, err := c.agents.Inject(ctx, nodeIP, cs.ContainerID, target, freeze)
 		if err != nil {
 			c.log.Warn("inject failed",
 				"pod", pod.Namespace+"/"+pod.Name,
@@ -269,7 +277,7 @@ func (c *controller) getTimeshift(id string) (*timeshift, error) {
 // updateTimeshift calls SetTime on every agent handle for the timeshift and updates the
 // registered target time. If an agent handle is gone (agent restarted), it re-injects
 // the container and updates the stored handle before retrying.
-func (c *controller) updateTimeshift(ctx context.Context, id string, target time.Time) (*timeshift, error) {
+func (c *controller) updateTimeshift(ctx context.Context, id string, target time.Time, freeze bool) (*timeshift, error) {
 	s, err := c.getTimeshift(id)
 	if err != nil {
 		return nil, err
@@ -288,7 +296,7 @@ func (c *controller) updateTimeshift(ctx context.Context, id string, target time
 	var updates []update
 
 	for i, h := range handles {
-		if err := c.agents.SetTime(ctx, h.nodeIP, h.agentHandle, target); err == nil {
+		if err := c.agents.SetTime(ctx, h.nodeIP, h.agentHandle, target, freeze); err == nil {
 			c.met.setTimeTotal.WithLabelValues("success").Inc()
 			continue
 		} else if !isAgentNotFound(err) {
@@ -302,7 +310,7 @@ func (c *controller) updateTimeshift(ctx context.Context, id string, target time
 			"timeshift_id", id[:8],
 			"handle", h.agentHandle,
 			"container_id", h.containerID)
-		newHandle, injErr := c.agents.Inject(ctx, h.nodeIP, h.containerID, target)
+		newHandle, injErr := c.agents.Inject(ctx, h.nodeIP, h.containerID, target, freeze)
 		if injErr != nil {
 			c.log.Warn("re-inject failed", "container_id", h.containerID, "err", injErr)
 			c.met.injectTotal.WithLabelValues("error").Inc()
@@ -320,6 +328,7 @@ func (c *controller) updateTimeshift(ctx context.Context, id string, target time
 		}
 	}
 	s.targetTime = target
+	s.frozen = freeze
 	c.mu.Unlock()
 	c.persist(ctx)
 	return s, nil

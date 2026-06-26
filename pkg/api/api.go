@@ -1,4 +1,4 @@
-// Package api holds the HTTP+JSON request and response types for the epochd
+﻿// Package api holds the HTTP+JSON request and response types for the epochd
 // controller's REST API. These types are shared between the controller
 // implementation and any Go client (e.g. the e2e test SDK in phase 10).
 // No build tag — the types are pure structs with no OS-specific dependencies.
@@ -8,13 +8,15 @@ package api
 type CreateTimeshiftRequest struct {
 	Namespace     string `json:"namespace"`
 	LabelSelector string `json:"labelSelector"`
-	Time          string `json:"time"`           // RFC3339 absolute timestamp
-	TTL           string `json:"ttl,omitempty"` // Go duration string, e.g. "1h30m"; omit for no expiry
+	Time          string `json:"time"`            // RFC3339 absolute timestamp
+	TTL           string `json:"ttl,omitempty"`  // Go duration string, e.g. "1h30m"; omit for no expiry
+	Freeze        bool   `json:"freeze,omitempty"` // if true, clock does not advance past target
 }
 
 // UpdateTimeshiftRequest is the body of PATCH /timeshifts/{id}.
 type UpdateTimeshiftRequest struct {
-	Time string `json:"time"` // RFC3339 absolute timestamp
+	Time   string `json:"time"`             // RFC3339 absolute timestamp
+	Freeze bool   `json:"freeze,omitempty"` // if true, switch to freeze mode at the new time
 }
 
 // TimeshiftResponse is returned by POST /timeshifts, GET /timeshifts/{id}, and PATCH /timeshifts/{id}.
@@ -22,6 +24,7 @@ type TimeshiftResponse struct {
 	ID        string   `json:"id"`
 	Namespace string   `json:"namespace"`
 	Time      string   `json:"time"`                // RFC3339
+	Frozen    bool     `json:"frozen,omitempty"`    // true when clock is frozen at Time
 	ExpiresAt string   `json:"expiresAt,omitempty"` // RFC3339; absent when no TTL was set
 	AppliedTo []string `json:"appliedTo"`           // "pod-name/container-name", sorted
 }
@@ -48,7 +51,7 @@ type ResolvedPod struct {
 // HandleStatus is the live injection state for one container, as read directly
 // from the trampoline's state struct by the agent.
 type HandleStatus struct {
-	Generation uint32 `json:"generation"` // bumped on each SetTime; 0 after initial Inject
+	Generation uint32 `json:"generation"` // bumped on each SetTime/Freeze; 0 after initial Inject
 	LastTarget string `json:"lastTarget"` // RFC3339, last time written by Inject or SetTime
 	StateAddr  string `json:"stateAddr"`  // hex address of the state struct, for debugging
 	PID        int32  `json:"pid"`        // host PID of the injected process

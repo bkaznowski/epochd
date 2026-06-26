@@ -1,11 +1,11 @@
-// Package sdk is the Go client library for the epochd controller API.
+﻿// Package sdk is the Go client library for the epochd controller API.
 // It is safe to use from any OS and has no Linux-specific dependencies.
 //
 // Typical e2e test usage:
 //
 //	client := sdk.NewClient("http://epochd-controller.epochd.svc")
 //	err := sdk.WithTime(ctx, client, "default", "app=my-svc", target, time.Hour,
-//	    func(ctx context.Context) error {
+//	    func(ctx context.Context, ts *sdk.Timeshift) error {
 //	        // assertions here — containers see target as the current time
 //	        return nil
 //	    },
@@ -58,8 +58,9 @@ type Timeshift struct {
 	ID        string
 	Namespace string
 	Time      time.Time
-	ExpiresAt time.Time
-	AppliedTo []string // "pod/container", sorted
+	Frozen    bool      // true when the clock does not advance past Time
+	ExpiresAt time.Time // zero value when no TTL was set
+	AppliedTo []string  // "pod/container", sorted
 }
 
 func timeshiftFromResponse(r api.TimeshiftResponse) (*Timeshift, error) {
@@ -78,7 +79,8 @@ func timeshiftFromResponse(r api.TimeshiftResponse) (*Timeshift, error) {
 		ID:        r.ID,
 		Namespace: r.Namespace,
 		Time:      t,
-		ExpiresAt: exp, // zero value when no TTL was set
+		Frozen:    r.Frozen,
+		ExpiresAt: exp,
 		AppliedTo: r.AppliedTo,
 	}, nil
 }
@@ -133,14 +135,25 @@ func isAPIError(err error, out **APIError) bool {
 // ---------------------------------------------------------------------------
 
 // CreateTimeshift creates a new timeshift for all running containers in ns
-// that match labelSelector, setting their clock to target. Pass a positive ttl
-// for automatic expiry; pass 0 for no expiry (the timeshift persists until
-// explicitly deleted).
+// that match labelSelector, setting their clock to target with time advancing
+// at the real rate. Pass a positive ttl for automatic expiry; pass 0 for no expiry.
 func (c *Client) CreateTimeshift(ctx context.Context, ns, labelSelector string, target time.Time, ttl time.Duration) (*Timeshift, error) {
+	return c.createTimeshift(ctx, ns, labelSelector, target, ttl, false)
+}
+
+// CreateFrozenTimeshift creates a new timeshift with the clock frozen at target.
+// Unlike CreateTimeshift, the containers see exactly target on every call to
+// clock_gettime -- time never advances.
+func (c *Client) CreateFrozenTimeshift(ctx context.Context, ns, labelSelector string, target time.Time, ttl time.Duration) (*Timeshift, error) {
+	return c.createTimeshift(ctx, ns, labelSelector, target, ttl, true)
+}
+
+func (c *Client) createTimeshift(ctx context.Context, ns, labelSelector string, target time.Time, ttl time.Duration, freeze bool) (*Timeshift, error) {
 	body := api.CreateTimeshiftRequest{
 		Namespace:     ns,
 		LabelSelector: labelSelector,
 		Time:          target.UTC().Format(time.RFC3339),
+		Freeze:        freeze,
 	}
 	if ttl > 0 {
 		body.TTL = ttl.String()
@@ -178,10 +191,23 @@ func (c *Client) GetTimeshift(ctx context.Context, id string) (*Timeshift, error
 	return timeshiftFromResponse(resp)
 }
 
-// UpdateTimeshift moves the target clock for an existing timeshift to target.
+// UpdateTimeshift moves the target clock for an existing timeshift to target
+// in advancing mode. If the timeshift was frozen, it becomes advancing.
 func (c *Client) UpdateTimeshift(ctx context.Context, id string, target time.Time) (*Timeshift, error) {
+	return c.updateTimeshift(ctx, id, target, false)
+}
+
+// FreezeTimeshift updates the target clock to target and switches the timeshift
+// to freeze mode. Every call to clock_gettime in the targeted containers returns
+// exactly target until the next UpdateTimeshift or FreezeTimeshift call.
+func (c *Client) FreezeTimeshift(ctx context.Context, id string, target time.Time) (*Timeshift, error) {
+	return c.updateTimeshift(ctx, id, target, true)
+}
+
+func (c *Client) updateTimeshift(ctx context.Context, id string, target time.Time, freeze bool) (*Timeshift, error) {
 	body := api.UpdateTimeshiftRequest{
-		Time: target.UTC().Format(time.RFC3339),
+		Time:   target.UTC().Format(time.RFC3339),
+		Freeze: freeze,
 	}
 	var resp api.TimeshiftResponse
 	if err := c.do(ctx, http.MethodPatch, "/timeshifts/"+id, body, &resp); err != nil {
@@ -231,9 +257,9 @@ func (c *Client) Resolve(ctx context.Context, ns, labelSelector string) ([]api.R
 // A per-container injection error is returned immediately rather than retried
 // — it indicates the agent rejected the injection and retrying is not useful.
 //
-// WaitForActive is called automatically by WithTime before the user callback
-// is invoked. Callers using CreateTimeshift directly can call this method to
-// confirm injection before making assertions.
+// WaitForActive is called automatically by WithTime and WithFrozenTime before
+// the user callback is invoked. Callers using CreateTimeshift or
+// CreateFrozenTimeshift directly can call this method to confirm injection.
 func (c *Client) WaitForActive(ctx context.Context, id string) error {
 	for {
 		st, err := c.TimeshiftStatus(ctx, id)
@@ -264,7 +290,7 @@ func (c *Client) WaitForActive(ctx context.Context, id string) error {
 }
 
 // ---------------------------------------------------------------------------
-// WithTime helper
+// WithTime / WithFrozenTime helpers
 // ---------------------------------------------------------------------------
 
 // WithTime creates a timeshift, waits for every targeted container to confirm
@@ -277,7 +303,7 @@ func (c *Client) WaitForActive(ctx context.Context, id string) error {
 // outlives a single function call.
 //
 // If both fn and the delete fail, both errors are combined into the returned
-// error.
+// error. See WithFrozenTime for freeze mode.
 func WithTime(
 	ctx context.Context,
 	c *Client,
@@ -286,10 +312,37 @@ func WithTime(
 	ttl time.Duration,
 	fn func(ctx context.Context, ts *Timeshift) error,
 ) error {
+	return withTimeMode(ctx, c, ns, labelSelector, target, ttl, false, fn)
+}
+
+// WithFrozenTime creates a timeshift with the clock frozen at target, waits
+// for injection, calls fn, then deletes the timeshift.
+// Every call to clock_gettime in the targeted containers returns exactly target
+// for the duration of the callback.
+func WithFrozenTime(
+	ctx context.Context,
+	c *Client,
+	ns, labelSelector string,
+	target time.Time,
+	ttl time.Duration,
+	fn func(ctx context.Context, ts *Timeshift) error,
+) error {
+	return withTimeMode(ctx, c, ns, labelSelector, target, ttl, true, fn)
+}
+
+func withTimeMode(
+	ctx context.Context,
+	c *Client,
+	ns, labelSelector string,
+	target time.Time,
+	ttl time.Duration,
+	freeze bool,
+	fn func(ctx context.Context, ts *Timeshift) error,
+) error {
 	if ttl <= 0 {
-		return fmt.Errorf("sdk: WithTime requires a positive ttl; use CreateTimeshift for no-expiry timeshifts")
+		return fmt.Errorf("sdk: WithTime/WithFrozenTime requires a positive ttl; use CreateTimeshift for no-expiry timeshifts")
 	}
-	ts, err := c.CreateTimeshift(ctx, ns, labelSelector, target, ttl)
+	ts, err := c.createTimeshift(ctx, ns, labelSelector, target, ttl, freeze)
 	if err != nil {
 		return fmt.Errorf("sdk: WithTime create: %w", err)
 	}

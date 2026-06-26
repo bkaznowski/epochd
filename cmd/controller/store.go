@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -43,6 +43,7 @@ type storedTimeshift struct {
 	Namespace     string         `json:"namespace"`
 	LabelSelector string         `json:"labelSelector"`
 	TargetTime    time.Time      `json:"targetTime"`
+	Frozen        bool           `json:"frozen,omitempty"`
 	TTL           time.Duration  `json:"ttl"`
 	ExpiresAt     time.Time      `json:"expiresAt"`
 	CreatedAt     time.Time      `json:"createdAt"`
@@ -69,6 +70,7 @@ func (s *store) encode(timeshifts map[string]*timeshift) ([]byte, error) {
 			Namespace:     ts.namespace,
 			LabelSelector: ts.labelSelector,
 			TargetTime:    ts.targetTime,
+			Frozen:        ts.frozen,
 			TTL:           ts.ttl,
 			ExpiresAt:     ts.expiresAt,
 			CreatedAt:     ts.createdAt,
@@ -149,6 +151,7 @@ func (s *store) load(ctx context.Context) (map[string]*timeshift, error) {
 			namespace:     st.Namespace,
 			labelSelector: st.LabelSelector,
 			targetTime:    st.TargetTime,
+			frozen:        st.Frozen,
 			ttl:           st.TTL,
 			expiresAt:     st.ExpiresAt,
 			createdAt:     st.CreatedAt,

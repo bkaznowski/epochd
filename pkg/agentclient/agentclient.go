@@ -1,4 +1,4 @@
-// Package agentclient provides a connection pool for the epochd node agent's
+﻿// Package agentclient provides a connection pool for the epochd node agent's
 // gRPC API. One gRPC connection is maintained per node IP and reused across
 // calls. Connections are created lazily on first use and closed by Close.
 package agentclient
@@ -33,7 +33,8 @@ func NewPool(agentPort string) *Pool {
 }
 
 // Inject calls the agent's Inject RPC on the node at nodeIP.
-func (p *Pool) Inject(ctx context.Context, nodeIP, containerID string, target time.Time) (string, error) {
+// When freeze is true the agent starts the clock in freeze mode.
+func (p *Pool) Inject(ctx context.Context, nodeIP, containerID string, target time.Time, freeze bool) (string, error) {
 	c, err := p.clientFor(nodeIP)
 	if err != nil {
 		return "", err
@@ -41,6 +42,7 @@ func (p *Pool) Inject(ctx context.Context, nodeIP, containerID string, target ti
 	resp, err := c.Inject(ctx, &agentpb.InjectRequest{
 		ContainerId: containerID,
 		TargetTime:  timestamppb.New(target),
+		Freeze:      freeze,
 	})
 	if err != nil {
 		return "", fmt.Errorf("agentclient: Inject on %s: %w", nodeIP, err)
@@ -49,7 +51,8 @@ func (p *Pool) Inject(ctx context.Context, nodeIP, containerID string, target ti
 }
 
 // SetTime calls the agent's SetTime RPC on the node at nodeIP.
-func (p *Pool) SetTime(ctx context.Context, nodeIP, handleID string, target time.Time) error {
+// When freeze is true the agent switches the clock to freeze mode at target.
+func (p *Pool) SetTime(ctx context.Context, nodeIP, handleID string, target time.Time, freeze bool) error {
 	c, err := p.clientFor(nodeIP)
 	if err != nil {
 		return err
@@ -57,6 +60,7 @@ func (p *Pool) SetTime(ctx context.Context, nodeIP, handleID string, target time
 	_, err = c.SetTime(ctx, &agentpb.SetTimeRequest{
 		HandleId:   handleID,
 		TargetTime: timestamppb.New(target),
+		Freeze:     freeze,
 	})
 	if err != nil {
 		return fmt.Errorf("agentclient: SetTime on %s: %w", nodeIP, err)

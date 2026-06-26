@@ -1,4 +1,4 @@
-//go:build !linux
+﻿//go:build !linux
 
 // Package localtime injects fake time into local (non-Kubernetes) processes.
 // This stub is compiled on non-Linux platforms; all operations return errors.
@@ -19,15 +19,19 @@ type Handle struct{}
 // Session manages fake time for a group of processes. On non-Linux platforms all operations return errors.
 type Session struct{}
 
-func Start(_ *exec.Cmd, _ time.Time) (*Handle, error) { return nil, errNotSupported }
-func Attach(_ int, _ time.Time) (*Handle, error)       { return nil, errNotSupported }
-func (h *Handle) SetTime(_ time.Time) error            { return errNotSupported }
-func (h *Handle) Reset() error                         { return errNotSupported }
+func Start(_ *exec.Cmd, _ time.Time) (*Handle, error)       { return nil, errNotSupported }
+func StartFrozen(_ *exec.Cmd, _ time.Time) (*Handle, error) { return nil, errNotSupported }
+func Attach(_ int, _ time.Time) (*Handle, error)            { return nil, errNotSupported }
+func AttachFrozen(_ int, _ time.Time) (*Handle, error)      { return nil, errNotSupported }
+func (h *Handle) SetTime(_ time.Time) error                 { return errNotSupported }
+func (h *Handle) Freeze(_ time.Time) error                  { return errNotSupported }
+func (h *Handle) Reset() error                              { return errNotSupported }
 
 func NewSession(_ time.Time) *Session        { return &Session{} }
 func (s *Session) Start(_ *exec.Cmd) error   { return errNotSupported }
 func (s *Session) Attach(_ int) error        { return errNotSupported }
 func (s *Session) SetTime(_ time.Time) error { return errNotSupported }
+func (s *Session) Freeze(_ time.Time) error  { return errNotSupported }
 func (s *Session) Reset() error              { return errNotSupported }
 func (s *Session) Len() int                  { return 0 }
 

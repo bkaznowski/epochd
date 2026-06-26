@@ -28,22 +28,22 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockAgentPool struct {
-	injectFn    func(ctx context.Context, nodeIP, containerID string, target time.Time) (string, error)
-	setTimeFn   func(ctx context.Context, nodeIP, handleID string, target time.Time) error
+	injectFn    func(ctx context.Context, nodeIP, containerID string, target time.Time, freeze bool) (string, error)
+	setTimeFn   func(ctx context.Context, nodeIP, handleID string, target time.Time, freeze bool) error
 	resetFn     func(ctx context.Context, nodeIP, handleID string) error
 	getStatusFn func(ctx context.Context, nodeIP, handleID string) (*api.HandleStatus, error)
 }
 
-func (m *mockAgentPool) Inject(ctx context.Context, nodeIP, containerID string, target time.Time) (string, error) {
+func (m *mockAgentPool) Inject(ctx context.Context, nodeIP, containerID string, target time.Time, freeze bool) (string, error) {
 	if m.injectFn != nil {
-		return m.injectFn(ctx, nodeIP, containerID, target)
+		return m.injectFn(ctx, nodeIP, containerID, target, freeze)
 	}
 	return "handle-" + containerID[:8], nil
 }
 
-func (m *mockAgentPool) SetTime(ctx context.Context, nodeIP, handleID string, target time.Time) error {
+func (m *mockAgentPool) SetTime(ctx context.Context, nodeIP, handleID string, target time.Time, freeze bool) error {
 	if m.setTimeFn != nil {
-		return m.setTimeFn(ctx, nodeIP, handleID, target)
+		return m.setTimeFn(ctx, nodeIP, handleID, target, freeze)
 	}
 	return nil
 }
@@ -133,7 +133,7 @@ func TestCreateTimeshift(t *testing.T) {
 	ctrl, _ := newTestController(t, pod)
 
 	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestCreateTimeshift(t *testing.T) {
 
 func TestCreateTimeshiftNoMatchingPods(t *testing.T) {
 	ctrl, _ := newTestController(t)
-	_, err := ctrl.createTimeshift(context.Background(), "default", "app=ghost", time.Now().Add(time.Hour), time.Hour)
+	_, err := ctrl.createTimeshift(context.Background(), "default", "app=ghost", time.Now().Add(time.Hour), time.Hour, false)
 	if err == nil {
 		t.Fatal("expected error for no matching pods")
 	}
@@ -164,12 +164,12 @@ func TestCreateTimeshiftConflictSamePod(t *testing.T) {
 	ctrl, _ := newTestController(t, pod)
 
 	target := time.Now().Add(24 * time.Hour)
-	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, 0); err != nil {
+	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, 0, false); err != nil {
 		t.Fatalf("first createTimeshift: %v", err)
 	}
 
 	// Second timeshift targeting the same pod must be rejected.
-	_, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target.Add(time.Hour), 0)
+	_, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target.Add(time.Hour), 0, false)
 	if err == nil {
 		t.Fatal("expected conflict error, got nil")
 	}
@@ -193,12 +193,12 @@ func TestCreateTimeshiftConflictPartialOverlap(t *testing.T) {
 	target := time.Now().Add(24 * time.Hour)
 
 	// First timeshift covers web-a only.
-	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-a", target, 0); err != nil {
+	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-a", target, 0, false); err != nil {
 		t.Fatalf("first createTimeshift: %v", err)
 	}
 
 	// Second timeshift uses a broader selector that overlaps web-a â€” must conflict.
-	_, err := ctrl.createTimeshift(context.Background(), "default", "app in (web-a,web-b)", target, 0)
+	_, err := ctrl.createTimeshift(context.Background(), "default", "app in (web-a,web-b)", target, 0, false)
 	if err == nil {
 		t.Fatal("expected conflict error, got nil")
 	}
@@ -212,7 +212,7 @@ func TestCreateTimeshiftNoConflictAfterDelete(t *testing.T) {
 	ctrl, _ := newTestController(t, pod)
 
 	target := time.Now().Add(24 * time.Hour)
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, 0)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, 0, false)
 	if err != nil {
 		t.Fatalf("first createTimeshift: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestCreateTimeshiftNoConflictAfterDelete(t *testing.T) {
 	}
 
 	// After deletion, the same pod must be targetable again.
-	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, 0); err != nil {
+	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, 0, false); err != nil {
 		t.Fatalf("second createTimeshift after delete: %v", err)
 	}
 }
@@ -270,17 +270,17 @@ func TestUpdateTimeshift(t *testing.T) {
 	ctrl, pool := newTestController(t, pod)
 
 	called := 0
-	pool.setTimeFn = func(_ context.Context, _, _ string, _ time.Time) error {
+	pool.setTimeFn = func(_ context.Context, _, _ string, _ time.Time, _ bool) error {
 		called++
 		return nil
 	}
 
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
 	newTarget := time.Now().Add(48 * time.Hour)
-	s2, err := ctrl.updateTimeshift(context.Background(), s.id, newTarget)
+	s2, err := ctrl.updateTimeshift(context.Background(), s.id, newTarget, false)
 	if err != nil {
 		t.Fatalf("updateTimeshift: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestDeleteTimeshift(t *testing.T) {
 		return nil
 	}
 
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -336,7 +336,7 @@ func TestSweepExpired(t *testing.T) {
 		return nil
 	}
 
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Millisecond)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Millisecond, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestCreateTimeshiftNoTTL(t *testing.T) {
 	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
 	ctrl, _ := newTestController(t, pod)
 
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), 0)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), 0, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -511,7 +511,7 @@ func TestSweepDoesNotExpireNoTTL(t *testing.T) {
 		return nil
 	}
 
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), 0)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), 0, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -579,13 +579,13 @@ func TestListTimeshifts(t *testing.T) {
 	}
 
 	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
-	s1, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour)
+	s1, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift 1: %v", err)
 	}
 	// Ensure distinct createdAt values.
 	time.Sleep(time.Millisecond)
-	s2, err := ctrl.createTimeshift(context.Background(), "default", "app=web-2", target.Add(time.Hour), 0)
+	s2, err := ctrl.createTimeshift(context.Background(), "default", "app=web-2", target.Add(time.Hour), 0, false)
 	if err != nil {
 		t.Fatalf("createTimeshift 2: %v", err)
 	}
@@ -667,25 +667,25 @@ func TestUpdateTimeshiftReinjection(t *testing.T) {
 	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
 	ctrl, pool := newTestController(t, pod)
 
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
 	originalHandle := s.handles[0].agentHandle
 
 	// SetTime returns NOT_FOUND to simulate agent restart.
-	pool.setTimeFn = func(_ context.Context, _, _ string, _ time.Time) error {
+	pool.setTimeFn = func(_ context.Context, _, _ string, _ time.Time, _ bool) error {
 		return grpcstatus.Error(codes.NotFound, "handle not found")
 	}
 	newAgentHandle := "handle-reinjected"
 	injectCalled := 0
-	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time) (string, error) {
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time, _ bool) (string, error) {
 		injectCalled++
 		return newAgentHandle, nil
 	}
 
 	newTarget := time.Now().Add(48 * time.Hour)
-	s2, err := ctrl.updateTimeshift(context.Background(), s.id, newTarget)
+	s2, err := ctrl.updateTimeshift(context.Background(), s.id, newTarget, false)
 	if err != nil {
 		t.Fatalf("updateTimeshift: %v", err)
 	}
@@ -708,7 +708,7 @@ func TestPodWatcherReinjection(t *testing.T) {
 	pod.Status.Phase = corev1.PodRunning
 	ctrl, pool := newTestController(t, pod)
 
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -722,7 +722,7 @@ func TestPodWatcherReinjection(t *testing.T) {
 	restarted.Status.Phase = corev1.PodRunning
 
 	newAgentHandle := "handle-new"
-	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time) (string, error) {
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time, _ bool) (string, error) {
 		return newAgentHandle, nil
 	}
 
@@ -753,13 +753,13 @@ func TestPodWatcherSkipsAlreadyHandled(t *testing.T) {
 	pod.Status.Phase = corev1.PodRunning
 	ctrl, pool := newTestController(t, pod)
 
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
 
 	injectCalled := 0
-	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time) (string, error) {
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time, _ bool) (string, error) {
 		injectCalled++
 		return "handle-extra", nil
 	}
@@ -879,7 +879,7 @@ func TestSweepEmitsEvent(t *testing.T) {
 	ctrl.setRecorder(fake)
 
 	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -923,7 +923,7 @@ func TestSweepEmitsOneEventPerPod(t *testing.T) {
 	ctrl.setRecorder(fake)
 
 	target := time.Now().Add(time.Hour)
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", target, time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -1080,7 +1080,7 @@ func TestControllerRestore(t *testing.T) {
 	ctx := context.Background()
 
 	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
-	s, err := ctrl1.createTimeshift(ctx, "default", "app=web-1", target, time.Hour)
+	s, err := ctrl1.createTimeshift(ctx, "default", "app=web-1", target, time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -1114,7 +1114,7 @@ func TestControllerRestoreAfterDelete(t *testing.T) {
 	ctrl1, _, k8s := newTestControllerWithStore(t, pod)
 	ctx := context.Background()
 
-	s, err := ctrl1.createTimeshift(ctx, "default", "app=web-1", time.Now().Add(time.Hour), time.Hour)
+	s, err := ctrl1.createTimeshift(ctx, "default", "app=web-1", time.Now().Add(time.Hour), time.Hour, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -1144,7 +1144,7 @@ func TestControllerRestoreGauge(t *testing.T) {
 
 	// Create two timeshifts (one per pod) so the gauge must be 2 after restore.
 	for _, sel := range []string{"app=web-1", "app=web-2"} {
-		if _, err := ctrl1.createTimeshift(ctx, "default", sel, time.Now().Add(time.Hour), 0); err != nil {
+		if _, err := ctrl1.createTimeshift(ctx, "default", sel, time.Now().Add(time.Hour), 0, false); err != nil {
 			t.Fatalf("createTimeshift: %v", err)
 		}
 	}
@@ -1196,7 +1196,7 @@ func TestHTTPResolve(t *testing.T) {
 
 	pool := &mockAgentPool{}
 	injectCalled := 0
-	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time) (string, error) {
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time, _ bool) (string, error) {
 		injectCalled++
 		return "", nil
 	}
@@ -1415,4 +1415,6 @@ func TestNewIDUniqueness(t *testing.T) {
 		seen[id] = struct{}{}
 	}
 }
+
+
 

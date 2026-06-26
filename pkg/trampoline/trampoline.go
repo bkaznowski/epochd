@@ -1,4 +1,4 @@
-//go:build linux
+﻿//go:build linux
 
 // Package trampoline holds the hand-assembled vDSO hook payload and the helpers
 // needed to encode and decode the state struct that sits immediately after it.
@@ -15,18 +15,27 @@ var Payload []byte
 
 // StateOffset is the byte offset of the state struct within Payload.
 // It equals the size of the trampoline code and must match the position of the
-// `state:` label in trampoline.s.  The regression test below will catch any
+// `state:` label in trampoline.asm.  The regression test below will catch any
 // future edit to the assembly that shifts the struct without updating this
 // constant.
-const StateOffset = 86
+const StateOffset = 136
 
 // State field offsets within Payload (absolute, not relative to StateOffset).
 // Use these when computing the address to pass to procmem.WriteMem.
 const (
-	FieldOffsetSec  = StateOffset + 0  // int64
-	FieldOffsetNsec = StateOffset + 8  // int64
-	FieldEnabledMask = StateOffset + 16 // uint64, bit 0 = CLOCK_REALTIME
+	FieldOffsetSec   = StateOffset + 0  // int64
+	FieldOffsetNsec  = StateOffset + 8  // int64
+	FieldEnabledMask = StateOffset + 16 // uint64, bit 0 = CLOCK_REALTIME, bit 1 = freeze
 	FieldGeneration  = StateOffset + 24 // uint32
+)
+
+// Mask values for the enabledMask field.
+const (
+	// MaskEnabled activates CLOCK_REALTIME interception in advancing mode.
+	MaskEnabled = uint64(1)
+	// MaskFrozen activates both interception and freeze mode: time.Now() always
+	// returns the stored absolute timestamp regardless of real time passing.
+	MaskFrozen = uint64(3)
 )
 
 // StateSize is the byte length of the mutable state struct.

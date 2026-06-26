@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -49,6 +49,7 @@ func (c *controller) handlePodEvent(ctx context.Context, pod *corev1.Pod) {
 	type match struct {
 		id         string
 		targetTime time.Time
+		frozen     bool
 	}
 	c.mu.RLock()
 	var matched []match
@@ -68,7 +69,7 @@ func (c *controller) handlePodEvent(ctx context.Context, pod *corev1.Pod) {
 		if allContainersHandled(s.handles, pod) {
 			continue
 		}
-		matched = append(matched, match{id: id, targetTime: s.targetTime})
+		matched = append(matched, match{id: id, targetTime: s.targetTime, frozen: s.frozen})
 	}
 	c.mu.RUnlock()
 
@@ -77,14 +78,13 @@ func (c *controller) handlePodEvent(ctx context.Context, pod *corev1.Pod) {
 	}
 
 	for _, m := range matched {
-		newHandles := c.injectPod(ctx, pod, m.targetTime)
+		newHandles := c.injectPod(ctx, pod, m.targetTime, m.frozen)
 		if len(newHandles) == 0 {
 			continue
 		}
 
 		c.mu.Lock()
 		if s, ok := c.timeshifts[m.id]; ok {
-			// Remove stale handles for this pod (same pod name, old container IDs).
 			retained := s.handles[:0]
 			for _, h := range s.handles {
 				if h.pod != pod.Name {

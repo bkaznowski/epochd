@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"encoding/json"
@@ -104,7 +104,7 @@ func (c *controller) handleCreateTimeshift(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	s, err := c.createTimeshift(r.Context(), req.Namespace, req.LabelSelector, target, ttl)
+	s, err := c.createTimeshift(r.Context(), req.Namespace, req.LabelSelector, target, ttl, req.Freeze)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
@@ -148,7 +148,7 @@ func (c *controller) handleUpdateTimeshift(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	s, err := c.updateTimeshift(r.Context(), id, target)
+	s, err := c.updateTimeshift(r.Context(), id, target, req.Freeze)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())

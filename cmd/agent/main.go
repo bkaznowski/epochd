@@ -1,4 +1,4 @@
-//go:build linux
+﻿//go:build linux
 
 // Command agent is the node-level gRPC daemon that performs vDSO clock
 // injection on behalf of the epochd controller.
@@ -152,15 +152,21 @@ func (s *server) Inject(ctx context.Context, req *agentpb.InjectRequest) (*agent
 	}
 
 	target := req.TargetTime.AsTime()
+	freeze := req.Freeze
 
 	pid, err := k8sresolve.LookupPID(req.ContainerId)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "resolve container %q: %v", req.ContainerId, err)
 	}
 
-	// InjectAtTime attaches via PTRACE_ATTACH, writes the trampoline, patches
-	// the vDSO, and detaches. It converts target→offset right before writing.
-	h, err := inject.InjectAtTime(pid, target)
+	var h *inject.Handle
+	if freeze {
+		h, err = inject.InjectFrozen(pid, target)
+	} else {
+		// InjectAtTime attaches via PTRACE_ATTACH, writes the trampoline, patches
+		// the vDSO, and detaches. It converts target→offset right before writing.
+		h, err = inject.InjectAtTime(pid, target)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "inject pid %d: %v", pid, err)
 	}
@@ -174,10 +180,15 @@ func (s *server) Inject(ctx context.Context, req *agentpb.InjectRequest) (*agent
 	}
 	s.mu.Unlock()
 
+	mode := "advancing"
+	if freeze {
+		mode = "frozen"
+	}
 	s.log.Info("inject",
 		"container", shortID(req.ContainerId),
 		"pid", pid,
 		"target", target.UTC().Format(time.RFC3339),
+		"mode", mode,
 		"handle", id[:8])
 
 	return &agentpb.InjectResponse{HandleId: id}, nil
@@ -199,7 +210,14 @@ func (s *server) SetTime(ctx context.Context, req *agentpb.SetTimeRequest) (*age
 	}
 
 	target := req.TargetTime.AsTime()
-	if err := entry.handle.SetTime(target); err != nil {
+	freeze := req.Freeze
+
+	if freeze {
+		err = entry.handle.Freeze(target)
+	} else {
+		err = entry.handle.SetTime(target)
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "SetTime: %v", err)
 	}
 

@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -45,6 +45,9 @@ func printTimeshift(prefix string, ts *sdk.Timeshift) {
 	}
 	fmt.Fprintf(stdout, "  namespace:  %s\n", ts.Namespace)
 	fmt.Fprintf(stdout, "  time:       %s\n", ts.Time.Format(time.RFC3339))
+	if ts.Frozen {
+		fmt.Fprintf(stdout, "  frozen:     yes\n")
+	}
 	if !ts.ExpiresAt.IsZero() {
 		fmt.Fprintf(stdout, "  expires at: %s\n", ts.ExpiresAt.Format(time.RFC3339))
 	}
@@ -67,6 +70,7 @@ func cmdCreate(args []string) error {
 	sel := fs.String("selector", "", "label selector, e.g. app=web (required)")
 	timeStr := fs.String("time", "", "fake time in RFC3339, e.g. 2030-01-01T00:00:00Z (required)")
 	ttlStr := fs.String("ttl", "", "expiry duration, e.g. 1h (optional; omit for no expiry)")
+	freeze := fs.Bool("freeze", false, "freeze clock at --time (clock does not advance past target)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -94,7 +98,12 @@ func cmdCreate(args []string) error {
 	if err != nil {
 		return err
 	}
-	ts, err := client.CreateTimeshift(context.Background(), *ns, *sel, target, ttl)
+	var ts *sdk.Timeshift
+	if *freeze {
+		ts, err = client.CreateFrozenTimeshift(context.Background(), *ns, *sel, target, ttl)
+	} else {
+		ts, err = client.CreateTimeshift(context.Background(), *ns, *sel, target, ttl)
+	}
 	if err != nil {
 		if sdk.IsConflict(err) {
 			return fmt.Errorf("create: %v (use 'delete' to remove the existing timeshift first)", err)
@@ -129,8 +138,12 @@ func cmdList(args []string) error {
 		return nil
 	}
 	w := newTabWriter()
-	fmt.Fprintln(w, "ID\tNAMESPACE\tTARGET TIME\tEXPIRES AT\tAPPLIED TO")
+	fmt.Fprintln(w, "ID\tNAMESPACE\tTARGET TIME\tMODE\tEXPIRES AT\tAPPLIED TO")
 	for _, ts := range timeshifts {
+		mode := "advancing"
+		if ts.Frozen {
+			mode = "frozen"
+		}
 		exp := "-"
 		if !ts.ExpiresAt.IsZero() {
 			exp = ts.ExpiresAt.Format(time.RFC3339)
@@ -139,8 +152,8 @@ func cmdList(args []string) error {
 		if applied == "" {
 			applied = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			ts.ID, ts.Namespace, ts.Time.Format(time.RFC3339), exp, applied)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			ts.ID, ts.Namespace, ts.Time.Format(time.RFC3339), mode, exp, applied)
 	}
 	w.Flush()
 	return nil
@@ -184,6 +197,7 @@ func cmdUpdate(args []string) error {
 	fs.SetOutput(stderr)
 	url := addURLFlag(fs)
 	timeStr := fs.String("time", "", "new fake time in RFC3339 (required)")
+	freeze := fs.Bool("freeze", false, "freeze clock at --time (pass false to thaw and advance)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -201,7 +215,12 @@ func cmdUpdate(args []string) error {
 	if err != nil {
 		return err
 	}
-	ts, err := client.UpdateTimeshift(context.Background(), fs.Arg(0), target)
+	var ts *sdk.Timeshift
+	if *freeze {
+		ts, err = client.FreezeTimeshift(context.Background(), fs.Arg(0), target)
+	} else {
+		ts, err = client.UpdateTimeshift(context.Background(), fs.Arg(0), target)
+	}
 	if err != nil {
 		if sdk.IsNotFound(err) {
 			return fmt.Errorf("update: timeshift %q not found", fs.Arg(0))

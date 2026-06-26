@@ -1,4 +1,4 @@
-//go:build linux
+﻿//go:build linux
 
 // Package localtime injects fake time into local (non-Kubernetes) processes.
 // It wraps pkg/inject for use in Go tests and CLI tooling without requiring a
@@ -43,6 +43,26 @@ func Start(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 	return &Handle{h: h}, nil
 }
 
+// StartFrozen starts cmd with the clock frozen at target. Unlike Start, the
+// process sees the same timestamp on every call to clock_gettime until
+// SetTime or Freeze is called.
+func StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Ptrace = true
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("localtime: StartFrozen: %w", err)
+	}
+	h, err := inject.InjectFrozenFollowChild(cmd.Process.Pid, target)
+	if err != nil {
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+		return nil, fmt.Errorf("localtime: inject frozen: %w", err)
+	}
+	return &Handle{h: h}, nil
+}
+
 // Attach injects fake time into an already-running process.
 // Requires CAP_SYS_PTRACE and /proc/sys/kernel/yama/ptrace_scope ≤ 1.
 func Attach(pid int, target time.Time) (*Handle, error) {
@@ -53,9 +73,25 @@ func Attach(pid int, target time.Time) (*Handle, error) {
 	return &Handle{h: h}, nil
 }
 
+// AttachFrozen injects a frozen clock into an already-running process.
+// Requires CAP_SYS_PTRACE and /proc/sys/kernel/yama/ptrace_scope <= 1.
+func AttachFrozen(pid int, target time.Time) (*Handle, error) {
+	h, err := inject.InjectFrozen(pid, target)
+	if err != nil {
+		return nil, fmt.Errorf("localtime: AttachFrozen pid %d: %w", pid, err)
+	}
+	return &Handle{h: h}, nil
+}
+
 // SetTime updates the fake time without stopping the process (process_vm_writev only).
 func (h *Handle) SetTime(target time.Time) error {
 	return h.h.SetTime(target)
+}
+
+// Freeze freezes the process's clock at target. Every subsequent call to
+// clock_gettime in the target process returns exactly target.
+func (h *Handle) Freeze(target time.Time) error {
+	return h.h.Freeze(target)
 }
 
 // Reset snaps the process back to the real clock. Equivalent to SetTime(time.Now()).
@@ -111,29 +147,12 @@ func (s *Session) Attach(pid int) error {
 // Per-process errors are collected and returned joined; a partial failure leaves
 // successful handles at the new target.
 func (s *Session) SetTime(target time.Time) error {
-	s.mu.Lock()
-	handles := make([]*Handle, len(s.handles))
-	copy(handles, s.handles)
-	s.mu.Unlock()
+	return s.applyAll(target, func(h *Handle) error { return h.SetTime(target) })
+}
 
-	errs := make([]error, len(handles))
-	var wg sync.WaitGroup
-	for i, h := range handles {
-		wg.Add(1)
-		go func(i int, h *Handle) {
-			defer wg.Done()
-			errs[i] = h.SetTime(target)
-		}(i, h)
-	}
-	wg.Wait()
-
-	if err := errors.Join(errs...); err != nil {
-		return fmt.Errorf("localtime: SetTime: %w", err)
-	}
-	s.mu.Lock()
-	s.target = target
-	s.mu.Unlock()
-	return nil
+// Freeze freezes the clock at target for all processes in the session concurrently.
+func (s *Session) Freeze(target time.Time) error {
+	return s.applyAll(target, func(h *Handle) error { return h.Freeze(target) })
 }
 
 // Reset snaps all processes back to the real clock.
@@ -146,4 +165,30 @@ func (s *Session) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.handles)
+}
+
+func (s *Session) applyAll(target time.Time, fn func(*Handle) error) error {
+	s.mu.Lock()
+	handles := make([]*Handle, len(s.handles))
+	copy(handles, s.handles)
+	s.mu.Unlock()
+
+	errs := make([]error, len(handles))
+	var wg sync.WaitGroup
+	for i, h := range handles {
+		wg.Add(1)
+		go func(i int, h *Handle) {
+			defer wg.Done()
+			errs[i] = fn(h)
+		}(i, h)
+	}
+	wg.Wait()
+
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("localtime: applyAll: %w", err)
+	}
+	s.mu.Lock()
+	s.target = target
+	s.mu.Unlock()
+	return nil
 }
