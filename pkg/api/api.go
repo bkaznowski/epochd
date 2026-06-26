@@ -14,9 +14,11 @@ type CreateTimeshiftRequest struct {
 }
 
 // UpdateTimeshiftRequest is the body of PATCH /timeshifts/{id}.
+// Provide either Time (absolute) or Duration (relative advance); not both.
 type UpdateTimeshiftRequest struct {
-	Time   string `json:"time"`             // RFC3339 absolute timestamp
-	Freeze bool   `json:"freeze,omitempty"` // if true, switch to freeze mode at the new time
+	Time     string `json:"time,omitempty"`     // RFC3339 absolute timestamp
+	Duration string `json:"duration,omitempty"` // Go duration string to advance by, e.g. "24h" or "-1h"
+	Freeze   bool   `json:"freeze,omitempty"`   // if true, switch to (or stay in) freeze mode
 }
 
 // TimeshiftResponse is returned by POST /timeshifts, GET /timeshifts/{id}, and PATCH /timeshifts/{id}.

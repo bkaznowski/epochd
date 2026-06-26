@@ -47,9 +47,10 @@ func (c *controller) handlePodEvent(ctx context.Context, pod *corev1.Pod) {
 
 	// Collect matching timeshifts without holding the write lock.
 	type match struct {
-		id         string
-		targetTime time.Time
-		frozen     bool
+		id       string
+		offset   time.Duration
+		frozenAt time.Time
+		frozen   bool
 	}
 	c.mu.RLock()
 	var matched []match
@@ -69,7 +70,7 @@ func (c *controller) handlePodEvent(ctx context.Context, pod *corev1.Pod) {
 		if allContainersHandled(s.handles, pod) {
 			continue
 		}
-		matched = append(matched, match{id: id, targetTime: s.targetTime, frozen: s.frozen})
+		matched = append(matched, match{id: id, offset: s.offset, frozenAt: s.frozenAt, frozen: s.frozen})
 	}
 	c.mu.RUnlock()
 
@@ -78,7 +79,13 @@ func (c *controller) handlePodEvent(ctx context.Context, pod *corev1.Pod) {
 	}
 
 	for _, m := range matched {
-		newHandles := c.injectPod(ctx, pod, m.targetTime, m.frozen)
+		var target time.Time
+		if m.frozen {
+			target = m.frozenAt
+		} else {
+			target = time.Now().Add(m.offset)
+		}
+		newHandles := c.injectPod(ctx, pod, target, m.frozen)
 		if len(newHandles) == 0 {
 			continue
 		}

@@ -143,8 +143,8 @@ func TestCreateTimeshift(t *testing.T) {
 	if len(s.handles) == 0 {
 		t.Error("expected at least one handle")
 	}
-	if !s.targetTime.Equal(target) {
-		t.Errorf("targetTime: got %v want %v", s.targetTime, target)
+	if got := s.effectiveTime(); got.Sub(target).Abs() > time.Second {
+		t.Errorf("effectiveTime: got %v want ~%v", got, target)
 	}
 }
 
@@ -287,8 +287,8 @@ func TestUpdateTimeshift(t *testing.T) {
 	if called != len(s.handles) {
 		t.Errorf("SetTime called %d times, want %d", called, len(s.handles))
 	}
-	if !s2.targetTime.Equal(newTarget) {
-		t.Errorf("targetTime not updated: got %v", s2.targetTime)
+	if got := s2.effectiveTime(); got.Sub(newTarget).Abs() > time.Second {
+		t.Errorf("effectiveTime not updated: got %v want ~%v", got, newTarget)
 	}
 }
 
@@ -452,6 +452,53 @@ func TestHTTPUpdateAndGetTimeshift(t *testing.T) {
 	w = doRequest(t, mux, http.MethodGet, "/timeshifts/"+created.ID, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("get: got %d; body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHTTPAdvanceTimeshift(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+	mux := ctrl.routes()
+
+	// Create advancing timeshift at now+24h.
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	w := doRequest(t, mux, http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace:     "default",
+		LabelSelector: "app=web-1",
+		Time:          target.Format(time.RFC3339),
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: got %d; body: %s", w.Code, w.Body.String())
+	}
+	var created api.TimeshiftResponse
+	decodeResponse(t, w, &created)
+
+	// Advance by one day — effective time should be ~now+48h.
+	w = doRequest(t, mux, http.MethodPatch, "/timeshifts/"+created.ID, api.UpdateTimeshiftRequest{
+		Duration: "24h",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("advance: got %d; body: %s", w.Code, w.Body.String())
+	}
+	var advanced api.TimeshiftResponse
+	decodeResponse(t, w, &advanced)
+
+	want := time.Now().Add(48 * time.Hour)
+	got, err := time.Parse(time.RFC3339, advanced.Time)
+	if err != nil {
+		t.Fatalf("parse advanced.Time: %v", err)
+	}
+	if got.Sub(want).Abs() > time.Second {
+		t.Errorf("effectiveTime after advance: got %v want ~%v", got, want)
+	}
+
+	// Advance-by-duration and absolute time together should be rejected.
+	w = doRequest(t, mux, http.MethodPatch, "/timeshifts/"+created.ID, api.UpdateTimeshiftRequest{
+		Time:     time.Now().Add(72 * time.Hour).Format(time.RFC3339),
+		Duration: "24h",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("both time+duration: got %d want 400", w.Code)
 	}
 }
 
@@ -1001,16 +1048,17 @@ func TestStoreRoundTrip(t *testing.T) {
 	st := newStore(k8s, "epochd")
 	ctx := context.Background()
 
-	target := time.Date(2030, 1, 15, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2030, 1, 15, 12, 0, 0, 0, time.UTC)
+	wantOffset := 24 * time.Hour
 	original := map[string]*timeshift{
 		"abc123": {
 			id:            "abc123",
 			namespace:     "staging",
 			labelSelector: "app=svc",
-			targetTime:    target,
+			offset:        wantOffset,
 			ttl:           time.Hour,
-			expiresAt:     target.Add(time.Hour),
-			createdAt:     target.Add(-time.Minute),
+			expiresAt:     now.Add(time.Hour),
+			createdAt:     now.Add(-time.Minute),
 			handles: []containerHandle{
 				{
 					pod:         "svc-abc",
@@ -1042,8 +1090,8 @@ func TestStoreRoundTrip(t *testing.T) {
 	if got.namespace != "staging" {
 		t.Errorf("namespace: got %q want %q", got.namespace, "staging")
 	}
-	if !got.targetTime.Equal(target) {
-		t.Errorf("targetTime: got %v want %v", got.targetTime, target)
+	if got.offset != wantOffset {
+		t.Errorf("offset: got %v want %v", got.offset, wantOffset)
 	}
 	if got.ttl != time.Hour {
 		t.Errorf("ttl: got %v want %v", got.ttl, time.Hour)
@@ -1096,8 +1144,8 @@ func TestControllerRestore(t *testing.T) {
 	if !ok {
 		t.Fatal("timeshift not present after restore")
 	}
-	if !restored.targetTime.Equal(target) {
-		t.Errorf("targetTime: got %v want %v", restored.targetTime, target)
+	if got := restored.effectiveTime(); got.Sub(target).Abs() > time.Second {
+		t.Errorf("effectiveTime after restore: got %v want ~%v", got, target)
 	}
 	if restored.namespace != "default" {
 		t.Errorf("namespace: got %q want %q", restored.namespace, "default")

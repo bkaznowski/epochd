@@ -140,7 +140,7 @@ func TestRemoteMmap(t *testing.T) {
 //  1. The trampoline payload is written to a new rwx page.
 //  2. The state struct at Handle.StateAddr has the expected initial field values.
 //  3. The vDSO clock_gettime entry is patched with a valid JMP rel32.
-//  4. setOffset updates the state correctly via process_vm_writev.
+//  4. writeState updates the state correctly via process_vm_writev.
 //  5. The child is still alive after Detach.
 func TestInjectMechanics(t *testing.T) {
 	tr, pid := startPtraceChild(t, "1")
@@ -155,7 +155,7 @@ func TestInjectMechanics(t *testing.T) {
 	target := time.Now().Add(24 * time.Hour)
 	wantSec, wantNsec := diffSecNsec(target, time.Now())
 
-	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, wantSec, wantNsec)
+	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, wantSec, wantNsec, trampoline.MaskEnabled)
 	if err != nil {
 		t.Fatalf("injectWithTracer: %v", err)
 	}
@@ -200,24 +200,24 @@ func TestInjectMechanics(t *testing.T) {
 	}
 	t.Logf("JMP rel32: page=0x%x disp=%d", newPage, gotDisp)
 
-	// 3 — setOffset: write new values and read them back.
+	// 3 — writeState: write new values and read them back.
 	newTarget := target.Add(time.Hour)
 	newSec, newNsec := diffSecNsec(newTarget, time.Now())
-	if err := h.setOffset(newSec, newNsec); err != nil {
-		t.Fatalf("setOffset: %v", err)
+	if err := h.writeState(newSec, newNsec, trampoline.MaskEnabled); err != nil {
+		t.Fatalf("writeState: %v", err)
 	}
 	if _, err := procmem.ReadMem(pid, h.StateAddr, stateBytes); err != nil {
-		t.Fatalf("ReadMem (state after setOffset): %v", err)
+		t.Fatalf("ReadMem (state after writeState): %v", err)
 	}
 	gotSec2, gotNsec2, _, gotGen2, _ := trampoline.DecodeState(stateBytes)
 	if gotSec2 != newSec {
-		t.Errorf("after setOffset: offsetSec = %d, want %d", gotSec2, newSec)
+		t.Errorf("after writeState: offsetSec = %d, want %d", gotSec2, newSec)
 	}
 	if gotNsec2 != newNsec {
-		t.Errorf("after setOffset: offsetNsec = %d, want %d", gotNsec2, newNsec)
+		t.Errorf("after writeState: offsetNsec = %d, want %d", gotNsec2, newNsec)
 	}
 	if gotGen2 != 1 {
-		t.Errorf("after setOffset: generation = %d, want 1", gotGen2)
+		t.Errorf("after writeState: generation = %d, want 1", gotGen2)
 	}
 
 	// 4 — Detach and confirm child is still alive.
@@ -274,7 +274,7 @@ func TestInjectObserved(t *testing.T) {
 	offset := 24 * time.Hour
 	target := time.Now().Add(offset)
 	wantSec, wantNsec := diffSecNsec(target, time.Now())
-	if _, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, wantSec, wantNsec); err != nil {
+	if _, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, wantSec, wantNsec, trampoline.MaskEnabled); err != nil {
 		t.Fatalf("injectWithTracer: %v", err)
 	}
 	tr.Detach()

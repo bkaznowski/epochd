@@ -36,7 +36,7 @@ func newTabWriter() *tabwriter.Writer {
 }
 
 // printTimeshift prints a single timeshift in multi-line key-value format.
-// prefix is "created", "updated", or "" (for get).
+// prefix is "created", "updated", "advanced", or "" (for get).
 func printTimeshift(prefix string, ts *sdk.Timeshift) {
 	if prefix != "" {
 		fmt.Fprintf(stdout, "%s timeshift %s\n", prefix, ts.ID)
@@ -228,6 +228,43 @@ func cmdUpdate(args []string) error {
 		return fmt.Errorf("update: %v", err)
 	}
 	printTimeshift("updated", ts)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// advance
+// ---------------------------------------------------------------------------
+
+func cmdAdvance(args []string) error {
+	fs := flag.NewFlagSet("advance", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	url := addURLFlag(fs)
+	byStr := fs.String("by", "", "duration to advance by, e.g. 24h or -1h (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return fmt.Errorf("advance: timeshift ID required")
+	}
+	if *byStr == "" {
+		return fmt.Errorf("advance: --by is required")
+	}
+	delta, err := time.ParseDuration(*byStr)
+	if err != nil {
+		return fmt.Errorf("advance: --by: %v", err)
+	}
+	client, err := clientFromURL(*url)
+	if err != nil {
+		return err
+	}
+	ts, err := client.AdvanceTimeshift(context.Background(), fs.Arg(0), delta)
+	if err != nil {
+		if sdk.IsNotFound(err) {
+			return fmt.Errorf("advance: timeshift %q not found", fs.Arg(0))
+		}
+		return fmt.Errorf("advance: %v", err)
+	}
+	printTimeshift("advanced", ts)
 	return nil
 }
 

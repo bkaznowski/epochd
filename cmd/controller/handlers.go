@@ -142,13 +142,32 @@ func (c *controller) handleUpdateTimeshift(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	target, err := time.Parse(time.RFC3339, req.Time)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "time must be RFC3339: "+err.Error())
+	if req.Time != "" && req.Duration != "" {
+		writeError(w, http.StatusBadRequest, "provide either time or duration, not both")
+		return
+	}
+	if req.Time == "" && req.Duration == "" {
+		writeError(w, http.StatusBadRequest, "time or duration is required")
 		return
 	}
 
-	s, err := c.updateTimeshift(r.Context(), id, target, req.Freeze)
+	var s *timeshift
+	var err error
+	if req.Duration != "" {
+		delta, parseErr := time.ParseDuration(req.Duration)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "duration must be a Go duration string (e.g. \"24h\"): "+parseErr.Error())
+			return
+		}
+		s, err = c.advanceTimeshift(r.Context(), id, delta, req.Freeze)
+	} else {
+		target, parseErr := time.Parse(time.RFC3339, req.Time)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "time must be RFC3339: "+parseErr.Error())
+			return
+		}
+		s, err = c.updateTimeshift(r.Context(), id, target, req.Freeze)
+	}
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())

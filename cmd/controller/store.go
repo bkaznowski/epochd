@@ -42,7 +42,8 @@ type storedTimeshift struct {
 	ID            string         `json:"id"`
 	Namespace     string         `json:"namespace"`
 	LabelSelector string         `json:"labelSelector"`
-	TargetTime    time.Time      `json:"targetTime"`
+	Offset        int64          `json:"offset"`             // nanoseconds; advancing: fake_time = now + offset
+	FrozenAt      time.Time      `json:"frozenAt,omitempty"` // frozen mode only
 	Frozen        bool           `json:"frozen,omitempty"`
 	TTL           time.Duration  `json:"ttl"`
 	ExpiresAt     time.Time      `json:"expiresAt"`
@@ -69,7 +70,8 @@ func (s *store) encode(timeshifts map[string]*timeshift) ([]byte, error) {
 			ID:            ts.id,
 			Namespace:     ts.namespace,
 			LabelSelector: ts.labelSelector,
-			TargetTime:    ts.targetTime,
+			Offset:        int64(ts.offset),
+			FrozenAt:      ts.frozenAt,
 			Frozen:        ts.frozen,
 			TTL:           ts.ttl,
 			ExpiresAt:     ts.expiresAt,
@@ -150,7 +152,8 @@ func (s *store) load(ctx context.Context) (map[string]*timeshift, error) {
 			id:            st.ID,
 			namespace:     st.Namespace,
 			labelSelector: st.LabelSelector,
-			targetTime:    st.TargetTime,
+			offset:        time.Duration(st.Offset),
+			frozenAt:      st.FrozenAt,
 			frozen:        st.Frozen,
 			ttl:           st.TTL,
 			expiresAt:     st.ExpiresAt,

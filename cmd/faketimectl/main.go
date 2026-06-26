@@ -11,7 +11,8 @@
 //	create   --namespace=NS --selector=SEL --time=RFC3339 [--ttl=DURATION]
 //	list
 //	get      <id>
-//	update   --time=RFC3339 <id>
+//	update   <id> --time=RFC3339
+//	advance  <id> --by=DURATION
 //	delete   <id>
 //	status   <id>
 //	resolve  --namespace=NS --selector=SEL
@@ -58,6 +59,8 @@ func run(args []string) error {
 		return cmdGet(args[1:])
 	case "update":
 		return cmdUpdate(args[1:])
+	case "advance":
+		return cmdAdvance(args[1:])
 	case "delete":
 		return cmdDelete(args[1:])
 	case "status":
@@ -80,6 +83,7 @@ Controller subcommands (require --url flag or EPOCHD_URL environment variable):
   list
   get      <id>
   update   <id> --time=RFC3339
+  advance  <id> --by=DURATION
   delete   <id>
   status   <id>
   resolve  --namespace=NS --selector=SEL

@@ -48,12 +48,24 @@ type timeshift struct {
 	id            string
 	namespace     string
 	labelSelector string
-	targetTime    time.Time
-	frozen        bool
-	ttl           time.Duration
-	expiresAt     time.Time
-	createdAt     time.Time
-	handles       []containerHandle
+	// For advancing mode: fake_time = time.Now() + offset.
+	// For frozen mode: fake_time = frozenAt (constant).
+	offset   time.Duration
+	frozenAt time.Time
+	frozen   bool
+	ttl      time.Duration
+	expiresAt time.Time
+	createdAt time.Time
+	handles   []containerHandle
+}
+
+// effectiveTime returns the fake time the targeted processes currently see.
+// For advancing timeshifts this grows in real time; for frozen ones it is constant.
+func (s *timeshift) effectiveTime() time.Time {
+	if s.frozen {
+		return s.frozenAt
+	}
+	return time.Now().Add(s.offset)
 }
 
 func (s *timeshift) appliedTo() []string {
@@ -69,7 +81,7 @@ func (s *timeshift) toResponse() api.TimeshiftResponse {
 	r := api.TimeshiftResponse{
 		ID:        s.id,
 		Namespace: s.namespace,
-		Time:      s.targetTime.UTC().Format(time.RFC3339),
+		Time:      s.effectiveTime().UTC().Format(time.RFC3339),
 		Frozen:    s.frozen,
 		AppliedTo: s.appliedTo(),
 	}
@@ -177,11 +189,15 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 		id:            newID(),
 		namespace:     ns,
 		labelSelector: labelSel,
-		targetTime:    target,
 		frozen:        freeze,
 		ttl:           ttl,
 		createdAt:     now,
 		handles:       handles,
+	}
+	if freeze {
+		s.frozenAt = target
+	} else {
+		s.offset = target.Sub(now)
 	}
 	if ttl > 0 {
 		s.expiresAt = now.Add(ttl)
@@ -206,7 +222,7 @@ func (c *controller) createTimeshift(ctx context.Context, ns, labelSel string, t
 		"timeshift_id", s.id[:8],
 		"namespace", ns,
 		"selector", labelSel,
-		"target", target.UTC().Format(time.RFC3339),
+		"target", s.effectiveTime().UTC().Format(time.RFC3339),
 		"mode", mode,
 		"ttl", ttlStr,
 		"containers", len(handles))
@@ -320,6 +336,7 @@ func (c *controller) updateTimeshift(ctx context.Context, id string, target time
 		updates = append(updates, update{i, newHandle})
 	}
 
+	now := time.Now()
 	c.mu.Lock()
 	// Apply re-injected handle IDs; match by containerID in case handles shifted.
 	for _, u := range updates {
@@ -327,11 +344,36 @@ func (c *controller) updateTimeshift(ctx context.Context, id string, target time
 			s.handles[u.idx].agentHandle = u.newHandle
 		}
 	}
-	s.targetTime = target
+	if freeze {
+		s.frozenAt = target
+		s.offset = 0
+	} else {
+		s.offset = target.Sub(now)
+		s.frozenAt = time.Time{}
+	}
 	s.frozen = freeze
 	c.mu.Unlock()
 	c.persist(ctx)
 	return s, nil
+}
+
+// advanceTimeshift advances the timeshift's clock by delta. For advancing
+// timeshifts the stored offset grows by delta; for frozen ones frozenAt shifts
+// by delta. All agent handles are updated immediately via SetTime.
+func (c *controller) advanceTimeshift(ctx context.Context, id string, delta time.Duration, freeze bool) (*timeshift, error) {
+	s, err := c.getTimeshift(id)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.RLock()
+	var target time.Time
+	if s.frozen {
+		target = s.frozenAt.Add(delta)
+	} else {
+		target = time.Now().Add(s.offset + delta)
+	}
+	c.mu.RUnlock()
+	return c.updateTimeshift(ctx, id, target, freeze)
 }
 
 // deleteTimeshift resets all handles to real time and removes the timeshift.
@@ -418,7 +460,7 @@ func (c *controller) postExpiryEvents(s *timeshift) {
 		return
 	}
 	msg := fmt.Sprintf("Timeshift %s (target: %s) expired after %s",
-		s.id[:8], s.targetTime.UTC().Format(time.RFC3339), s.ttl.String())
+		s.id[:8], s.effectiveTime().UTC().Format(time.RFC3339), s.ttl.String())
 
 	seen := make(map[string]bool, len(s.handles))
 	for _, h := range s.handles {

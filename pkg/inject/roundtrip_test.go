@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"epochd/pkg/procmem"
+	"epochd/pkg/trampoline"
 	"epochd/pkg/vdso"
 )
 
@@ -64,7 +65,7 @@ func TestInjectRoundTrip(t *testing.T) {
 	const fakeOffset = 24 * time.Hour
 	target := time.Now().Add(fakeOffset)
 	wantSec, wantNsec := diffSecNsec(target, time.Now())
-	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, wantSec, wantNsec)
+	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, wantSec, wantNsec, trampoline.MaskEnabled)
 	if err != nil {
 		t.Fatalf("injectWithTracer: %v", err)
 	}

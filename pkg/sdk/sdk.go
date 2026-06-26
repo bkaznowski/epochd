@@ -204,6 +204,18 @@ func (c *Client) FreezeTimeshift(ctx context.Context, id string, target time.Tim
 	return c.updateTimeshift(ctx, id, target, true)
 }
 
+// AdvanceTimeshift advances the timeshift's clock by d (may be negative to
+// rewind). For advancing timeshifts the offset grows by d; for frozen ones the
+// frozen point shifts by d. The mode (frozen or advancing) is preserved.
+func (c *Client) AdvanceTimeshift(ctx context.Context, id string, d time.Duration) (*Timeshift, error) {
+	body := api.UpdateTimeshiftRequest{Duration: d.String()}
+	var resp api.TimeshiftResponse
+	if err := c.do(ctx, http.MethodPatch, "/timeshifts/"+id, body, &resp); err != nil {
+		return nil, err
+	}
+	return timeshiftFromResponse(resp)
+}
+
 func (c *Client) updateTimeshift(ctx context.Context, id string, target time.Time, freeze bool) (*Timeshift, error) {
 	body := api.UpdateTimeshiftRequest{
 		Time:   target.UTC().Format(time.RFC3339),
