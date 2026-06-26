@@ -6,13 +6,18 @@
 
 A Go tool that injects a fake wall-clock time into a running Linux process without
 restarting it, stopping it for more than a moment, or modifying its binary. Designed for
-Kubernetes end-to-end tests that need to advance time on specific pods (e.g. testing
+Kubernetes end-to-end tests that need to control time on specific pods (e.g. testing
 certificate expiry, token refresh, cron scheduling).
 
-After a one-time injection, reading a new time requires a single `process_vm_writev`
-syscall — no `ptrace` stop, no signal, no coordination with the target. The target process
-continues running and its clock keeps advancing at the normal rate from the injected
-starting point.
+Two clock modes are supported:
+
+- **Advancing** — the target's clock is shifted by a fixed offset from real time. The clock
+  keeps advancing at the normal rate; `time.Now()` returns `real_now + offset`.
+- **Frozen** — the target's clock is pinned to a specific instant. Every call to
+  `clock_gettime` returns exactly that time, regardless of how much real time passes.
+
+After a one-time injection, updating the time requires a single `process_vm_writev`
+syscall — no `ptrace` stop, no signal, no coordination with the target.
 
 **Platform**: Linux x86-64 only. Everything in the codebase is guarded with
 `//go:build linux`.
@@ -64,8 +69,8 @@ Because the vDSO is a normal mapped region, its code is writable under `PTRACE_P
 │    └─ state struct (32 bytes, at StateOffset = 86)                      │
 │         +0   int64  offsetSec                                           │
 │         +8   int64  offsetNsec                                          │
-│         +16  uint64 enabledMask  (bit 0 = CLOCK_REALTIME)               │
-│         +24  uint32 generation   (bumped on each SetTime)               │
+│         +16  uint64 enabledMask  (1=advancing, 3=frozen)                │
+│         +24  uint32 generation   (bumped on each SetTime/Freeze)        │
 │         +28  uint32 _pad                                                │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -93,11 +98,14 @@ Because the vDSO is a normal mapped region, its code is writable under `PTRACE_P
 5. **Detach** — the target resumes. Every subsequent `clock_gettime(CLOCK_REALTIME, ...)`
    call now goes through the trampoline.
 
-6. **Update time** — `SetTime` computes a new `(offsetSec, offsetNsec)` pair and writes
-   32 bytes directly into the state struct using `process_vm_writev`. No ptrace needed.
-   The trampoline reads the state with plain loads; there is no synchronisation primitive,
-   so an update and a concurrent `clock_gettime` call can race — the worst outcome is one
-   call returning a time between the old and new offsets, which is acceptable for testing.
+6. **Update time** — `SetTime` / `Freeze` writes a new state struct (32 bytes) into the
+   trampoline page using `process_vm_writev`. No ptrace needed. The `enabledMask` field
+   controls behaviour: `MaskEnabled = 1` (bit 0 set) means advancing mode — the trampoline
+   adds `(offsetSec, offsetNsec)` to the real time. `MaskFrozen = 3` (bits 0+1 set) means
+   freeze mode — the offsets encode an absolute timestamp; the trampoline ignores the real
+   time and returns that value directly. The trampoline reads the state with plain loads;
+   a concurrent update and `clock_gettime` call can race — the worst outcome is one call
+   returning a time between the old and new values, which is acceptable for testing.
 
 ---
 
@@ -115,6 +123,7 @@ epochd/
 │   ├── procmem/          # ptrace wrapper + process_vm_readv/writev
 │   ├── trampoline/       # Assembled payload bytes + state struct helpers
 │   ├── inject/           # Injection orchestration; public API
+│   ├── localtime/        # Non-Kubernetes injection (local processes, tests)
 │   ├── agentpb/          # Generated gRPC types (agent.proto)
 │   ├── agentclient/      # gRPC connection pool (controller → agents)
 │   ├── k8sresolve/       # Container ID → PID resolution via /proc
@@ -245,48 +254,107 @@ Both images use `scratch` as the runtime base — no shell, no libc, ~10–50 MB
 
 ## `faketimectl` — manual testing CLI
 
-Injects a fake time into any running process.
+`faketimectl` has two groups of subcommands: **controller subcommands** that talk to a
+running epochd controller over HTTP, and **local injection subcommands** that directly
+ptrace a process on the current machine (Linux only, requires `CAP_SYS_PTRACE`).
+
+### Controller subcommands
+
+Set `EPOCHD_URL` or pass `--url` on every command.
 
 ```
-faketimectl --pid=<PID> --set-time=<RFC3339>
-faketimectl --pid=<PID> --reset
+faketimectl create  --namespace=NS --selector=SEL --time=RFC3339 [--ttl=DUR] [--freeze]
+faketimectl list
+faketimectl get     <id>
+faketimectl update  <id> --time=RFC3339 [--freeze]
+faketimectl advance <id> --by=DURATION
+faketimectl delete  <id>
+faketimectl status  <id>
+faketimectl resolve --namespace=NS --selector=SEL
 ```
 
-**Flags**
+| Subcommand | Description |
+|------------|-------------|
+| `create`   | Inject a fake time into all matching pods. `--freeze` pins the clock at `--time` so it never advances. `--ttl` auto-deletes after the given duration. |
+| `list`     | List all active timeshifts. The `TIME` column reflects the live effective time the processes currently see. |
+| `get`      | Print details for one timeshift, including the current effective time. |
+| `update`   | Move the clock to a new absolute time. `--freeze` switches to/from freeze mode. |
+| `advance`  | Shift the clock forward (or backward) by a Go duration. Preserves the current mode. |
+| `delete`   | Reset all targeted processes to the real clock and remove the timeshift. |
+| `status`   | Query each node agent for the live trampoline state (generation counter, PID, last write). |
+| `resolve`  | Preview which pods and containers would be targeted without injecting anything. |
+
+**Example — advance a frozen clock by one day**
+
+```bash
+export EPOCHD_URL=http://localhost:8080
+
+# Create a timeshift frozen at 2030-01-01.
+faketimectl create --namespace=default --selector=app=web \
+  --time=2030-01-01T00:00:00Z --freeze
+# created timeshift a1b2c3d4...
+#   namespace:  default
+#   time:       2030-01-01T00:00:00Z
+#   frozen:     yes
+#   applied to: web-abc/main
+
+# An hour later in real time, the processes still see 2030-01-01T00:00:00Z.
+faketimectl get a1b2c3d4
+#   time:       2030-01-01T00:00:00Z
+
+# Advance by one day.
+faketimectl advance a1b2c3d4 --by=24h
+#   time:       2030-01-02T00:00:00Z   ← frozen at the new point
+
+# Switch to advancing mode and move time to 2030-06-01.
+faketimectl update a1b2c3d4 --time=2030-06-01T00:00:00Z
+#   time:       2030-06-01T00:00:02Z   ← now advancing; seconds tick forward
+
+# Clean up.
+faketimectl delete a1b2c3d4
+```
+
+### Local injection subcommands
+
+These directly ptrace a process — no controller required.
+
+```
+faketimectl inject --pid=PID --time=RFC3339 [--freeze]
+faketimectl reset  --pid=PID
+```
 
 | Flag | Description |
 |------|-------------|
 | `--pid` | Target process PID (required) |
-| `--set-time` | Fake wall-clock time in RFC3339, e.g. `2030-01-01T00:00:00Z` |
+| `--time` | Fake wall-clock time in RFC3339, e.g. `2030-01-01T00:00:00Z` |
+| `--freeze` | Pin the clock at `--time` so it never advances |
 | `--reset` | Snap the target back to the real clock |
 
-**Example — fake the clock of a running clockprinter**
+**Example — inject a fake advancing time into a running process**
 
 ```bash
 # Terminal 1: run the sample target
 ./clockprinter
 # 2026-06-21T10:00:00Z
 # 2026-06-21T10:00:01Z
-# ...
 
-# Terminal 2: inject a fake time
-sudo ./faketimectl --pid=$(pgrep clockprinter) --set-time=2030-01-01T00:00:00Z
-# pid 12345: clock set to 2030-01-01T00:00:00Z (+3y193d from now, state=0x7ff...)
+# Terminal 2: inject +4 years, advancing
+sudo faketimectl inject --pid=$(pgrep clockprinter) --time=2030-01-01T00:00:00Z
 
 # Terminal 1 now prints:
 # 2030-01-01T00:00:00Z
 # 2030-01-01T00:00:01Z
-# ...
 
-# Terminal 2: reset
-sudo ./faketimectl --pid=$(pgrep clockprinter) --reset
-# pid 12345: clock reset to real time (state=0x7ff...)
+# Terminal 2: reset to real time
+sudo faketimectl reset --pid=$(pgrep clockprinter)
 ```
 
-**Permissions**: `faketimectl` calls `PTRACE_ATTACH`, which requires `CAP_SYS_PTRACE`
-(or `root`) and `ptrace_scope` ≤ 1. Calling it multiple times on the same process is safe
-— each call re-injects (allocating a new trampoline page) while the target is
-ptrace-stopped, eliminating any race.
+**Permissions**: local injection calls `PTRACE_ATTACH`, which requires `CAP_SYS_PTRACE`
+(or `root`) and `ptrace_scope` ≤ 1:
+
+```bash
+echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+```
 
 ---
 
@@ -417,19 +485,33 @@ The vDSO entry is used as the scratch location because it is already known to be
 and reachable. The final `JMP rel32` patch happens later, after the trampoline has been
 written.
 
-### `setOffset` / `SetTime` — live updates with no ptrace
+### `writeState` / `SetTime` / `Freeze` — live updates with no ptrace
 
 After injection, updating the fake time requires only `process_vm_writev` into the state
 struct. The target does not need to be stopped. A `generation` counter is incremented on
 every write for observability (visible in `TestInjectMechanics`).
 
+The public `Handle` API:
+
 ```go
-func (h *Handle) setOffset(offsetSec, offsetNsec int64) error {
-    h.gen++
-    encoded := trampoline.EncodeState(offsetSec, offsetNsec, 1, h.gen)
-    _, err := procmem.WriteMem(h.PID, h.StateAddr, encoded)
-    ...
-}
+// Advancing mode — trampoline adds (target - now) to real clock_gettime result.
+func (h *Handle) SetTime(target time.Time) error
+
+// Frozen mode — trampoline ignores real time and always returns exactly target.
+func (h *Handle) Freeze(target time.Time) error
+```
+
+Internally, both call `writeState(sec, nsec, mask)` which writes a 32-byte state struct
+via `process_vm_writev`. The mask controls mode: `MaskEnabled = 1` for advancing,
+`MaskFrozen = 3` for frozen.
+
+The four top-level constructors handle both modes and both ptrace paths:
+
+```go
+func InjectAtTime(pid int, target time.Time) (*Handle, error)       // Attach, advancing
+func InjectFrozen(pid int, target time.Time) (*Handle, error)       // Attach, frozen
+func InjectAtTimeFollowChild(pid int, target time.Time) (*Handle, error) // FollowChild, advancing
+func InjectFrozenFollowChild(pid int, target time.Time) (*Handle, error) // FollowChild, frozen
 ```
 
 ### `Tracer` — OS-thread affinity for ptrace
@@ -447,6 +529,107 @@ as closures over a channel and executed on that pinned thread.
 | Mechanism | Child calls `PTRACE_TRACEME`; parent waits for SIGTRAP | Parent calls `PTRACE_ATTACH`; sends `SIGSTOP` |
 | Requires | Owning the child process | `CAP_SYS_PTRACE` + `ptrace_scope ≤ 1` |
 | Used in | Tests (Docker-compatible) | `faketimectl`, production agent |
+
+---
+
+## Freeze mode
+
+When a timeshift is created or updated with `--freeze` / `freeze: true`, the trampoline
+enters **frozen mode**: the `enabledMask` field is set to `MaskFrozen = 3` (bits 0 and 1),
+and the offset fields store the absolute target timestamp rather than a delta. Every
+`clock_gettime(CLOCK_REALTIME, ...)` call in the target returns exactly that timestamp,
+regardless of how much real time passes.
+
+Freeze mode is useful for:
+- Reproducing time-sensitive bugs that only trigger at a specific instant.
+- Tests that need a deterministic, non-advancing clock (e.g. certificate expiry checks
+  where the exact timestamp must match).
+- Pausing time while performing setup, then advancing by discrete steps.
+
+### SDK — freeze mode
+
+```go
+client := sdk.NewClient("http://localhost:8080")
+
+// Create a frozen timeshift.
+ts, err := client.CreateFrozenTimeshift(ctx, "default", "app=web",
+    time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), 0)
+
+// Switch an existing timeshift to frozen mode.
+ts, err = client.FreezeTimeshift(ctx, ts.ID, time.Date(2030, 6, 1, 0, 0, 0, 0, time.UTC))
+
+// Test helper — runs fn with the clock frozen, restores on return.
+sdk.WithFrozenTime(t, "app=web", frozenAt, func() {
+    // time.Now() in target pods always returns frozenAt
+})
+```
+
+### `pkg/localtime` — freeze mode (local processes)
+
+```go
+// Start a child process with its clock frozen at target.
+handle, err := localtime.StartFrozen(cmd, target)
+
+// Attach to an already-running process.
+handle, err = localtime.AttachFrozen(pid, target)
+
+// Freeze/unfreeze via the handle.
+handle.Freeze(newTarget)
+handle.SetTime(advancingTarget) // switches back to advancing mode
+
+// Session-level freeze.
+session := localtime.NewSession(target)
+session.Freeze(target)
+session.Start(cmd) // new processes joined after Freeze() are also frozen
+```
+
+---
+
+## Advance-by-duration
+
+Instead of providing an absolute target time, you can advance (or rewind) the current fake
+time by a relative amount. This works in both advancing and frozen modes and preserves the
+current mode.
+
+### HTTP API
+
+```
+PATCH /timeshifts/{id}
+Content-Type: application/json
+
+{ "duration": "24h" }
+```
+
+Accepted by `PATCH /timeshifts/{id}` alongside the existing `time` field (the two are
+mutually exclusive). Go duration strings are supported (`"24h"`, `"-1h30m"`, `"72h"`).
+
+The `time` field in `GET /timeshifts/{id}` responses always reflects the **live** effective
+time — the actual timestamp the targeted processes currently see. For advancing timeshifts
+this grows every second; for frozen timeshifts it is constant.
+
+### CLI
+
+```bash
+faketimectl advance <id> --by=24h    # advance by 24 hours
+faketimectl advance <id> --by=-1h    # rewind by 1 hour
+```
+
+### SDK
+
+```go
+// Shift forward by one day.
+ts, err := client.AdvanceTimeshift(ctx, ts.ID, 24*time.Hour)
+```
+
+### `pkg/localtime` — advance (local processes)
+
+```go
+// Advance a single-process handle by one day.
+err = handle.Advance(24 * time.Hour)
+
+// Advance all processes in a session.
+err = session.Advance(24 * time.Hour)
+```
 
 ---
 
@@ -516,6 +699,10 @@ as closures over a channel and executed on that pinned thread.
 | 31 | Validating webhook admission controller | 🔲 |
 | 32 | `pkg/localtime` Attach path (`CAP_SYS_PTRACE`) | 🔲 |
 | 33 | Integration test harness (`make test-integration`, kind) | ✅ |
+| 34 | Freeze mode (pin clock at fixed instant, `--freeze` / `MaskFrozen`) | ✅ |
+| 35 | Advance-by-duration (`PATCH duration`, `advance --by`, `AdvanceTimeshift`, `Handle.Advance`) | ✅ |
+| 36 | Offset-based timeshift storage (live `time` in GET responses) | ✅ |
+| 37 | proto `freeze` field on `InjectRequest` / `SetTimeRequest` | ✅ |
 
 See `plan.md` for the detailed specification of all phases.
 See `FUTURE.md` for longer-horizon improvements (auth, multi-arch, Helm, HA).

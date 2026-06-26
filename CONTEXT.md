@@ -1,7 +1,7 @@
-# epochd — implementation context (current phase: 19)
+# epochd — implementation context (current phase: 37)
 
 This file is a dense reference for an agent or developer continuing the project. It
-captures the state of the codebase after phases 0–19, the exact APIs that exist, every
+captures the state of the codebase after phases 0–37, the exact APIs that exist, every
 non-obvious decision that was made and why, and discovered gotchas. All planned phases
 are complete; see `FUTURE.md` for longer-horizon improvements.
 
@@ -162,34 +162,42 @@ type Handle struct {
     // unexported: origBytes [5]byte, gen uint32
 }
 
-// One-time injection. Attaches (PTRACE_ATTACH), injects, detaches. Safe to call
-// multiple times on same pid (re-patches JMP, leaks old trampoline page — acceptable).
-func InjectAtTime(pid int, target time.Time) (*Handle, error)
+// PTRACE_ATTACH path (requires CAP_SYS_PTRACE + ptrace_scope ≤ 1):
+func InjectAtTime(pid int, target time.Time) (*Handle, error)   // advancing mode
+func InjectFrozen(pid int, target time.Time) (*Handle, error)   // frozen mode
 
-// Live update — single process_vm_writev, no ptrace stop required.
-func (h *Handle) SetTime(target time.Time) error
+// FollowChild path (no elevated perms; child must have SysProcAttr{Ptrace: true}):
+func InjectAtTimeFollowChild(pid int, target time.Time) (*Handle, error)
+func InjectFrozenFollowChild(pid int, target time.Time) (*Handle, error)
+
+// Live updates — single process_vm_writev, no ptrace stop required.
+func (h *Handle) SetTime(target time.Time) error    // advancing mode
+func (h *Handle) Freeze(target time.Time) error     // frozen mode
+func (h *Handle) Generation() uint32                // observability
 ```
+
+Clock modes:
+- **Advancing** (`MaskEnabled = 1`): trampoline adds `(offsetSec, offsetNsec)` to real time.
+- **Frozen** (`MaskFrozen = 3`): `offsetSec`/`offsetNsec` store the absolute frozen timestamp;
+  the trampoline ignores real time and returns that value directly.
 
 #### Internal functions (used in tests)
 
 ```go
-// Core injection — tr must already be attached. Used by tests so they can use
-// FollowChild instead of Attach (Docker-compatible).
-func injectWithTracer(tr *procmem.Tracer, pid int, cgtAddr uintptr, initialOffsetSec, initialOffsetNsec int64) (*Handle, error)
+// Core injection — tr must already be attached.
+func injectWithTracer(tr *procmem.Tracer, pid int, cgtAddr uintptr, sec, nsec int64, mask uint64) (*Handle, error)
 
 // Writes state struct with process_vm_writev, increments h.gen.
-func (h *Handle) setOffset(offsetSec, offsetNsec int64) error
+func (h *Handle) writeState(sec, nsec int64, mask uint64) error
 
 // Converts absolute target time to (sec, nsec) offset from base.
 // nsec is in (-1e9, 1e9); trampoline normalises to [0, 1e9).
 func diffSecNsec(target, base time.Time) (sec, nsec int64)
 
 // Scans /proc/<pid>/maps for first unmapped page-aligned gap within ±2 GB of near.
-// Called while tracee is ptrace-stopped (maps are stable).
 func findNearbyGap(pid int, near uintptr) (uintptr, error)
 
 // Injects mmap syscall into tracee via patching patchAddr with syscall+int3.
-// fixedAddr=0: kernel chooses; fixedAddr!=0: MAP_FIXED_NOREPLACE at that address.
 func remoteMmap(tr *procmem.Tracer, pid int, patchAddr, fixedAddr uintptr) (uintptr, error)
 ```
 
@@ -240,13 +248,26 @@ t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
 
 ### `cmd/faketimectl`
 
+Two groups of subcommands. All controller subcommands accept `--url` or `EPOCHD_URL`:
+
 ```
-faketimectl --pid=<PID> --set-time=<RFC3339>   # inject fake time
-faketimectl --pid=<PID> --reset                 # snap back to real clock
+# Controller subcommands (talk to a running epochd controller):
+faketimectl create  --namespace=NS --selector=SEL --time=RFC3339 [--ttl=DUR] [--freeze]
+faketimectl list
+faketimectl get     <id>
+faketimectl update  <id> --time=RFC3339 [--freeze]
+faketimectl advance <id> --by=DURATION       # shift by a Go duration, e.g. "24h"
+faketimectl delete  <id>
+faketimectl status  <id>
+faketimectl resolve --namespace=NS --selector=SEL
+
+# Local injection subcommands (Linux only, CAP_SYS_PTRACE / ptrace_scope ≤ 1):
+faketimectl inject  --pid=PID --time=RFC3339 [--freeze]
+faketimectl reset   --pid=PID
 ```
 
-Always calls `inject.InjectAtTime` (re-injects on each call, which is safe). Uses
-`PTRACE_ATTACH` — requires `CAP_SYS_PTRACE` and `ptrace_scope ≤ 1`.
+`inject` calls `inject.InjectAtTime` or `inject.InjectFrozen` (re-injects on each call,
+which is safe). Uses `PTRACE_ATTACH`.
 
 ---
 
@@ -258,7 +279,7 @@ injection target with `faketimectl`. The inject tests use an in-binary helper in
 
 ---
 
-### Packages added in phases 7–18
+### Packages added in phases 7–37
 
 | Package | Phase | Summary |
 |---------|-------|---------|
@@ -266,27 +287,132 @@ injection target with `faketimectl`. The inject tests use an in-binary helper in
 | `pkg/agentclient` | 7 | gRPC connection pool (`Pool`) satisfying `AgentPool` interface |
 | `pkg/k8sresolve` | 7 | Container ID → PID resolution by scanning `/proc/*/cgroup` |
 | `pkg/api` | 8 | Shared HTTP request/response types (no build tag) |
-| `pkg/sdk` | 10 | Go client library; `Client`, `Timeshift`, `WithTimeT`, `ListTimeshifts` |
+| `pkg/sdk` | 10 | Go client library; `Client`, `Timeshift`, `WithTimeT`, `ListTimeshifts`, `AdvanceTimeshift`, freeze helpers |
+| `pkg/localtime` | 25 | Non-Kubernetes injection: `Start`, `StartFrozen`, `Attach`, `AttachFrozen`, `Handle`, `Session` |
 | `cmd/agent` | 7 | gRPC daemon: CRI→PID, inject, SetTime, Reset, handle map |
-| `cmd/controller` | 8 | HTTP+JSON API: timeshifts CRUD, TTL sweeper, pod watcher |
+| `cmd/controller` | 8 | HTTP+JSON API: timeshifts CRUD, TTL sweeper, pod watcher, advance-by-duration |
 | `deploy/` | 9 | `rbac.yaml`, `daemonset.yaml`, `controller-deployment.yaml` |
 | `e2e/` | 15 | `//go:build e2e` end-to-end test (`TestTimeshiftDate`) |
 | metrics wiring | 19 | `cmd/controller/metrics.go`: Prometheus registry, 5 metrics; `/metrics` route via `promhttp`; per-route `track` middleware |
 
 ---
 
+### `pkg/localtime`
+
+**File**: `pkg/localtime/localtime.go` — `//go:build linux`
+
+Wraps `pkg/inject` for use in Go tests and CLI tooling without a Kubernetes cluster or
+agent daemon.
+
+#### `Handle` — single-process injection
+
+```go
+// Constructors — FollowChild path (no elevated perms, child must Ptrace: true):
+func Start(cmd *exec.Cmd, target time.Time) (*Handle, error)       // advancing
+func StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error) // frozen
+
+// Constructors — PTRACE_ATTACH path (CAP_SYS_PTRACE + ptrace_scope ≤ 1):
+func Attach(pid int, target time.Time) (*Handle, error)
+func AttachFrozen(pid int, target time.Time) (*Handle, error)
+
+// Update methods (all use process_vm_writev — no ptrace stop):
+func (h *Handle) SetTime(target time.Time) error   // switch to advancing mode
+func (h *Handle) Freeze(target time.Time) error    // switch to frozen mode
+func (h *Handle) Advance(d time.Duration) error    // shift by delta, preserve mode
+func (h *Handle) Reset() error                      // snap back to real clock
+```
+
+`Handle` tracks its own `offset`/`frozenAt`/`frozen` state (under a `sync.Mutex`) so
+`effectiveTime()` can report the live fake time without re-reading process memory.
+
+#### `Session` — multi-process injection
+
+```go
+func NewSession(target time.Time) *Session
+
+func (s *Session) Start(cmd *exec.Cmd) error      // add process, respects current mode
+func (s *Session) Attach(pid int) error            // add already-running process
+
+func (s *Session) SetTime(target time.Time) error  // update all handles concurrently
+func (s *Session) Freeze(target time.Time) error   // freeze all handles concurrently
+func (s *Session) Advance(d time.Duration) error   // shift all handles concurrently
+func (s *Session) Reset() error
+func (s *Session) Len() int
+```
+
+`Session.Start` / `Session.Attach` inject new processes at `effectiveTarget()` (the live
+computed time), not at the original target, so processes added later see the correct time.
+`applyAll` fans out `fn` to all handles concurrently, collects errors with `errors.Join`,
+and only commits the new state via `updateState()` if all handles succeed.
+
+---
+
+### `pkg/sdk` — key additions in phases 34–37
+
+```go
+// Freeze mode:
+func (c *Client) CreateFrozenTimeshift(ctx, ns, labelSelector string, target time.Time, ttl time.Duration) (*Timeshift, error)
+func (c *Client) FreezeTimeshift(ctx, id string, target time.Time) (*Timeshift, error)
+
+// Advance by duration:
+func (c *Client) AdvanceTimeshift(ctx, id string, d time.Duration) (*Timeshift, error)
+
+// Test helpers:
+func WithFrozenTime(t *testing.T, labelSelector string, target time.Time, fn func())
+```
+
+`Timeshift.Time` is now the **live effective time** — for advancing timeshifts it grows
+every time `GetTimeshift` is called; for frozen timeshifts it is constant.
+
+### Controller internals — offset model (phase 36)
+
+The `timeshift` struct stores:
+- `offset time.Duration` — for advancing mode: `offset = target - now` at creation; `effectiveTime() = time.Now() + offset`
+- `frozenAt time.Time` — for frozen mode: constant absolute timestamp
+- `frozen bool` — which field is active
+
+Stored to ConfigMap (`cmd/controller/store.go`) as:
+- `Offset int64` (nanoseconds)
+- `FrozenAt time.Time`
+
+`advanceTimeshift(ctx, id, delta, freeze)` adds `delta` to the current effective time and
+calls `updateTimeshift`, which then calls `SetTime` (or `Inject` with freeze) on all agent handles.
+
+`PATCH /timeshifts/{id}` accepts either `time` (absolute RFC3339) or `duration` (Go
+duration string) but not both. The watcher (`watcher.go`) recomputes `effectiveTarget()`
+when re-injecting pods that restart, so newly added processes always see the current
+offset-based time.
+
+### Proto — `freeze` field (phase 37)
+
+`proto/agent/v1/agent.proto` has `bool freeze = 3` on both `InjectRequest` and
+`SetTimeRequest`. The freeze flag is no longer in gRPC metadata; it is a proper proto
+field. The generated `pkg/agentpb/agent.pb.go` has `Freeze bool` with
+`protobuf:"varint,3,opt,name=freeze,proto3"` and a `GetFreeze() bool` getter on both
+message types.
+
+The proto was regenerated using `bufbuild/buf` Docker image with `buf.gen.yaml` and
+`buf.yaml` (kept in repo for future re-generation).
+
+---
+
 ## Decisions and constraints to carry forward
 
-### Time is always an absolute timestamp, never an offset
+### Time is always an absolute timestamp on the wire
 
-From the user's perspective and all APIs above `pkg/inject`, the only meaningful value is
-"set this process's clock to `2030-01-01T00:00:00Z`." The conversion to an internal
-`(offsetSec, offsetNsec)` pair happens at the last possible moment, inside `inject.go`,
-right before the write. This minimises drift from the `time.Now()` used as the subtraction
-base. **The offset must never appear in any API surface above `pkg/inject`.**
+All external APIs (HTTP, gRPC, CLI) use absolute RFC3339 timestamps, not raw offsets.
+The `duration`-based advance path in `PATCH /timeshifts/{id}` is the one exception: the
+client sends a relative duration, but the controller converts it to an absolute target
+before forwarding to the agent; the agent still receives an absolute `google.protobuf.Timestamp`.
 
-This applies to the agent and controller APIs in phases 7–8: the wire format should carry
-an absolute `time` (RFC3339 or Unix nanoseconds), not a duration.
+Internally, the controller stores a `time.Duration offset = target - now` (advancing mode)
+or `time.Time frozenAt` (frozen mode) rather than the absolute target, so that
+`GET /timeshifts/{id}` returns the live effective time (`time.Now() + offset`) instead of
+a stale snapshot.
+
+The agent is the last hop before the memory write. Converting `target - time.Now()` there
+gives the most accurate offset; network latency at the controller is not included.
+`inject.InjectAtTime` and `(*Handle).SetTime` both call `time.Now()` internally.
 
 ### The agent, not the controller, does the time-to-offset conversion
 
@@ -564,12 +690,14 @@ self-contained.
 
 ---
 
-## File tree as of phase 18
+## File tree as of phase 37
 
 ```
 epochd/
 ├── go.mod                                     # module epochd, go 1.26.4
 ├── go.sum
+├── buf.gen.yaml                               # bufbuild/buf remote plugin config (proto regen)
+├── buf.yaml                                   # bufbuild/buf module config (proto regen)
 ├── plan.md                                    # original rollout plan (phases 0–19)
 ├── README.md                                  # user-facing docs
 ├── CONTEXT.md                                 # this file
@@ -584,15 +712,19 @@ epochd/
 │   └── workflows/ci.yml                       # test + lint + build-images jobs
 │
 ├── cmd/
-│   ├── faketimectl/main.go                    # ✅ CLI: --pid, --set-time, --reset
-│   ├── agent/main.go                          # ✅ gRPC daemon: Inject/SetTime/Reset + handle map
+│   ├── faketimectl/
+│   │   ├── main.go                            # ✅ subcommand dispatch + usage
+│   │   ├── cmds_controller.go                 # ✅ create/list/get/update/advance/delete/status/resolve
+│   │   └── cmds_inject.go                     # ✅ inject/reset (local ptrace, linux-only)
+│   ├── agent/main.go                          # ✅ gRPC daemon: Inject/SetTime/Reset + handle map; freeze via req.Freeze field
 │   └── controller/
 │       ├── main.go                            # ✅ flags, k8s client, agent pool, HTTP server
-│       ├── controller.go                      # ✅ timeshift registry, CRUD, sweeper, re-injection, metric increments
-│       ├── metrics.go                         # ✅ Prometheus registry + 5 metrics (gauge, counters)
-│       ├── handlers.go                        # ✅ HTTP routes (/timeshifts, /healthz, /metrics), track middleware
-│       ├── watcher.go                         # ✅ SharedInformer pod watcher (phase 18b)
-│       └── controller_test.go                 # ✅ unit tests for all controller logic
+│       ├── controller.go                      # ✅ timeshift registry (offset model), CRUD, advance, sweeper
+│       ├── store.go                           # ✅ ConfigMap persistence; stores Offset (int64 ns) + FrozenAt
+│       ├── handlers.go                        # ✅ HTTP routes; PATCH accepts time or duration (mutually exclusive)
+│       ├── metrics.go                         # ✅ Prometheus registry + 5 metrics
+│       ├── watcher.go                         # ✅ SharedInformer pod watcher; recomputes effectiveTarget() on re-inject
+│       └── controller_test.go                 # ✅ unit tests including TestHTTPAdvanceTimeshift
 │
 ├── pkg/
 │   ├── vdso/
@@ -602,30 +734,32 @@ epochd/
 │   │   ├── procmem.go                         # ✅ Tracer, ReadMem, WriteMem, PokeText, FollowChild
 │   │   └── procmem_test.go                    # ✅ TestTracerBasic
 │   ├── trampoline/
-│   │   ├── trampoline.asm                     # ✅ NASM source (118 bytes)
+│   │   ├── trampoline.asm                     # ✅ NASM source (118 bytes); MaskEnabled=1, MaskFrozen=3
 │   │   ├── trampoline.bin                     # ✅ assembled binary (committed)
-│   │   ├── trampoline.go                      # ✅ Payload, StateOffset=86, EncodeState, DecodeState
+│   │   ├── trampoline.go                      # ✅ Payload, StateOffset=86, EncodeState, DecodeState, MaskEnabled, MaskFrozen
 │   │   └── trampoline_test.go                 # ✅ regression + round-trip tests
 │   ├── inject/
-│   │   ├── inject.go                          # ✅ InjectAtTime, SetTime, injectWithTracer, remoteMmap
-│   │   ├── inject_test.go                     # ✅ TestRemoteMmap, TestInjectMechanics, TestInjectObserved*
-│   │   └── roundtrip_test.go                  # ✅ TestInjectRoundTrip* (inject+verify+reset+verify)
-│   ├── agentpb/                               # ✅ generated from proto/agent/v1/agent.proto
+│   │   ├── inject.go                          # ✅ InjectAtTime, InjectFrozen, InjectAtTimeFollowChild, InjectFrozenFollowChild, SetTime, Freeze
+│   │   ├── inject_test.go                     # ✅ TestRemoteMmap, TestInjectMechanics (uses writeState + MaskEnabled), TestInjectObserved*
+│   │   └── roundtrip_test.go                  # ✅ TestInjectRoundTrip* (inject+verify+reset+verify; uses MaskEnabled)
+│   ├── localtime/
+│   │   └── localtime.go                       # ✅ Start, StartFrozen, Attach, AttachFrozen, Handle (Advance/Freeze/SetTime/Reset), Session
+│   ├── agentpb/                               # ✅ generated from proto/agent/v1/agent.proto (freeze=field 3)
 │   │   └── agent_grpc.pb.go, agent.pb.go
 │   ├── agentclient/
-│   │   └── agentclient.go                     # ✅ Pool: per-node gRPC connections, Inject/SetTime/Reset
+│   │   └── agentclient.go                     # ✅ Pool: per-node gRPC connections; freeze via req.Freeze field (not metadata)
 │   ├── k8sresolve/
 │   │   └── k8sresolve.go                      # ✅ LookupPID: container ID → PID via /proc/*/cgroup
 │   ├── api/
-│   │   └── api.go                             # ✅ HTTP request/response types (no build tag)
+│   │   └── api.go                             # ✅ UpdateTimeshiftRequest has Time, Duration, Freeze fields (no build tag)
 │   └── sdk/
-│       ├── sdk.go                             # ✅ Client, Timeshift, CreateTimeshift, ListTimeshifts, …
-│       ├── testing.go                         # ✅ WithTimeT (isolated testing import)
+│       ├── sdk.go                             # ✅ CreateTimeshift, CreateFrozenTimeshift, FreezeTimeshift, AdvanceTimeshift, …
+│       ├── testing.go                         # ✅ WithTime, WithFrozenTime
 │       └── sdk_test.go                        # ✅ fake-server tests
 │
 ├── proto/
 │   └── agent/v1/
-│       └── agent.proto                        # ✅ Inject/SetTime/Reset RPCs
+│       └── agent.proto                        # ✅ InjectRequest + SetTimeRequest both have bool freeze = 3
 │
 ├── test/
 │   └── targets/

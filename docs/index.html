@@ -351,6 +351,10 @@ tr:last-child td { border-bottom: none; }
   <a href="#k8s-usage">Using the SDK</a>
   <a href="#k8s-api">HTTP API reference</a>
 
+  <div class="nav-section-label">Clock modes</div>
+  <a href="#freeze-mode">Freeze mode</a>
+  <a href="#advance-by-duration">Advance by duration</a>
+
   <div class="nav-section-label">Go tests (no cluster)</div>
   <a href="#local-overview">Overview</a>
   <a href="#local-quickstart">Quickstart</a>
@@ -377,7 +381,7 @@ tr:last-child td { border-bottom: none; }
 <section id="overview">
 <div class="hero">
   <h1>epochd</h1>
-  <p class="lead">Inject a fake wall-clock time into any running Linux process — without restarting it, modifying its binary, or stopping it for more than a millisecond. Purpose-built for testing time-sensitive behaviour in Kubernetes pods and Go programs.</p>
+  <p class="lead">Inject a fake wall-clock time into any running Linux process — without restarting it, modifying its binary, or stopping it for more than a millisecond. Supports both <strong>advancing</strong> mode (clock shifts by a fixed offset and keeps ticking) and <strong>freeze</strong> mode (clock is pinned to an exact instant). Purpose-built for testing time-sensitive behaviour in Kubernetes pods and Go programs.</p>
 
   <div class="badges">
     <img src="https://github.com/bkaznowski/epochd/actions/workflows/ci.yml/badge.svg" alt="CI status">
@@ -451,12 +455,18 @@ tr:last-child td { border-bottom: none; }
   │    add offset to timespec
   │    return 0
   └─ state struct (32 bytes, at byte offset 86)
-       offsetSec    int64  ← updated by SetTime()
-       offsetNsec   int64
-       enabledMask  uint64 (bit 0 = CLOCK_REALTIME)
+       offsetSec    int64  ← in advancing mode: offset from real time
+       offsetNsec   int64     in frozen mode: absolute frozen timestamp
+       enabledMask  uint64 (1 = advancing, 3 = frozen)
        generation   uint32 (bumped on each update)</div>
 
-<p>Updating the fake time after the initial injection only requires writing 32 bytes into the state struct using <code>process_vm_writev</code>. No ptrace stop. No signal. The target process continues running, and its <code>clock_gettime</code> calls immediately return the new time.</p>
+<p>Updating the fake time requires writing 32 bytes into the state struct using <code>process_vm_writev</code>. No ptrace stop. No signal. The target process continues running.</p>
+
+<p>Two clock modes are controlled via <code>enabledMask</code>:</p>
+<ul>
+  <li><strong>Advancing</strong> (<code>enabledMask = 1</code>) — the trampoline adds <code>(offsetSec, offsetNsec)</code> to the real time returned by the syscall. The clock ticks forward at the normal rate, shifted by the injected offset.</li>
+  <li><strong>Frozen</strong> (<code>enabledMask = 3</code>) — the trampoline ignores the real syscall result and returns the absolute timestamp stored in the offset fields. The clock does not advance.</li>
+</ul>
 
 <h3>The injection sequence</h3>
 <p>The one-time setup (on first <code>InjectAtTime</code> or <code>Start</code> call) involves three brief ptrace stops:</p>
@@ -619,7 +629,7 @@ docker push my-registry/epochd-controller:v1</code></pre>
 <pre><code class="language-go">client := sdk.NewClient(os.Getenv("EPOCHD_URL"))
 ctx := context.Background()
 
-// Create a timeshift targeting two years in the future, expiring in 1 hour.
+// Create an advancing timeshift — clock shifts forward 2 years and keeps ticking.
 ts, err := client.CreateTimeshift(ctx, "default", "app=payment-service",
     time.Now().Add(2*365*24*time.Hour), time.Hour)
 if err != nil {
@@ -627,14 +637,46 @@ if err != nil {
 }
 fmt.Printf("timeshift %s applied to: %v\n", ts.ID, ts.AppliedTo)
 
-// Advance time further.
-ts, err = client.UpdateTimeshift(ctx, ts.ID, time.Now().Add(3*365*24*time.Hour))
+// Advance time further by one day.
+ts, err = client.AdvanceTimeshift(ctx, ts.ID, 24*time.Hour)
 
-// Move time backwards.
-ts, err = client.UpdateTimeshift(ctx, ts.ID, time.Now().Add(24*time.Hour))
+// Move time to a specific absolute point.
+ts, err = client.UpdateTimeshift(ctx, ts.ID, time.Now().Add(3*365*24*time.Hour))
 
 // Clean up (resets all injected processes to real time).
 _ = client.DeleteTimeshift(ctx, ts.ID)</code></pre>
+
+<h3>Freeze mode</h3>
+<p>In freeze mode the clock is pinned to a specific instant. Every <code>clock_gettime</code> call in the target returns exactly that time, regardless of how much real time passes.</p>
+<pre><code class="language-go">frozenAt := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// Create a frozen timeshift — clock never advances.
+ts, err := client.CreateFrozenTimeshift(ctx, "default", "app=web",
+    frozenAt, time.Hour)
+
+// Switch an existing timeshift to frozen mode at a new instant.
+ts, err = client.FreezeTimeshift(ctx, ts.ID,
+    time.Date(2030, 6, 1, 0, 0, 0, 0, time.UTC))
+
+// Advance a frozen clock by one day (clock stays frozen at the new instant).
+ts, err = client.AdvanceTimeshift(ctx, ts.ID, 24*time.Hour)
+
+// Switch back to advancing mode.
+ts, err = client.UpdateTimeshift(ctx, ts.ID, time.Now().Add(365*24*time.Hour))</code></pre>
+
+<h3>WithFrozenTime — frozen test helper</h3>
+<pre><code class="language-go">func TestCertificatePinnedAt(t *testing.T) {
+    client := sdk.NewClient(os.Getenv("EPOCHD_URL"))
+    frozenAt := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+    sdk.WithFrozenTime(t, client, "default", "app=my-service",
+        frozenAt, 30*time.Minute,
+        func(t *testing.T, ts *sdk.Timeshift) {
+            // Every call to time.Now() in target pods returns exactly frozenAt.
+            // ts.Time == frozenAt (constant; does not grow).
+        },
+    )
+}</code></pre>
 
 <h3>Preview which pods will be affected (dry run)</h3>
 <p>Use <code>Resolve</code> to see which pods and containers match a selector before creating a timeshift:</p>
@@ -683,14 +725,16 @@ for _, c := range status.Containers {
   "namespace": "default",
   "labelSelector": "app=my-service",
   "time": "2030-01-01T00:00:00Z",
-  "ttl": "1h"           // optional; omit for no expiry
+  "ttl": "1h",          // optional; omit for no expiry
+  "freeze": false        // optional; true = pin clock at exactly "time"
 }
 // Response 201
 {
   "id": "b3f5c2d1-...",
   "namespace": "default",
   "labelSelector": "app=my-service",
-  "time": "2030-01-01T00:00:00Z",
+  "time": "2030-01-01T00:00:04Z",  // live effective time (advancing: grows each second)
+  "frozen": false,
   "expiresAt": "2026-06-21T11:00:00Z",
   "appliedTo": ["pod/my-service-abc/app", "pod/my-service-def/app"]
 }</code></pre>
@@ -716,7 +760,7 @@ for _, c := range status.Containers {
     <span class="endpoint-desc">Get a timeshift by ID</span>
   </div>
   <div class="endpoint-body">
-    <p>Returns <code>404</code> if the timeshift does not exist or has expired.</p>
+    <p>Returns <code>404</code> if the timeshift does not exist or has expired. The <code>time</code> field reflects the <strong>live effective time</strong> — for advancing timeshifts it grows every second; for frozen timeshifts it is constant.</p>
   </div>
 </div>
 
@@ -724,12 +768,19 @@ for _, c := range status.Containers {
   <div class="endpoint-header">
     <span class="method patch">PATCH</span>
     <span class="endpoint-path">/timeshifts/{id}</span>
-    <span class="endpoint-desc">Update the target time</span>
+    <span class="endpoint-desc">Update the target time or advance by a duration</span>
   </div>
   <div class="endpoint-body">
-    <pre><code class="language-json">// Request
-{ "time": "2035-06-01T00:00:00Z" }
+    <p>Provide exactly one of <code>time</code> (absolute RFC3339) or <code>duration</code> (Go duration string). Both fields together return <code>400</code>.</p>
+    <pre><code class="language-json">// Absolute update — move clock to a specific instant
+{ "time": "2035-06-01T00:00:00Z", "freeze": false }
+
+// Relative update — shift forward (or backward) by a duration
+{ "duration": "24h" }      // advance by one day
+{ "duration": "-1h30m" }   // rewind by 90 minutes
+
 // Response 200 — updated timeshift object</code></pre>
+    <p>The <code>freeze</code> field is optional and only meaningful with <code>time</code>. When using <code>duration</code>, the current mode (advancing or frozen) is preserved.</p>
   </div>
 </div>
 
@@ -818,6 +869,120 @@ for _, c := range status.Containers {
     </ul>
   </div>
 </div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="freeze-mode">Freeze mode</h2>
+
+<p>In <strong>freeze mode</strong> the target's clock is pinned to a specific instant. Every call to <code>clock_gettime(CLOCK_REALTIME, ...)</code> returns exactly that timestamp regardless of how much real time passes. The trampoline uses <code>enabledMask = 3</code> (<code>MaskFrozen</code>) and stores the absolute frozen timestamp in the offset fields.</p>
+
+<p>Freeze mode is useful for:</p>
+<ul>
+  <li>Reproducing time-sensitive bugs that only trigger at a specific instant.</li>
+  <li>Tests where the exact timestamp must match — e.g. certificate expiry checks where the serial number or expiry string is part of the assertion.</li>
+  <li>Pausing time during complex setup, then advancing by discrete steps.</li>
+</ul>
+
+<div class="compare">
+  <div class="compare-card">
+    <h3>Advancing mode</h3>
+    <ul>
+      <li>Clock runs at normal speed</li>
+      <li>Fake time = real time + fixed offset</li>
+      <li>Offset computed at injection time: <code>target − now</code></li>
+      <li>GET response <code>time</code> field grows every second</li>
+      <li>Created with <code>freeze: false</code> (the default)</li>
+    </ul>
+  </div>
+  <div class="compare-card">
+    <h3>Frozen mode</h3>
+    <ul>
+      <li>Clock is completely stopped</li>
+      <li>Fake time = constant pinned instant</li>
+      <li>GET response <code>time</code> field is always the same value</li>
+      <li>Created with <code>freeze: true</code></li>
+      <li>Can be unfrozen via <code>PATCH</code> with <code>"freeze": false</code></li>
+    </ul>
+  </div>
+</div>
+
+<h3>Freeze via HTTP API</h3>
+<pre><code class="language-bash">curl -X POST http://localhost:8080/timeshifts \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace":"default","labelSelector":"app=web",
+       "time":"2030-01-01T00:00:00Z","freeze":true}'
+
+# Later — unfreeze and resume advancing from a new point:
+curl -X PATCH http://localhost:8080/timeshifts/&lt;id&gt; \
+  -H 'Content-Type: application/json' \
+  -d '{"time":"2030-06-01T00:00:00Z","freeze":false}'</code></pre>
+
+<h3>Freeze via CLI</h3>
+<pre><code class="language-bash">faketimectl create --namespace=default --selector=app=web \
+  --time=2030-01-01T00:00:00Z --freeze
+# created timeshift a1b2c3d4-...
+#   time:   2030-01-01T00:00:00Z
+#   frozen: yes
+
+# Unfreeze and move to a new time:
+faketimectl update a1b2c3d4-... --time=2030-06-01T00:00:00Z</code></pre>
+
+<h3>Freeze via pkg/localtime</h3>
+<pre><code class="language-go">frozen := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// Start a child process with its clock frozen.
+h, err := localtime.StartFrozen(cmd, frozen)
+if err != nil { t.Fatal(err) }
+defer h.Reset()
+
+// Advance the frozen clock by one day (still frozen at the new instant).
+h.Advance(24 * time.Hour)
+
+// Switch to advancing mode from a new base.
+h.SetTime(time.Now().Add(365 * 24 * time.Hour))</code></pre>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="advance-by-duration">Advance by duration</h2>
+
+<p>Instead of specifying an absolute target time, you can shift the current fake time by a relative amount. This works in both advancing and frozen modes and preserves the current mode.</p>
+
+<div class="callout info">
+  <span class="callout-icon">💡</span>
+  <div class="callout-body">
+    <p>Use <code>duration</code> when you want to step through time in a test scenario without having to compute absolute timestamps at each step. For example: create a timeshift at now+1 year, then advance by 30 days, then advance by 6 months — each step is relative to where the clock currently is.</p>
+  </div>
+</div>
+
+<h3>Advance via HTTP API</h3>
+<pre><code class="language-bash"># Advance by 24 hours:
+curl -X PATCH http://localhost:8080/timeshifts/&lt;id&gt; \
+  -H 'Content-Type: application/json' \
+  -d '{"duration":"24h"}'
+
+# Rewind by 90 minutes:
+curl -X PATCH http://localhost:8080/timeshifts/&lt;id&gt; \
+  -H 'Content-Type: application/json' \
+  -d '{"duration":"-1h30m"}'</code></pre>
+
+<p>Accepted Go duration strings: <code>"30s"</code>, <code>"5m"</code>, <code>"24h"</code>, <code>"72h"</code>, <code>"-1h"</code>, <code>"8760h"</code> (one year). Providing both <code>time</code> and <code>duration</code> in the same request returns <code>400 Bad Request</code>.</p>
+
+<h3>Advance via CLI</h3>
+<pre><code class="language-bash">faketimectl advance &lt;id&gt; --by=24h      # forward one day
+faketimectl advance &lt;id&gt; --by=-1h      # rewind one hour
+faketimectl advance &lt;id&gt; --by=8760h    # forward one year</code></pre>
+
+<h3>Advance via Go SDK</h3>
+<pre><code class="language-go">// Shift forward by one day.
+ts, err := client.AdvanceTimeshift(ctx, ts.ID, 24*time.Hour)
+
+// Rewind by 90 minutes.
+ts, err = client.AdvanceTimeshift(ctx, ts.ID, -90*time.Minute)</code></pre>
+
+<h3>Advance via pkg/localtime</h3>
+<pre><code class="language-go">// Single process:
+h.Advance(24 * time.Hour)
+
+// All processes in a session simultaneously:
+s.Advance(24 * time.Hour)</code></pre>
 
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <h2 id="local-overview">Go tests (no cluster) — overview</h2>
@@ -941,15 +1106,31 @@ for _, c := range status.Containers {
   <tbody>
     <tr>
       <td><code>Start(cmd *exec.Cmd, target time.Time) (*Handle, error)</code></td>
-      <td>Sets <code>cmd.SysProcAttr.Ptrace = true</code>, calls <code>cmd.Start()</code>, injects fake time using the FollowChild path (no elevated permissions required). Do not call <code>cmd.Start()</code> yourself.</td>
+      <td>Starts <code>cmd</code> in advancing mode. Sets <code>cmd.SysProcAttr.Ptrace = true</code>, calls <code>cmd.Start()</code>, injects via FollowChild (no elevated permissions required). Do not call <code>cmd.Start()</code> yourself.</td>
+    </tr>
+    <tr>
+      <td><code>StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error)</code></td>
+      <td>Starts <code>cmd</code> with its clock frozen at <code>target</code>. Every <code>clock_gettime</code> call in the child returns exactly <code>target</code> until <code>SetTime</code> or <code>Freeze</code> is called.</td>
     </tr>
     <tr>
       <td><code>Attach(pid int, target time.Time) (*Handle, error)</code></td>
-      <td>Injects into an already-running process using <code>PTRACE_ATTACH</code>. Requires <code>CAP_SYS_PTRACE</code> and <code>/proc/sys/kernel/yama/ptrace_scope ≤ 1</code>.</td>
+      <td>Injects into an already-running process in advancing mode using <code>PTRACE_ATTACH</code>. Requires <code>CAP_SYS_PTRACE</code> and <code>ptrace_scope ≤ 1</code>.</td>
+    </tr>
+    <tr>
+      <td><code>AttachFrozen(pid int, target time.Time) (*Handle, error)</code></td>
+      <td>Injects into an already-running process with the clock frozen at <code>target</code>. Requires <code>CAP_SYS_PTRACE</code> and <code>ptrace_scope ≤ 1</code>.</td>
     </tr>
     <tr>
       <td><code>h.SetTime(target time.Time) error</code></td>
-      <td>Updates the fake time without stopping the process (<code>process_vm_writev</code> only, ~1 µs).</td>
+      <td>Switches to advancing mode and sets the fake time. Uses <code>process_vm_writev</code> only (~1 µs, no ptrace stop).</td>
+    </tr>
+    <tr>
+      <td><code>h.Freeze(target time.Time) error</code></td>
+      <td>Switches to frozen mode and pins the clock at <code>target</code>. Uses <code>process_vm_writev</code> only.</td>
+    </tr>
+    <tr>
+      <td><code>h.Advance(d time.Duration) error</code></td>
+      <td>Shifts the current fake time by <code>d</code> (may be negative to rewind). Preserves the current mode — advancing handles stay advancing; frozen handles stay frozen at the new instant.</td>
     </tr>
     <tr>
       <td><code>h.Reset() error</code></td>
@@ -981,10 +1162,12 @@ if err := s.Reset(); err != nil { ... }</code></pre>
 <table>
   <thead><tr><th>Method</th><th>Description</th></tr></thead>
   <tbody>
-    <tr><td><code>NewSession(target time.Time) *Session</code></td><td>Creates an empty session with the given initial target.</td></tr>
-    <tr><td><code>s.Start(cmd *exec.Cmd) error</code></td><td>Starts the command and adds its handle to the session.</td></tr>
-    <tr><td><code>s.Attach(pid int) error</code></td><td>Attaches to a running process and adds it to the session.</td></tr>
-    <tr><td><code>s.SetTime(target time.Time) error</code></td><td>Updates all handles concurrently. Errors from individual handles are joined.</td></tr>
+    <tr><td><code>NewSession(target time.Time) *Session</code></td><td>Creates an empty session in advancing mode with the given initial target.</td></tr>
+    <tr><td><code>s.Start(cmd *exec.Cmd) error</code></td><td>Starts the command and adds its handle to the session. Respects the session's current mode (advancing or frozen).</td></tr>
+    <tr><td><code>s.Attach(pid int) error</code></td><td>Attaches to a running process and adds it to the session. Respects the session's current mode.</td></tr>
+    <tr><td><code>s.SetTime(target time.Time) error</code></td><td>Switches all handles to advancing mode and updates the time concurrently. Errors from individual handles are joined.</td></tr>
+    <tr><td><code>s.Freeze(target time.Time) error</code></td><td>Switches all handles to frozen mode at <code>target</code> concurrently.</td></tr>
+    <tr><td><code>s.Advance(d time.Duration) error</code></td><td>Shifts all handles by <code>d</code> concurrently, preserving the current mode.</td></tr>
     <tr><td><code>s.Reset() error</code></td><td>Resets all processes to real time.</td></tr>
     <tr><td><code>s.Len() int</code></td><td>Returns the number of handles in the session.</td></tr>
   </tbody>
@@ -1055,13 +1238,13 @@ export EPOCHD_URL=http://localhost:8080</code></pre>
   <tbody>
     <tr>
       <td><code>create</code></td>
-      <td><code>--namespace=NS --selector=SEL --time=RFC3339 [--ttl=DURATION]</code></td>
-      <td>Create a timeshift for all pods matching the selector.</td>
+      <td><code>--namespace=NS --selector=SEL --time=RFC3339 [--ttl=DURATION] [--freeze]</code></td>
+      <td>Create a timeshift. <code>--freeze</code> pins the clock at <code>--time</code> so it never advances.</td>
     </tr>
     <tr>
       <td><code>list</code></td>
       <td>—</td>
-      <td>List all active timeshifts.</td>
+      <td>List all active timeshifts. The <code>TIME</code> column shows the live effective time.</td>
     </tr>
     <tr>
       <td><code>get &lt;id&gt;</code></td>
@@ -1070,8 +1253,13 @@ export EPOCHD_URL=http://localhost:8080</code></pre>
     </tr>
     <tr>
       <td><code>update &lt;id&gt;</code></td>
-      <td><code>--time=RFC3339</code></td>
-      <td>Move the target clock to a new time.</td>
+      <td><code>--time=RFC3339 [--freeze]</code></td>
+      <td>Move the clock to a new absolute time. <code>--freeze</code> toggles freeze mode.</td>
+    </tr>
+    <tr>
+      <td><code>advance &lt;id&gt;</code></td>
+      <td><code>--by=DURATION</code></td>
+      <td>Shift the clock forward (or backward) by a Go duration, e.g. <code>--by=24h</code> or <code>--by=-1h</code>. Preserves the current mode.</td>
     </tr>
     <tr>
       <td><code>delete &lt;id&gt;</code></td>
@@ -1098,14 +1286,26 @@ export EPOCHD_URL=http://localhost:8080</code></pre>
 # Preview which pods would be targeted
 faketimectl resolve --namespace=default --selector=app=my-service
 
-# Create a timeshift (1 hour TTL)
+# Create an advancing timeshift (1 hour TTL)
 faketimectl create --namespace=default --selector=app=my-service \
   --time=2030-01-01T00:00:00Z --ttl=1h
 # created timeshift b3f5c2d1-...
 #   namespace:  default
-#   time:       2030-01-01T00:00:00Z
+#   time:       2030-01-01T00:00:04Z    ← live effective time, ticking
+#   frozen:     no
 #   expires at: 2030-01-01T01:00:00Z
 #   applied to: my-service-abc/app, my-service-def/app
+
+# Create a frozen timeshift
+faketimectl create --namespace=default --selector=app=my-service \
+  --time=2030-01-01T00:00:00Z --freeze
+# created timeshift c4e6f7a8-...
+#   time:    2030-01-01T00:00:00Z    ← constant; does not advance
+#   frozen:  yes
+
+# Advance by one day (preserves freeze mode)
+faketimectl advance c4e6f7a8-... --by=24h
+#   time:    2030-01-02T00:00:00Z    ← still frozen at the new point
 
 # List active timeshifts
 faketimectl list
@@ -1114,9 +1314,6 @@ faketimectl list
 faketimectl status b3f5c2d1-...
 # POD               CONTAINER  GENERATION  TARGET TIME           PID    ERROR
 # my-service-abc    app        0           2030-01-01T00:00:00Z  12345
-
-# Advance the clock
-faketimectl update b3f5c2d1-... --time=2035-06-01T00:00:00Z
 
 # Clean up — resets all pods to real time
 faketimectl delete b3f5c2d1-...</code></pre>
@@ -1130,8 +1327,8 @@ faketimectl delete b3f5c2d1-...</code></pre>
   <tbody>
     <tr>
       <td><code>inject</code></td>
-      <td><code>--pid=PID --time=RFC3339</code></td>
-      <td>Inject fake time into a running process.</td>
+      <td><code>--pid=PID --time=RFC3339 [--freeze]</code></td>
+      <td>Inject fake time into a running process. <code>--freeze</code> pins the clock so it never advances.</td>
     </tr>
     <tr>
       <td><code>reset</code></td>
@@ -1378,6 +1575,13 @@ if sdk.IsConflict(err) {
     log.Printf("conflict: %v", err)
     // list existing timeshifts to find the owner, or delete it first
 }</code></pre>
+
+<h3>What's the difference between freeze mode and advancing mode?</h3>
+<p>In <strong>advancing mode</strong> (the default), the trampoline adds a fixed offset to the real time returned by the syscall. The clock ticks forward at the normal rate — if you inject +2 years and check <code>time.Now()</code> one second later, you'll see a time that is 2 years and 1 second ahead.</p>
+<p>In <strong>freeze mode</strong>, the trampoline ignores the real syscall result entirely and returns a constant absolute timestamp. No matter how many seconds of real time pass, <code>time.Now()</code> in the target always returns exactly the frozen instant. Use freeze mode when the exact timestamp matters — for example, when testing a certificate whose serial number or expiry must match a specific value, or when you need full control over each time step in a test scenario.</p>
+
+<h3>Can I advance a frozen clock step by step?</h3>
+<p>Yes. Use <code>AdvanceTimeshift</code> (SDK), <code>faketimectl advance --by=...</code> (CLI), or <code>h.Advance(d)</code> (pkg/localtime). Each advance shifts the pinned instant by the given duration and the clock remains frozen at the new value. This is useful for simulating discrete time steps (e.g. "now advance by one billing cycle") without switching to advancing mode.</p>
 
 <h3>Is there a Helm chart?</h3>
 <p>Not yet. The <code>deploy/</code> directory contains raw Kubernetes manifests. A Helm chart is on the roadmap.</p>
