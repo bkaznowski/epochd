@@ -1,6 +1,6 @@
 //go:build linux
 
-package localtime
+package faketime
 
 import (
 	"bufio"
@@ -12,13 +12,13 @@ import (
 	"time"
 )
 
-const helperEnv = "EPOCHD_LOCALTIME_HELPER"
+const helperEnv = "EPOCHD_FAKETIME_HELPER"
 
-// TestLocaltimeHelper is the clock-printing child used by all localtime tests.
+// TestFaketimeHelper is the clock-printing child used by all faketime tests.
 // When run by the test framework helperEnv is unset and the test is skipped.
 // When spawned as a child process with helperEnv=1 it prints RFC3339Nano
 // timestamps every 100 ms until killed.
-func TestLocaltimeHelper(t *testing.T) {
+func TestFaketimeHelper(t *testing.T) {
 	if os.Getenv(helperEnv) != "1" {
 		t.Skip()
 	}
@@ -49,7 +49,7 @@ func TestStartSingleProcess(t *testing.T) {
 	const fakeOffset = 24 * time.Hour
 	target := time.Now().Add(fakeOffset)
 
-	cmd := exec.Command(exe, "-test.run=TestLocaltimeHelper", "-test.v")
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
 	cmd.Env = append(os.Environ(), helperEnv+"=1")
 	cmd.Stdout = pw
 
@@ -71,7 +71,7 @@ func TestStartSingleProcess(t *testing.T) {
 	t.Log("phase A: verifying +24h offset")
 	phaseA := 0
 	for sc.Scan() && phaseA < wantEach {
-		ts, ok := parseLocaltimeTimestamp(sc.Text())
+		ts, ok := parseFaketimeTimestamp(sc.Text())
 		if !ok {
 			continue
 		}
@@ -94,7 +94,7 @@ func TestStartSingleProcess(t *testing.T) {
 	}
 	phaseB := 0
 	for sc.Scan() && phaseB < wantEach {
-		ts, ok := parseLocaltimeTimestamp(sc.Text())
+		ts, ok := parseFaketimeTimestamp(sc.Text())
 		if !ok {
 			continue
 		}
@@ -132,7 +132,7 @@ func TestSessionTwoProcesses(t *testing.T) {
 		return pr, pw
 	}
 	newHelper := func(pw *os.File) *exec.Cmd {
-		cmd := exec.Command(exe, "-test.run=TestLocaltimeHelper", "-test.v")
+		cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
 		cmd.Env = append(os.Environ(), helperEnv+"=1")
 		cmd.Stdout = pw
 		return cmd
@@ -177,7 +177,7 @@ func TestSessionTwoProcesses(t *testing.T) {
 	readFirst := func(pr *os.File, label string) {
 		sc := bufio.NewScanner(pr)
 		for sc.Scan() {
-			ts, ok := parseLocaltimeTimestamp(sc.Text())
+			ts, ok := parseFaketimeTimestamp(sc.Text())
 			if !ok {
 				continue
 			}
@@ -205,7 +205,7 @@ func TestSessionTwoProcesses(t *testing.T) {
 	readAfterUpdate := func(pr *os.File, label string) {
 		sc := bufio.NewScanner(pr)
 		for sc.Scan() {
-			ts, ok := parseLocaltimeTimestamp(sc.Text())
+			ts, ok := parseFaketimeTimestamp(sc.Text())
 			if !ok {
 				continue
 			}
@@ -244,7 +244,7 @@ func TestWithSession(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			cmd := exec.Command(exe, "-test.run=TestLocaltimeHelper", "-test.v")
+			cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
 			cmd.Env = append(os.Environ(), helperEnv+"=1")
 			cmd.Stdout = pw
 			if err := s.Start(cmd); err != nil {
@@ -268,9 +268,9 @@ func TestWithSession(t *testing.T) {
 	}
 }
 
-// parseLocaltimeTimestamp trims and parses an RFC3339Nano line, returning
+// parseFaketimeTimestamp trims and parses an RFC3339Nano line, returning
 // (zero, false) for test-framework noise or unparseable lines.
-func parseLocaltimeTimestamp(line string) (time.Time, bool) {
+func parseFaketimeTimestamp(line string) (time.Time, bool) {
 	line = strings.TrimSpace(line)
 	if line == "" || strings.HasPrefix(line, "=== ") || strings.HasPrefix(line, "--- ") {
 		return time.Time{}, false

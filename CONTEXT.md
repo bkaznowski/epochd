@@ -288,7 +288,7 @@ injection target with `faketimectl`. The inject tests use an in-binary helper in
 | `pkg/k8sresolve` | 7 | Container ID → PID resolution by scanning `/proc/*/cgroup` |
 | `pkg/api` | 8 | Shared HTTP request/response types (no build tag) |
 | `pkg/sdk` | 10 | Go client library; `Client`, `Timeshift`, `WithTimeT`, `ListTimeshifts`, `AdvanceTimeshift`, freeze helpers |
-| `pkg/localtime` | 25 | Non-Kubernetes injection: `Start`, `StartFrozen`, `Attach`, `AttachFrozen`, `Handle`, `Session` |
+| `pkg/faketime` | 25 | Non-Kubernetes injection: `Start`, `StartFrozen`, `Attach`, `AttachFrozen`, `Handle`, `Session` |
 | `cmd/agent` | 7 | gRPC daemon: CRI→PID, inject, SetTime, Reset, handle map |
 | `cmd/controller` | 8 | HTTP+JSON API: timeshifts CRUD, TTL sweeper, pod watcher, advance-by-duration |
 | `deploy/` | 9 | `rbac.yaml`, `daemonset.yaml`, `controller-deployment.yaml` |
@@ -297,9 +297,11 @@ injection target with `faketimectl`. The inject tests use an in-binary helper in
 
 ---
 
-### `pkg/localtime`
+### `pkg/faketime`
 
-**File**: `pkg/localtime/localtime.go` — `//go:build linux`
+**Module**: `github.com/bkaznowski/faketime` (standalone `go.mod` at `pkg/faketime/go.mod`; `replace epochd => ../..` for local development)
+**Import**: `import "github.com/bkaznowski/faketime"` — `go get github.com/bkaznowski/faketime` for external consumers
+**File**: `pkg/faketime/faketime.go` — `//go:build linux`
 
 Wraps `pkg/inject` for use in Go tests and CLI tooling without a Kubernetes cluster or
 agent daemon.
@@ -742,8 +744,9 @@ epochd/
 │   │   ├── inject.go                          # ✅ InjectAtTime, InjectFrozen, InjectAtTimeFollowChild, InjectFrozenFollowChild, SetTime, Freeze
 │   │   ├── inject_test.go                     # ✅ TestRemoteMmap, TestInjectMechanics (uses writeState + MaskEnabled), TestInjectObserved*
 │   │   └── roundtrip_test.go                  # ✅ TestInjectRoundTrip* (inject+verify+reset+verify; uses MaskEnabled)
-│   ├── localtime/
-│   │   └── localtime.go                       # ✅ Start, StartFrozen, Attach, AttachFrozen, Handle (Advance/Freeze/SetTime/Reset), Session
+│   ├── faketime/                              # standalone module: github.com/bkaznowski/faketime
+│   │   ├── faketime.go                       # ✅ Start, StartFrozen, Attach, AttachFrozen, Handle (Advance/Freeze/SetTime/Reset), Session
+│   │   └── go.mod                            # module github.com/bkaznowski/faketime; replace epochd => ../..
 │   ├── agentpb/                               # ✅ generated from proto/agent/v1/agent.proto (freeze=field 3)
 │   │   └── agent_grpc.pb.go, agent.pb.go
 │   ├── agentclient/

@@ -123,7 +123,7 @@ epochd/
 │   ├── procmem/          # ptrace wrapper + process_vm_readv/writev
 │   ├── trampoline/       # Assembled payload bytes + state struct helpers
 │   ├── inject/           # Injection orchestration; public API
-│   ├── localtime/        # Non-Kubernetes injection (local processes, tests)
+│   ├── faketime/         # Non-Kubernetes injection (standalone module: github.com/bkaznowski/faketime)
 │   ├── agentpb/          # Generated gRPC types (agent.proto)
 │   ├── agentclient/      # gRPC connection pool (controller → agents)
 │   ├── k8sresolve/       # Container ID → PID resolution via /proc
@@ -564,21 +564,21 @@ sdk.WithFrozenTime(t, "app=web", frozenAt, func() {
 })
 ```
 
-### `pkg/localtime` — freeze mode (local processes)
+### `pkg/faketime` — freeze mode (local processes)
 
 ```go
 // Start a child process with its clock frozen at target.
-handle, err := localtime.StartFrozen(cmd, target)
+handle, err := faketime.StartFrozen(cmd, target)
 
 // Attach to an already-running process.
-handle, err = localtime.AttachFrozen(pid, target)
+handle, err = faketime.AttachFrozen(pid, target)
 
 // Freeze/unfreeze via the handle.
 handle.Freeze(newTarget)
 handle.SetTime(advancingTarget) // switches back to advancing mode
 
 // Session-level freeze.
-session := localtime.NewSession(target)
+session := faketime.NewSession(target)
 session.Freeze(target)
 session.Start(cmd) // new processes joined after Freeze() are also frozen
 ```
@@ -621,7 +621,7 @@ faketimectl advance <id> --by=-1h    # rewind by 1 hour
 ts, err := client.AdvanceTimeshift(ctx, ts.ID, 24*time.Hour)
 ```
 
-### `pkg/localtime` — advance (local processes)
+### `pkg/faketime` — advance (local processes)
 
 ```go
 // Advance a single-process handle by one day.
@@ -690,14 +690,14 @@ err = session.Advance(24 * time.Hour)
 | 21 | Graceful agent shutdown (SIGTERM drain) | ✅ |
 | 22 | Dry-run / resolve mode (`GET /resolve`) | ✅ |
 | 23 | Agent handle status RPC (`GetStatus`) | ✅ |
-| 25 | Local process injection (`pkg/localtime`, non-Kubernetes) | ✅ |
+| 25 | Local process injection (`pkg/faketime`, non-Kubernetes) | ✅ |
 | 26 | Conflict guard (reject overlapping timeshifts, `409 Conflict`) | ✅ |
 | 27 | `faketimectl` subcommand completeness (`update`, `status`) | ✅ |
 | 28 | Structured logging (`log/slog`, JSON output, `LOG_LEVEL`) | ✅ |
 | 29 | TTL expiry Kubernetes Events + `timeshift_expired_total` counter | ✅ |
 | 30 | Lease-based leader election (`coordination.k8s.io/Lease`) | 🔲 |
 | 31 | Validating webhook admission controller | 🔲 |
-| 32 | `pkg/localtime` Attach path (`CAP_SYS_PTRACE`) | 🔲 |
+| 32 | `pkg/faketime` Attach path (`CAP_SYS_PTRACE`) | 🔲 |
 | 33 | Integration test harness (`make test-integration`, kind) | ✅ |
 | 34 | Freeze mode (pin clock at fixed instant, `--freeze` / `MaskFrozen`) | ✅ |
 | 35 | Advance-by-duration (`PATCH duration`, `advance --by`, `AdvanceTimeshift`, `Handle.Advance`) | ✅ |

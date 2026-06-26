@@ -1,9 +1,9 @@
 //go:build linux
 
-// Package localtime injects fake time into local (non-Kubernetes) processes.
+// Package faketime injects fake time into local (non-Kubernetes) processes.
 // It wraps pkg/inject for use in Go tests and CLI tooling without requiring a
 // running Kubernetes cluster or agent daemon.
-package localtime
+package faketime
 
 import (
 	"errors"
@@ -54,13 +54,13 @@ func Start(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 	}
 	cmd.SysProcAttr.Ptrace = true
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("localtime: Start: %w", err)
+		return nil, fmt.Errorf("faketime: Start: %w", err)
 	}
 	h, err := inject.InjectAtTimeFollowChild(cmd.Process.Pid, target)
 	if err != nil {
 		cmd.Process.Kill() //nolint:errcheck
 		cmd.Wait()         //nolint:errcheck
-		return nil, fmt.Errorf("localtime: inject: %w", err)
+		return nil, fmt.Errorf("faketime: inject: %w", err)
 	}
 	return newAdvancingHandle(h, target), nil
 }
@@ -74,13 +74,13 @@ func StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 	}
 	cmd.SysProcAttr.Ptrace = true
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("localtime: StartFrozen: %w", err)
+		return nil, fmt.Errorf("faketime: StartFrozen: %w", err)
 	}
 	h, err := inject.InjectFrozenFollowChild(cmd.Process.Pid, target)
 	if err != nil {
 		cmd.Process.Kill() //nolint:errcheck
 		cmd.Wait()         //nolint:errcheck
-		return nil, fmt.Errorf("localtime: inject frozen: %w", err)
+		return nil, fmt.Errorf("faketime: inject frozen: %w", err)
 	}
 	return newFrozenHandle(h, target), nil
 }
@@ -90,7 +90,7 @@ func StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 func Attach(pid int, target time.Time) (*Handle, error) {
 	h, err := inject.InjectAtTime(pid, target)
 	if err != nil {
-		return nil, fmt.Errorf("localtime: Attach pid %d: %w", pid, err)
+		return nil, fmt.Errorf("faketime: Attach pid %d: %w", pid, err)
 	}
 	return newAdvancingHandle(h, target), nil
 }
@@ -100,7 +100,7 @@ func Attach(pid int, target time.Time) (*Handle, error) {
 func AttachFrozen(pid int, target time.Time) (*Handle, error) {
 	h, err := inject.InjectFrozen(pid, target)
 	if err != nil {
-		return nil, fmt.Errorf("localtime: AttachFrozen pid %d: %w", pid, err)
+		return nil, fmt.Errorf("faketime: AttachFrozen pid %d: %w", pid, err)
 	}
 	return newFrozenHandle(h, target), nil
 }
@@ -298,7 +298,7 @@ func (s *Session) applyAll(fn func(*Handle) error, updateState func()) error {
 	wg.Wait()
 
 	if err := errors.Join(errs...); err != nil {
-		return fmt.Errorf("localtime: applyAll: %w", err)
+		return fmt.Errorf("faketime: applyAll: %w", err)
 	}
 	s.mu.Lock()
 	updateState()

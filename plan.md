@@ -1056,14 +1056,14 @@ The agent-side read from the state struct is already covered by `TestInjectMecha
 
 ---
 
-## Phase 25 — Local process time injection (`pkg/localtime`)
+## Phase 25 — Local process time injection (`pkg/faketime`)
 
 **Goal**: make the vDSO injection usable directly in Go tests that start their own
 processes — postgres, redpanda, Go services, Python services — without Kubernetes. This
 is the non-cluster path: the test binary injects fake time directly into child processes
 on the same Linux host.
 
-This phase builds a `pkg/localtime` package on top of the existing `pkg/inject`
+This phase builds a `pkg/faketime` package on top of the existing `pkg/inject`
 primitives. No new injection mechanics are needed; the work is entirely in the API layer.
 
 ---
@@ -1086,7 +1086,7 @@ inside a Linux VM whose PID namespace is inaccessible from the host.
 ### Single-process API
 
 ```go
-// pkg/localtime/localtime.go
+// pkg/faketime/faketime.go
 // //go:build linux
 
 // Handle holds an active time injection for one process.
@@ -1172,12 +1172,12 @@ func WithPID(t *testing.T, pid int, target time.Time,
 //
 // Example:
 //
-//   localtime.WithSession(t, futureTime,
-//       func(s *localtime.Session) error {
+//   faketime.WithSession(t, futureTime,
+//       func(s *faketime.Session) error {
 //           if err := s.Start(serviceCmd); err != nil { return err }
 //           return s.Attach(postgresPID)
 //       },
-//       func(t *testing.T, s *localtime.Session) {
+//       func(t *testing.T, s *faketime.Session) {
 //           // all processes see futureTime here
 //           s.SetTime(futureTime.Add(24 * time.Hour))
 //           // assert expiry behaviour, etc.
@@ -1198,13 +1198,13 @@ even when `fn` calls `t.Fatal`.
 `Session.SetTime` enables stepping through time within a single test:
 
 ```go
-localtime.WithSession(t, base,
-    func(s *localtime.Session) error {
+faketime.WithSession(t, base,
+    func(s *faketime.Session) error {
         s.Start(serviceCmd)
         s.Attach(postgresPID)
         return s.Attach(redpandaPID)
     },
-    func(t *testing.T, s *localtime.Session) {
+    func(t *testing.T, s *faketime.Session) {
         assertTokenValid(t, client)             // at base time
 
         s.SetTime(base.Add(23 * time.Hour))
@@ -1223,11 +1223,11 @@ have the new time before the next RPC or Kafka message reaches them.
 
 ### Build constraints and platform notes
 
-- All files in `pkg/localtime` carry `//go:build linux`.
+- All files in `pkg/faketime` carry `//go:build linux`.
 - On non-Linux platforms (`GOOS=darwin`, `GOOS=windows`) the package does not compile.
   Tests that import it should be gated with the same build tag or use `t.Skip` behind a
   runtime check. An alternative stub package (`//go:build !linux`) that provides the same
-  signatures but returns `errors.New("localtime: not supported on this platform")` is
+  signatures but returns `errors.New("timeshift: not supported on this platform")` is
   worth adding so callers can compile cross-platform even if they can only run on Linux.
 - The `FollowChild` path (`Start`, `WithProcess`, `Session.Start`) works inside Docker
   with `--cap-add SYS_PTRACE --security-opt seccomp=unconfined` — the same flags already
@@ -1241,11 +1241,11 @@ have the new time before the next RPC or Kafka message reaches them.
 ### File layout
 
 ```
-pkg/localtime/
-├── localtime.go          # //go:build linux — Handle, Session, Start, Attach
-├── localtime_stub.go     # //go:build !linux — same signatures, stub errors
+pkg/faketime/
+├── faketime.go          # //go:build linux — Handle, Session, Start, Attach
+├── faketime_stub.go     # //go:build !linux — same signatures, stub errors
 ├── testing.go            # //go:build linux — WithProcess, WithPID, WithSession
-└── localtime_test.go     # //go:build linux — uses in-binary helper processes
+└── faketime_test.go     # //go:build linux — uses in-binary helper processes
 ```
 
 ---
@@ -1257,14 +1257,14 @@ Follow the same in-binary helper pattern established in `pkg/inject`:
 ```go
 const helperEnv = "EPOCHD_LOCALTIME_HELPER"
 
-// TestLocaltimeHelper is the clock-printing child reused by all localtime tests.
+// TestLocaltimeHelper is the clock-printing child reused by all timeshift tests.
 func TestLocaltimeHelper(t *testing.T) {
     if os.Getenv(helperEnv) != "1" { t.Skip() }
     for { fmt.Println(time.Now().Format(time.RFC3339Nano)); time.Sleep(100*time.Millisecond) }
 }
 ```
 
-**`TestStartSingleProcess`** — start the helper via `localtime.Start`, read timestamps
+**`TestStartSingleProcess`** — start the helper via `faketime.Start`, read timestamps
 from its stdout, assert they are approximately `target`, then `Reset` and assert they
 return to real time. This mirrors `TestInjectRoundTrip` in `pkg/inject`.
 
@@ -1527,14 +1527,14 @@ would be delayed more than a configurable threshold.
 
 ---
 
-## Phase 32 — `pkg/localtime` Attach path
+## Phase 32 — `pkg/faketime` Attach path
 
 **Goal**: complement Phase 25's `Start` (FollowChild) path with an `Attach` path that
 injects into an already-running process by PID. This is useful when the process was
 started by the test framework (testcontainers, `go test -exec`, an external binary) rather
 than by the test itself.
 
-### API addition to `pkg/localtime`
+### API addition to `pkg/faketime`
 
 ```go
 // Attach injects fake time into an already-running process with the given pid.

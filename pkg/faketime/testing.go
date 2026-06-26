@@ -1,6 +1,6 @@
 //go:build linux
 
-package localtime
+package faketime
 
 import (
 	"os/exec"
@@ -17,11 +17,11 @@ func WithProcess(t *testing.T, cmd *exec.Cmd, target time.Time, fn func(*testing
 	t.Helper()
 	h, err := Start(cmd, target)
 	if err != nil {
-		t.Fatalf("localtime.WithProcess: %v", err)
+		t.Fatalf("faketime.WithProcess: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := h.Reset(); err != nil {
-			t.Logf("localtime.WithProcess: cleanup Reset: %v", err)
+			t.Logf("faketime.WithProcess: cleanup Reset: %v", err)
 		}
 		cmd.Process.Kill() //nolint:errcheck
 		cmd.Wait()         //nolint:errcheck
@@ -35,11 +35,11 @@ func WithPID(t *testing.T, pid int, target time.Time, fn func(*testing.T, *Handl
 	t.Helper()
 	h, err := Attach(pid, target)
 	if err != nil {
-		t.Fatalf("localtime.WithPID: %v", err)
+		t.Fatalf("faketime.WithPID: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := h.Reset(); err != nil {
-			t.Logf("localtime.WithPID: cleanup Reset: %v", err)
+			t.Logf("faketime.WithPID: cleanup Reset: %v", err)
 		}
 	})
 	fn(t, h)
@@ -52,11 +52,11 @@ func WithSession(t *testing.T, target time.Time, setup func(*Session) error, fn 
 	t.Helper()
 	s := NewSession(target)
 	if err := setup(s); err != nil {
-		t.Fatalf("localtime.WithSession: setup: %v", err)
+		t.Fatalf("faketime.WithSession: setup: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := s.Reset(); err != nil {
-			t.Logf("localtime.WithSession: cleanup Reset: %v", err)
+			t.Logf("faketime.WithSession: cleanup Reset: %v", err)
 		}
 		s.mu.Lock()
 		cmds := make([]*exec.Cmd, len(s.cmds))

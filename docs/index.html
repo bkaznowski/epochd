@@ -489,7 +489,7 @@ tr:last-child td { border-bottom: none; }
   </div>
   <div class="mode-card">
     <span class="tag local">Go test</span>
-    <h3>pkg/localtime</h3>
+    <h3>pkg/faketime</h3>
     <p>Import the package directly into your Go tests. No cluster required. Injects into child processes you start or processes you attach to.</p>
   </div>
   <div class="mode-card">
@@ -509,8 +509,8 @@ tr:last-child td { border-bottom: none; }
   </thead>
   <tbody>
     <tr><td>e2e tests against services running in a Kubernetes cluster</td><td><a href="#k8s-deploy">Cluster deployment</a> + <a href="#k8s-usage">SDK</a></td></tr>
-    <tr><td>Unit / integration tests for a Go program that calls <code>time.Now()</code></td><td><a href="#local-quickstart">pkg/localtime</a></td></tr>
-    <tr><td>Testing two Go processes that need to share a fake clock</td><td><a href="#local-api">pkg/localtime Session</a></td></tr>
+    <tr><td>Unit / integration tests for a Go program that calls <code>time.Now()</code></td><td><a href="#local-quickstart">pkg/faketime</a></td></tr>
+    <tr><td>Testing two Go processes that need to share a fake clock</td><td><a href="#local-api">pkg/faketime Session</a></td></tr>
     <tr><td>One-off injection into a running process for manual inspection</td><td><a href="#cli-install">faketimectl</a></td></tr>
     <tr><td>Integrating from Python, Ruby, or another language</td><td><a href="#k8s-api">Controller HTTP API</a></td></tr>
   </tbody>
@@ -926,11 +926,11 @@ curl -X PATCH http://localhost:8080/timeshifts/&lt;id&gt; \
 # Unfreeze and move to a new time:
 faketimectl update a1b2c3d4-... --time=2030-06-01T00:00:00Z</code></pre>
 
-<h3>Freeze via pkg/localtime</h3>
+<h3>Freeze via pkg/faketime</h3>
 <pre><code class="language-go">frozen := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // Start a child process with its clock frozen.
-h, err := localtime.StartFrozen(cmd, frozen)
+h, err := faketime.StartFrozen(cmd, frozen)
 if err != nil { t.Fatal(err) }
 defer h.Reset()
 
@@ -977,7 +977,7 @@ ts, err := client.AdvanceTimeshift(ctx, ts.ID, 24*time.Hour)
 // Rewind by 90 minutes.
 ts, err = client.AdvanceTimeshift(ctx, ts.ID, -90*time.Minute)</code></pre>
 
-<h3>Advance via pkg/localtime</h3>
+<h3>Advance via pkg/faketime</h3>
 <pre><code class="language-go">// Single process:
 h.Advance(24 * time.Hour)
 
@@ -987,7 +987,7 @@ s.Advance(24 * time.Hour)</code></pre>
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <h2 id="local-overview">Go tests (no cluster) — overview</h2>
 
-<p><code>pkg/localtime</code> provides the same injection capability without any Kubernetes infrastructure. You import the package directly into your Go tests and inject into processes you start yourself — no agent, no controller, no cluster.</p>
+<p><code>pkg/faketime</code> provides the same injection capability without any Kubernetes infrastructure. You import the package directly into your Go tests and inject into processes you start yourself — no agent, no controller, no cluster.</p>
 
 <div class="compare">
   <div class="compare-card">
@@ -1012,7 +1012,7 @@ s.Advance(24 * time.Hour)</code></pre>
 <div class="callout info">
   <span class="callout-icon">💡</span>
   <div class="callout-body">
-    <p>The stub in <code>localtime_stub.go</code> (compiled on non-Linux platforms) makes all functions return errors and all test helpers call <code>t.Skip()</code>. Your test code compiles and runs cleanly on macOS and Windows — the tests are simply skipped unless running on Linux.</p>
+    <p>The stub in <code>faketime_stub.go</code> (compiled on non-Linux platforms) makes all functions return errors and all test helpers call <code>t.Skip()</code>. Your test code compiles and runs cleanly on macOS and Windows — the tests are simply skipped unless running on Linux.</p>
   </div>
 </div>
 
@@ -1024,23 +1024,24 @@ s.Advance(24 * time.Hour)</code></pre>
     <div class="step-num"></div>
     <div class="step-body">
       <h3>Add the import</h3>
-      <pre><code class="language-go">import "epochd/pkg/localtime"</code></pre>
-      <p>No external dependency to add — <code>pkg/localtime</code> is part of the same module.</p>
+      <pre><code class="language-go">import "github.com/bkaznowski/faketime"</code></pre>
+      <p>Install the standalone module:</p>
+      <pre><code class="language-bash">go get github.com/bkaznowski/faketime</code></pre>
     </div>
   </div>
   <div class="step">
     <div class="step-num"></div>
     <div class="step-body">
       <h3>Inject into a process you start</h3>
-      <p>Use <code>localtime.Start</code> to set a fake clock on a child process from the moment it begins executing:</p>
+      <p>Use <code>faketime.Start</code> to set a fake clock on a child process from the moment it begins executing:</p>
       <pre><code class="language-go">func TestMyBinary(t *testing.T) {
     cmd := exec.Command("./my-binary", "--some-flag")
-    // Do NOT call cmd.Start() — localtime.Start does it for you.
+    // Do NOT call cmd.Start() — faketime.Start does it for you.
 
     target := time.Now().Add(365 * 24 * time.Hour) // one year in the future
-    h, err := localtime.Start(cmd, target)
+    h, err := faketime.Start(cmd, target)
     if err != nil {
-        t.Fatalf("localtime.Start: %v", err)
+        t.Fatalf("faketime.Start: %v", err)
     }
     t.Cleanup(func() {
         h.Reset()             // snap back to real time
@@ -1062,7 +1063,7 @@ s.Advance(24 * time.Hour)</code></pre>
     cmd := exec.Command("./my-binary")
     target := time.Now().Add(365 * 24 * time.Hour)
 
-    localtime.WithProcess(t, cmd, target, func(t *testing.T, h *localtime.Handle) {
+    faketime.WithProcess(t, cmd, target, func(t *testing.T, h *faketime.Handle) {
         // h.SetTime(newTarget) — update the fake time
         // h.Reset()            — snap back to real time
         // cmd is running; query it however you need
@@ -1144,7 +1145,7 @@ s.Advance(24 * time.Hour)</code></pre>
 <p>A <code>Session</code> groups multiple processes under a single target time. <code>SetTime</code> issues all <code>process_vm_writev</code> calls concurrently to minimise the inter-process race window.</p>
 
 <pre><code class="language-go">target := time.Now().Add(24 * time.Hour)
-s := localtime.NewSession(target)
+s := faketime.NewSession(target)
 
 // Add processes via Start or Attach.
 if err := s.Start(cmd1); err != nil { ... }
@@ -1201,14 +1202,14 @@ if err := s.Reset(); err != nil { ... }</code></pre>
 <pre><code class="language-go">func TestTwoServicesShareClock(t *testing.T) {
     target := time.Now().Add(365 * 24 * time.Hour)
 
-    localtime.WithSession(t, target,
-        func(s *localtime.Session) error {
+    faketime.WithSession(t, target,
+        func(s *faketime.Session) error {
             if err := s.Start(exec.Command("./service-a")); err != nil {
                 return err
             }
             return s.Start(exec.Command("./service-b"))
         },
-        func(t *testing.T, s *localtime.Session) {
+        func(t *testing.T, s *faketime.Session) {
             // Both service-a and service-b see time ~1 year in the future.
             // s.SetTime(...) updates both simultaneously.
         },
@@ -1412,11 +1413,11 @@ sudo faketimectl reset --pid=$(pgrep clockprinter)
 <h3>Agent privileges are broad</h3>
 <p>The <code>privileged: true</code> flag gives the agent essentially full access to the host. The recommended mitigation is to only deploy epochd in clusters that are already treated as low-trust dev/test environments, and to apply Kubernetes admission policies (OPA/Gatekeeper, Kyverno) that prevent privileged pods from being created in other contexts.</p>
 
-<h3>pkg/localtime — local privilege requirements</h3>
-<p>When using <code>pkg/localtime</code> in Go tests:</p>
+<h3>pkg/faketime — local privilege requirements</h3>
+<p>When using <code>pkg/faketime</code> in Go tests:</p>
 <ul>
-  <li><code>localtime.Start</code> uses the FollowChild path (<code>PTRACE_TRACEME</code> from the child). This does not require elevated privileges — you don't need <code>CAP_SYS_PTRACE</code> or root. It works in Docker with only <code>--cap-add SYS_PTRACE --security-opt seccomp=unconfined</code>.</li>
-  <li><code>localtime.Attach</code> uses <code>PTRACE_ATTACH</code> and does require <code>CAP_SYS_PTRACE</code> and <code>ptrace_scope ≤ 1</code>. Prefer <code>Start</code> when you can control the target process's launch.</li>
+  <li><code>faketime.Start</code> uses the FollowChild path (<code>PTRACE_TRACEME</code> from the child). This does not require elevated privileges — you don't need <code>CAP_SYS_PTRACE</code> or root. It works in Docker with only <code>--cap-add SYS_PTRACE --security-opt seccomp=unconfined</code>.</li>
+  <li><code>faketime.Attach</code> uses <code>PTRACE_ATTACH</code> and does require <code>CAP_SYS_PTRACE</code> and <code>ptrace_scope ≤ 1</code>. Prefer <code>Start</code> when you can control the target process's launch.</li>
 </ul>
 
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
@@ -1454,7 +1455,7 @@ sudo faketimectl reset --pid=$(pgrep clockprinter)
     <tr>
       <td><strong>Forked children inherit the injection</strong></td>
       <td>Processes forked after injection share the same vDSO mapping and see the same fake time. This is usually desirable.</td>
-      <td>Intended behaviour. The Go runtime's <code>os/exec</code> creates new processes, not forks, so child processes started via <code>exec.Command</code> do <em>not</em> inherit the injection unless you start them with <code>localtime.Start</code>.</td>
+      <td>Intended behaviour. The Go runtime's <code>os/exec</code> creates new processes, not forks, so child processes started via <code>exec.Command</code> do <em>not</em> inherit the injection unless you start them with <code>faketime.Start</code>.</td>
     </tr>
     <tr>
       <td><strong>No HA for the controller</strong></td>
@@ -1540,7 +1541,7 @@ sudo faketimectl reset --pid=$(pgrep clockprinter)
     <tr><td><code>cmd/controller</code></td><td>Accepts API requests, resolves pods, dispatches to agents, manages timeshift registry, runs TTL sweeper and pod watcher.</td><td>Unprivileged. Standard Deployment with ClusterRole for pod reads.</td></tr>
     <tr><td><code>cmd/agent</code></td><td>Receives gRPC calls from controller. Resolves container IDs to PIDs. Performs ptrace injection. Holds <code>inject.Handle</code> map. Drains handles gracefully on SIGTERM.</td><td>Privileged. DaemonSet with <code>hostPID: true</code> and <code>CAP_SYS_PTRACE</code>.</td></tr>
     <tr><td><code>pkg/inject</code></td><td>Core injection library. <code>InjectAtTime</code> → one-time setup via ptrace. <code>SetTime</code> → live updates via <code>process_vm_writev</code>.</td><td>Needs <code>CAP_SYS_PTRACE</code>.</td></tr>
-    <tr><td><code>pkg/localtime</code></td><td>Wrapper around <code>pkg/inject</code> for use in Go tests without a cluster. <code>Start</code> uses FollowChild (no elevated perms); <code>Attach</code> uses PTRACE_ATTACH.</td><td><code>Start</code>: no extra perms. <code>Attach</code>: needs <code>CAP_SYS_PTRACE</code>.</td></tr>
+    <tr><td><code>pkg/faketime</code></td><td>Wrapper around <code>pkg/inject</code> for use in Go tests without a cluster. <code>Start</code> uses FollowChild (no elevated perms); <code>Attach</code> uses PTRACE_ATTACH.</td><td><code>Start</code>: no extra perms. <code>Attach</code>: needs <code>CAP_SYS_PTRACE</code>.</td></tr>
     <tr><td><code>pkg/sdk</code></td><td>Go client for the controller API. Used from e2e tests. No Linux dependency.</td><td>None — pure HTTP client.</td></tr>
   </tbody>
 </table>
@@ -1559,7 +1560,7 @@ sudo faketimectl reset --pid=$(pgrep clockprinter)
 
 <h3>Can I use this with Python, Node.js, or Java?</h3>
 <p>For Kubernetes-deployed services: yes. The controller API is plain HTTP+JSON. Any language can use <code>POST /timeshifts</code> to shift the clock of any container regardless of what language that container is written in.</p>
-<p>For local process injection: only via the Go <code>pkg/localtime</code> API or the <code>faketimectl</code> CLI.</p>
+<p>For local process injection: only via the Go <code>pkg/faketime</code> API or the <code>faketimectl</code> CLI.</p>
 
 <h3>What happens if the target process calls <code>fork</code>?</h3>
 <p>Forked children inherit the parent's vDSO mapping, which includes the patched <code>JMP</code> and the trampoline page. Children see the same fake time as the parent. This is usually the desired behaviour when testing a multi-process server.</p>
@@ -1581,7 +1582,7 @@ if sdk.IsConflict(err) {
 <p>In <strong>freeze mode</strong>, the trampoline ignores the real syscall result entirely and returns a constant absolute timestamp. No matter how many seconds of real time pass, <code>time.Now()</code> in the target always returns exactly the frozen instant. Use freeze mode when the exact timestamp matters — for example, when testing a certificate whose serial number or expiry must match a specific value, or when you need full control over each time step in a test scenario.</p>
 
 <h3>Can I advance a frozen clock step by step?</h3>
-<p>Yes. Use <code>AdvanceTimeshift</code> (SDK), <code>faketimectl advance --by=...</code> (CLI), or <code>h.Advance(d)</code> (pkg/localtime). Each advance shifts the pinned instant by the given duration and the clock remains frozen at the new value. This is useful for simulating discrete time steps (e.g. "now advance by one billing cycle") without switching to advancing mode.</p>
+<p>Yes. Use <code>AdvanceTimeshift</code> (SDK), <code>faketimectl advance --by=...</code> (CLI), or <code>h.Advance(d)</code> (pkg/faketime). Each advance shifts the pinned instant by the given duration and the clock remains frozen at the new value. This is useful for simulating discrete time steps (e.g. "now advance by one billing cycle") without switching to advancing mode.</p>
 
 <h3>Is there a Helm chart?</h3>
 <p>Not yet. The <code>deploy/</code> directory contains raw Kubernetes manifests. A Helm chart is on the roadmap.</p>
