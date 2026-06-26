@@ -640,6 +640,18 @@ for _, pod := range pods {
     fmt.Printf("pod %s: containers %v\n", pod.Name, pod.Containers)
 }</code></pre>
 
+<h3>Wait for injection to be confirmed</h3>
+<p><code>WaitForActive</code> polls <code>/timeshifts/{id}/status</code> every 250 ms until every container in the timeshift reports a successful injection (<code>Status</code> non-nil, no error). It returns immediately on a permanent per-container error.</p>
+<p><strong><code>WithTime</code> and <code>WithTimeT</code> call <code>WaitForActive</code> automatically</strong> before invoking your callback — you do not need to sleep or poll manually when using those helpers. Call <code>WaitForActive</code> directly only when using <code>CreateTimeshift</code> on its own:</p>
+<pre><code class="language-go">ts, err := client.CreateTimeshift(ctx, ns, selector, target, ttl)
+if err != nil { log.Fatal(err) }
+
+// Block until every container is confirmed injected.
+if err := client.WaitForActive(ctx, ts.ID); err != nil {
+    log.Fatalf("injection failed: %v", err)
+}
+// Safe to make assertions now.</code></pre>
+
 <h3>Inspect live injection state</h3>
 <p><code>TimeshiftStatus</code> queries each agent for the current trampoline state — useful to confirm the injection landed and what time each container currently sees:</p>
 <pre><code class="language-go">status, err := client.TimeshiftStatus(ctx, ts.ID)
@@ -1020,44 +1032,135 @@ if err := s.Reset(); err != nil { ... }</code></pre>
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <h2 id="cli-install">CLI tool — faketimectl</h2>
 
+<p><code>faketimectl</code> is a command-line tool for managing epochd timeshifts. It has two sets of subcommands: <strong>controller subcommands</strong> that talk to a running epochd controller over HTTP, and <strong>local injection subcommands</strong> that inject directly into a process via ptrace.</p>
+
 <h3>Build</h3>
 <pre><code class="language-bash">GOOS=linux go build -o faketimectl ./cmd/faketimectl</code></pre>
 
-<h3>Usage</h3>
-<pre><code class="language-bash">faketimectl --pid=&lt;PID&gt; --set-time=&lt;RFC3339&gt;   # inject fake time
-faketimectl --pid=&lt;PID&gt; --reset                 # snap back to real clock</code></pre>
+<h3>General usage</h3>
+<pre><code class="language-bash">faketimectl [--url=&lt;controller-url&gt;] &lt;subcommand&gt; [flags]
+
+# The controller URL can also be set via environment variable:
+export EPOCHD_URL=http://localhost:8080</code></pre>
+
+<h3>Controller subcommands</h3>
+<p>These subcommands talk to a running epochd controller. Set <code>EPOCHD_URL</code> or pass <code>--url</code> to each command.</p>
 
 <div class="table-wrap">
 <table>
-  <thead><tr><th>Flag</th><th>Description</th></tr></thead>
+  <thead><tr><th>Subcommand</th><th>Flags / args</th><th>Description</th></tr></thead>
   <tbody>
-    <tr><td><code>--pid</code></td><td>Target process PID (required)</td></tr>
-    <tr><td><code>--set-time</code></td><td>Fake wall-clock time in RFC3339 format, e.g. <code>2030-01-01T00:00:00Z</code></td></tr>
-    <tr><td><code>--reset</code></td><td>Snap the target back to the real clock</td></tr>
+    <tr>
+      <td><code>create</code></td>
+      <td><code>--namespace=NS --selector=SEL --time=RFC3339 [--ttl=DURATION]</code></td>
+      <td>Create a timeshift for all pods matching the selector.</td>
+    </tr>
+    <tr>
+      <td><code>list</code></td>
+      <td>—</td>
+      <td>List all active timeshifts.</td>
+    </tr>
+    <tr>
+      <td><code>get &lt;id&gt;</code></td>
+      <td>—</td>
+      <td>Get a single timeshift by ID.</td>
+    </tr>
+    <tr>
+      <td><code>update &lt;id&gt;</code></td>
+      <td><code>--time=RFC3339</code></td>
+      <td>Move the target clock to a new time.</td>
+    </tr>
+    <tr>
+      <td><code>delete &lt;id&gt;</code></td>
+      <td>—</td>
+      <td>Delete the timeshift and reset all injected pods to real time.</td>
+    </tr>
+    <tr>
+      <td><code>status &lt;id&gt;</code></td>
+      <td>—</td>
+      <td>Show live injection state per container (generation, target time, PID).</td>
+    </tr>
+    <tr>
+      <td><code>resolve</code></td>
+      <td><code>--namespace=NS --selector=SEL</code></td>
+      <td>List pods and containers that would be targeted — no injection performed.</td>
+    </tr>
   </tbody>
 </table>
 </div>
 
-<h3>Example</h3>
+<h3>Controller examples</h3>
+<pre><code class="language-bash">export EPOCHD_URL=http://localhost:8080
+
+# Preview which pods would be targeted
+faketimectl resolve --namespace=default --selector=app=my-service
+
+# Create a timeshift (1 hour TTL)
+faketimectl create --namespace=default --selector=app=my-service \
+  --time=2030-01-01T00:00:00Z --ttl=1h
+# created timeshift b3f5c2d1-...
+#   namespace:  default
+#   time:       2030-01-01T00:00:00Z
+#   expires at: 2030-01-01T01:00:00Z
+#   applied to: my-service-abc/app, my-service-def/app
+
+# List active timeshifts
+faketimectl list
+
+# Inspect per-container injection state
+faketimectl status b3f5c2d1-...
+# POD               CONTAINER  GENERATION  TARGET TIME           PID    ERROR
+# my-service-abc    app        0           2030-01-01T00:00:00Z  12345
+
+# Advance the clock
+faketimectl update b3f5c2d1-... --time=2035-06-01T00:00:00Z
+
+# Clean up — resets all pods to real time
+faketimectl delete b3f5c2d1-...</code></pre>
+
+<h3>Local injection subcommands</h3>
+<p>These subcommands inject directly into a process via ptrace. No epochd controller is required, but the target process must be owned by you and the kernel ptrace scope must permit it (see the warning below).</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Subcommand</th><th>Flags</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>inject</code></td>
+      <td><code>--pid=PID --time=RFC3339</code></td>
+      <td>Inject fake time into a running process.</td>
+    </tr>
+    <tr>
+      <td><code>reset</code></td>
+      <td><code>--pid=PID</code></td>
+      <td>Snap the target process back to the real clock.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Local injection example</h3>
 <pre><code class="language-bash"># Terminal 1: run the sample clock-printer target
 ./clockprinter
-# 2026-06-21T10:00:00Z
-# 2026-06-21T10:00:01Z
+# 2026-06-26T10:00:00Z
+# 2026-06-26T10:00:01Z
 
-# Terminal 2: inject a fake time (requires CAP_SYS_PTRACE or root)
-sudo ./faketimectl --pid=$(pgrep clockprinter) --set-time=2030-01-01T00:00:00Z
+# Terminal 2: inject a fake time
+sudo faketimectl inject --pid=$(pgrep clockprinter) --time=2030-01-01T00:00:00Z
+# pid 12345: clock set to 2030-01-01T00:00:00Z (+3y from now, state=0x7ffe...)
 
 # Terminal 1 now prints:
 # 2030-01-01T00:00:00Z
 # 2030-01-01T00:00:01Z
 
 # Terminal 2: reset to real time
-sudo ./faketimectl --pid=$(pgrep clockprinter) --reset</code></pre>
+sudo faketimectl reset --pid=$(pgrep clockprinter)
+# pid 12345: clock reset to real time (state=0x7ffe...)</code></pre>
 
 <div class="callout warn">
   <span class="callout-icon">⚠️</span>
   <div class="callout-body">
-    <p><code>faketimectl</code> uses <code>PTRACE_ATTACH</code>. This requires either running as root, or having <code>CAP_SYS_PTRACE</code> and <code>/proc/sys/kernel/yama/ptrace_scope ≤ 1</code>. On Ubuntu/Debian, you can temporarily set: <code>echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope</code></p>
+    <p>The <code>inject</code> and <code>reset</code> subcommands use <code>PTRACE_ATTACH</code>. This requires either running as root, or having <code>CAP_SYS_PTRACE</code> and <code>/proc/sys/kernel/yama/ptrace_scope ≤ 1</code>. On Ubuntu/Debian: <code>echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope</code></p>
   </div>
 </div>
 
