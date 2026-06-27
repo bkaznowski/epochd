@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/bkaznowski/epochd/pkg/inject"
+	"github.com/bkaznowski/epochd/pkg/procmem"
+	"golang.org/x/sys/unix"
 )
 
 // Handle holds an active time injection for a single process.
@@ -274,6 +276,240 @@ func (s *Session) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.handles)
+}
+
+// ---------------------------------------------------------------------------
+// ChildTracker
+// ---------------------------------------------------------------------------
+
+// ChildTracker watches a process for fork and vfork events and automatically
+// injects fake time into each child process as it is created. Because fork
+// copies the parent's address space, the child inherits the trampoline page and
+// vDSO patch; no new injection is needed — only a Handle pointing to the
+// child's copy of the state struct is created.
+//
+// Obtain a ChildTracker via StartWithTracking or StartFrozenWithTracking.
+type ChildTracker struct {
+	// Handle is the parent process's fake-time handle.
+	Handle *Handle
+
+	mu          sync.Mutex
+	tracer      *procmem.Tracer
+	parentPID   int
+	children    map[int]*Handle // childPID → Handle
+	pendingStop map[int]bool    // children waiting for their initial ptrace stop
+	done        chan struct{}
+	wg          sync.WaitGroup
+	loopErr     error
+}
+
+// Children returns Handles for all child processes currently tracked.
+func (c *ChildTracker) Children() []*Handle {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*Handle, 0, len(c.children))
+	for _, h := range c.children {
+		out = append(out, h)
+	}
+	return out
+}
+
+// Err returns the first error encountered by the background watch loop, if any.
+func (c *ChildTracker) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.loopErr
+}
+
+// Close stops the fork watcher, resets all tracked children to the real clock,
+// and detaches ptrace from the parent and all children. The parent process
+// continues running after Close returns.
+func (c *ChildTracker) Close() error {
+	close(c.done)
+	c.wg.Wait()
+	c.mu.Lock()
+	err := c.loopErr
+	c.mu.Unlock()
+	return err
+}
+
+// StartWithTracking starts cmd with advancing fake time and returns a
+// ChildTracker that automatically injects fake time into any processes spawned
+// via fork or vfork. No elevated permissions required.
+func StartWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Ptrace = true
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("faketime: StartWithTracking: %w", err)
+	}
+	ih, tr, err := inject.InjectAtTimeFollowChildKeepTracer(cmd.Process.Pid, target)
+	if err != nil {
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+		return nil, fmt.Errorf("faketime: StartWithTracking: %w", err)
+	}
+	return newChildTracker(newAdvancingHandle(ih, target), tr, cmd.Process.Pid), nil
+}
+
+// StartFrozenWithTracking starts cmd with the clock frozen at target and
+// returns a ChildTracker that automatically injects fake time into any
+// processes spawned via fork or vfork.
+func StartFrozenWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Ptrace = true
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("faketime: StartFrozenWithTracking: %w", err)
+	}
+	ih, tr, err := inject.InjectFrozenFollowChildKeepTracer(cmd.Process.Pid, target)
+	if err != nil {
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+		return nil, fmt.Errorf("faketime: StartFrozenWithTracking: %w", err)
+	}
+	return newChildTracker(newFrozenHandle(ih, target), tr, cmd.Process.Pid), nil
+}
+
+func newChildTracker(h *Handle, tr *procmem.Tracer, parentPID int) *ChildTracker {
+	ct := &ChildTracker{
+		Handle:      h,
+		tracer:      tr,
+		parentPID:   parentPID,
+		children:    make(map[int]*Handle),
+		pendingStop: make(map[int]bool),
+		done:        make(chan struct{}),
+	}
+	ct.wg.Add(1)
+	go ct.watchLoop()
+	return ct
+}
+
+func (c *ChildTracker) watchLoop() {
+	defer c.wg.Done()
+	defer c.cleanup()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		pid, ws, err := c.tracer.WaitAnyNonBlocking()
+		if err != nil {
+			// ECHILD means no more traced children — normal exit when parent dies.
+			if !errors.Is(err, syscall.ECHILD) {
+				c.mu.Lock()
+				c.loopErr = err
+				c.mu.Unlock()
+			}
+			return
+		}
+		if pid == 0 {
+			// No events pending — avoid busy-spinning.
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+
+		c.handleEvent(pid, ws)
+	}
+}
+
+func (c *ChildTracker) handleEvent(pid int, ws unix.WaitStatus) {
+	if ws.Exited() || ws.Signaled() {
+		c.mu.Lock()
+		delete(c.children, pid)
+		delete(c.pendingStop, pid)
+		c.mu.Unlock()
+		if pid == c.parentPID {
+			// Parent exited — no more fork events to expect.
+			c.mu.Lock()
+			if c.loopErr == nil {
+				c.loopErr = fmt.Errorf("faketime: parent process %d exited unexpectedly", pid)
+			}
+			c.mu.Unlock()
+		}
+		return
+	}
+
+	if !ws.Stopped() {
+		return
+	}
+
+	// Check for a fork or vfork ptrace event.
+	ptraceEvent := (int(ws) >> 16) & 0xFF
+	isFork := ws.StopSignal() == syscall.SIGTRAP &&
+		(ptraceEvent == unix.PTRACE_EVENT_FORK || ptraceEvent == unix.PTRACE_EVENT_VFORK)
+
+	if isFork {
+		childPIDMsg, err := c.tracer.GetEventMsgPID(pid)
+		if err != nil {
+			c.tracer.ContPID(pid, 0) //nolint:errcheck
+			return
+		}
+		childPID := int(childPIDMsg) //nolint:gosec — PID fits in int on all supported arches
+
+		// The child inherits the trampoline via fork — build a Handle for it.
+		c.Handle.mu.Lock()
+		childIH := inject.ChildHandle(c.Handle.h, childPID)
+		var childH *Handle
+		if c.Handle.frozen {
+			childH = newFrozenHandle(childIH, c.Handle.frozenAt)
+		} else {
+			childH = newAdvancingHandle(childIH, c.Handle.effectiveTime())
+		}
+		c.Handle.mu.Unlock()
+
+		c.mu.Lock()
+		c.children[childPID] = childH
+		c.pendingStop[childPID] = true
+		c.mu.Unlock()
+
+		c.tracer.ContPID(pid, 0) //nolint:errcheck
+		return
+	}
+
+	// Child's initial ptrace stop (auto-attached by PTRACE_O_TRACEFORK).
+	c.mu.Lock()
+	isPending := c.pendingStop[pid]
+	if isPending {
+		delete(c.pendingStop, pid)
+	}
+	c.mu.Unlock()
+
+	if isPending {
+		// Resume without forwarding the implicit stop signal.
+		c.tracer.ContPID(pid, 0) //nolint:errcheck
+		return
+	}
+
+	// Forward non-ptrace signals; suppress SIGTRAP (it's a ptrace event, not a real signal).
+	sig := 0
+	if ws.StopSignal() != syscall.SIGTRAP {
+		sig = int(ws.StopSignal())
+	}
+	c.tracer.ContPID(pid, sig) //nolint:errcheck
+}
+
+func (c *ChildTracker) cleanup() {
+	// Reset all child handles to the real clock (best effort).
+	for _, h := range c.Children() {
+		h.Reset() //nolint:errcheck
+	}
+
+	// Detach from children, then the parent.
+	c.mu.Lock()
+	childPIDs := make([]int, 0, len(c.children))
+	for pid := range c.children {
+		childPIDs = append(childPIDs, pid)
+	}
+	c.mu.Unlock()
+
+	c.tracer.DetachAll(childPIDs) //nolint:errcheck
+	c.tracer.InterruptDetach()    //nolint:errcheck
 }
 
 // applyAll calls fn on every handle concurrently and then, if no errors

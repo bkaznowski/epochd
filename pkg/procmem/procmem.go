@@ -4,6 +4,7 @@
 package procmem
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 
@@ -169,6 +170,102 @@ func (t *Tracer) PokeText(addr uintptr, buf []byte) error {
 		}
 	})
 	return err
+}
+
+// SetOptions sets PTRACE_O_* options on the current tracee.
+// Must be called while the tracee is ptrace-stopped.
+func (t *Tracer) SetOptions(opts int) error {
+	var err error
+	t.run(func() {
+		if e := unix.PtraceSetOptions(t.pid, opts); e != nil {
+			err = fmt.Errorf("procmem: PTRACE_SETOPTIONS pid %d: %w", t.pid, e)
+		}
+	})
+	return err
+}
+
+// WaitAnyNonBlocking checks for a stop event from any traced child without
+// blocking. Returns pid=0 if no events are pending, or syscall.ECHILD if
+// there are no traced children.
+func (t *Tracer) WaitAnyNonBlocking() (int, unix.WaitStatus, error) {
+	var ws unix.WaitStatus
+	var pid int
+	var err error
+	t.run(func() {
+		p, e := unix.Wait4(-1, &ws, unix.WNOHANG, nil)
+		if e != nil {
+			err = fmt.Errorf("procmem: wait4(-1, WNOHANG): %w", e)
+			return
+		}
+		pid = p
+	})
+	return pid, ws, err
+}
+
+// GetEventMsgPID retrieves the ptrace event message from an arbitrary
+// ptrace-stopped PID. After PTRACE_EVENT_FORK or PTRACE_EVENT_VFORK,
+// this returns the newly created child's PID.
+func (t *Tracer) GetEventMsgPID(pid int) (uint, error) {
+	var msg uint
+	var err error
+	t.run(func() {
+		m, e := unix.PtraceGetEventMsg(pid)
+		if e != nil {
+			err = fmt.Errorf("procmem: PTRACE_GETEVENTMSG pid %d: %w", pid, e)
+			return
+		}
+		msg = m
+	})
+	return msg, err
+}
+
+// ContPID resumes an arbitrary ptrace-stopped PID on the pinned OS thread.
+// sig is forwarded to the resumed process (0 for no signal).
+func (t *Tracer) ContPID(pid, sig int) error {
+	var err error
+	t.run(func() {
+		if e := unix.PtraceCont(pid, sig); e != nil {
+			err = fmt.Errorf("procmem: PTRACE_CONT pid %d: %w", pid, e)
+		}
+	})
+	return err
+}
+
+// InterruptDetach stops the current tracee via PTRACE_INTERRUPT and detaches.
+// Safe to call when the tracee is running (not already stopped).
+func (t *Tracer) InterruptDetach() error {
+	var err error
+	t.run(func() {
+		unix.PtraceInterrupt(t.pid) //nolint:errcheck — may already be stopped/dead
+		var ws unix.WaitStatus
+		unix.Wait4(t.pid, &ws, 0, nil) //nolint:errcheck
+		if e := unix.PtraceDetach(t.pid); e != nil && !isNoProcess(e) {
+			err = fmt.Errorf("procmem: PTRACE_DETACH pid %d: %w", t.pid, e)
+		}
+		t.pid = 0
+	})
+	return err
+}
+
+// DetachAll interrupts and detaches from each PID in the list on the pinned
+// OS thread. Errors for processes that no longer exist are silently ignored.
+func (t *Tracer) DetachAll(pids []int) error {
+	var err error
+	t.run(func() {
+		for _, pid := range pids {
+			unix.PtraceInterrupt(pid) //nolint:errcheck
+			var ws unix.WaitStatus
+			unix.Wait4(pid, &ws, 0, nil) //nolint:errcheck
+			if e := unix.PtraceDetach(pid); e != nil && !isNoProcess(e) {
+				err = errors.Join(err, fmt.Errorf("procmem: PTRACE_DETACH pid %d: %w", pid, e))
+			}
+		}
+	})
+	return err
+}
+
+func isNoProcess(err error) bool {
+	return errors.Is(err, unix.ESRCH)
 }
 
 // ReadMem reads len(buf) bytes from addr in pid using process_vm_readv.

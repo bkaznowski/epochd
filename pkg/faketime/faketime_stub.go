@@ -52,3 +52,16 @@ func WithSession(t *testing.T, _ time.Time, _ func(*Session) error, _ func(*test
 	t.Helper()
 	t.Skip("faketime: not supported on this platform (Linux only)")
 }
+
+// ChildTracker stubs — on non-Linux platforms construction always returns an error.
+type ChildTracker struct{ Handle *Handle }
+
+func StartWithTracking(_ *exec.Cmd, _ time.Time) (*ChildTracker, error) {
+	return nil, errNotSupported
+}
+func StartFrozenWithTracking(_ *exec.Cmd, _ time.Time) (*ChildTracker, error) {
+	return nil, errNotSupported
+}
+func (c *ChildTracker) Children() []*Handle { return nil }
+func (c *ChildTracker) Err() error          { return errNotSupported }
+func (c *ChildTracker) Close() error        { return errNotSupported }

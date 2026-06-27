@@ -704,6 +704,8 @@ err = session.Advance(24 * time.Hour)
 | 36 | Offset-based timeshift storage (live `time` in GET responses) | ✅ |
 | 37 | proto `freeze` field on `InjectRequest` / `SetTimeRequest` | ✅ |
 | 38 | `pkg/faketime`: `Handle.EffectiveTime()`, `Handle.PID()`, `Session.Close()`, `Handle.IsAlive()` | 🔲 |
+| 39 | `pkg/faketime`: `Handle.FollowChildren()` — auto-inject into forked child processes via `PTRACE_O_TRACEFORK` | 🔲 |
+| 40 | `pkg/faketime`: exec-survivor injection — re-inject after `exec()` via `PTRACE_O_TRACEEXEC` so processes that self-exec (e.g. PEX bootstrap) or fork+exec retain fake time | 🔲 |
 
 See `plan.md` for the detailed specification of all phases.
 See `FUTURE.md` for longer-horizon improvements (auth, multi-arch, Helm, HA).

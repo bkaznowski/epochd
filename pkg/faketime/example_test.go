@@ -133,7 +133,11 @@ func ExampleSession() {
 // WithProcess is the idiomatic way to inject time in a Go test. Cleanup
 // (kill, wait, reset) runs automatically via t.Cleanup, even if the test calls
 // t.Fatal.
-func ExampleWithProcess(t *testing.T) {
+//
+// In a real test t comes from the testing framework; the nil here is for
+// illustration only — this example is not executed by go test.
+func ExampleWithProcess() {
+	var t *testing.T // replaced by the real *testing.T in your test function
 	target := time.Date(2030, 6, 1, 0, 0, 0, 0, time.UTC)
 	cmd := exec.Command("./my-service")
 
@@ -147,9 +151,37 @@ func ExampleWithProcess(t *testing.T) {
 	// cmd is killed and clock is reset here.
 }
 
+// StartWithTracking is the idiomatic way to test a process that spawns children
+// (e.g. Postgres forking a backend per connection). Each forked child
+// automatically inherits the fake clock without any extra setup.
+func ExampleStartWithTracking() {
+	target := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// Start the parent (e.g. a Postgres postmaster) with fake time.
+	tracker, err := faketime.StartWithTracking(exec.Command("./postmaster"), target)
+	if err != nil {
+		panic(err)
+	}
+	defer tracker.Close() //nolint:errcheck
+
+	// tracker.Handle controls the parent's clock.
+	if err := tracker.Handle.Advance(24 * time.Hour); err != nil {
+		panic(err)
+	}
+
+	// Any process forked after StartWithTracking (e.g. Postgres backends) is
+	// automatically injected and appears in tracker.Children().
+	for _, child := range tracker.Children() {
+		_ = child // same Handle API: SetTime, Freeze, Advance, Reset
+	}
+}
+
 // WithSession is the idiomatic way to run a multi-process test with a shared
 // fake clock.
-func ExampleWithSession(t *testing.T) {
+// In a real test t comes from the testing framework; the nil here is for
+// illustration only — this example is not executed by go test.
+func ExampleWithSession() {
+	var t *testing.T // replaced by the real *testing.T in your test function
 	target := time.Date(2030, 6, 1, 0, 0, 0, 0, time.UTC)
 
 	faketime.WithSession(t, target,

@@ -64,6 +64,62 @@ func InjectFrozenFollowChild(pid int, target time.Time) (*Handle, error) {
 	return injectFollowChild(pid, sec, nsec, trampoline.MaskFrozen)
 }
 
+// InjectAtTimeFollowChildKeepTracer is like InjectAtTimeFollowChild but keeps
+// ptrace active on the parent with PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK set
+// and resumes the parent before returning. The caller owns the Tracer and must
+// drive the event loop, calling tr.InterruptDetach() when done.
+func InjectAtTimeFollowChildKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer, error) {
+	sec, nsec := diffSecNsec(target, time.Now())
+	return injectFollowChildKeepTracer(pid, sec, nsec, trampoline.MaskEnabled)
+}
+
+// InjectFrozenFollowChildKeepTracer is like InjectFrozenFollowChild but keeps
+// ptrace active on the parent with PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK set.
+func InjectFrozenFollowChildKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer, error) {
+	sec := target.Unix()
+	nsec := int64(target.Nanosecond())
+	return injectFollowChildKeepTracer(pid, sec, nsec, trampoline.MaskFrozen)
+}
+
+func injectFollowChildKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle, *procmem.Tracer, error) {
+	tr := procmem.NewTracer()
+	if err := tr.FollowChild(pid); err != nil {
+		return nil, nil, fmt.Errorf("inject: FollowChild pid %d: %w", pid, err)
+	}
+	info, err := vdso.Locate(pid)
+	if err != nil {
+		tr.Detach() //nolint:errcheck
+		return nil, nil, fmt.Errorf("inject: vdso.Locate: %w", err)
+	}
+	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
+	if err != nil {
+		tr.Detach() //nolint:errcheck
+		return nil, nil, err
+	}
+	if err := tr.SetOptions(unix.PTRACE_O_TRACEFORK | unix.PTRACE_O_TRACEVFORK); err != nil {
+		tr.Detach() //nolint:errcheck
+		return nil, nil, fmt.Errorf("inject: SetOptions: %w", err)
+	}
+	// Resume the parent so it can run and fork.
+	if err := tr.Cont(0); err != nil {
+		tr.Detach() //nolint:errcheck
+		return nil, nil, fmt.Errorf("inject: Cont parent: %w", err)
+	}
+	return h, tr, nil
+}
+
+// ChildHandle returns a Handle for a process that forked from parent's target.
+// fork() copies the parent's address space, so the child inherits the trampoline
+// page and the vDSO JMP patch at the same virtual addresses. No new injection is
+// needed; only the PID differs.
+func ChildHandle(parent *Handle, childPID int) *Handle {
+	return &Handle{
+		PID:       childPID,
+		StateAddr: parent.StateAddr,
+		origBytes: parent.origBytes,
+	}
+}
+
 // Generation returns the current write-generation counter. It is incremented
 // on each SetTime or Freeze call and can be used by callers to confirm a write landed.
 func (h *Handle) Generation() uint32 { return h.gen }

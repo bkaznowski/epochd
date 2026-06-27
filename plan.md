@@ -1689,3 +1689,188 @@ func (h *Handle) IsAlive() bool {
 - `pkg/faketime/faketime.go` — add `EffectiveTime`, `PID`, `IsAlive` to `Handle`; add `Close` to `Session`
 - `pkg/faketime/faketime_stub.go` — add stub implementations returning `errNotSupported`
 - `pkg/faketime/example_test.go` — add `ExampleHandle_EffectiveTime`, `ExampleHandle_IsAlive`, `ExampleSession_Close`
+
+---
+
+## Phase 39 — `Handle.FollowChildren()` (auto-inject into forked processes)
+
+### Goal
+
+Automatically inject fake time into child processes forked by the target (e.g.
+Postgres backends forked from the postmaster) without requiring the caller to
+track and attach to each child manually.
+
+### Mechanism
+
+`PTRACE_O_TRACEFORK` causes the kernel to stop every newly forked child and
+deliver a `PTRACE_EVENT_FORK` notification to the tracer. The tracer reads the
+child PID via `PTRACE_GETEVENTMSG`, injects the current fake time, then resumes
+both parent and child. This requires keeping ptrace attached to the parent after
+the initial injection rather than detaching immediately.
+
+### API
+
+```go
+// FollowChildren enables automatic injection into processes forked by this
+// handle's target. A background goroutine watches for PTRACE_EVENT_FORK
+// notifications and injects the current fake time into each child as it is
+// created. The child inherits the handle's current mode (advancing or frozen).
+// Call Close on the returned ChildTracker to stop watching and detach from
+// all children.
+//
+// FollowChildren requires the handle to have been created via Start or
+// StartFrozen (FollowChild path). It is not supported on handles created via
+// Attach (PTRACE_ATTACH path) because re-attaching after initial detach
+// requires CAP_SYS_PTRACE and is racey.
+func (h *Handle) FollowChildren() (*ChildTracker, error)
+
+// ChildTracker watches a process for fork events and injects fake time into
+// each child automatically.
+type ChildTracker struct { /* unexported */ }
+
+// Close stops the fork watcher, resets all tracked children to the real clock,
+// and detaches from them. Also detaches from the parent handle's process.
+func (c *ChildTracker) Close() error
+
+// Pids returns the PIDs of all child processes currently tracked.
+func (c *ChildTracker) Pids() []int
+```
+
+### Implementation sketch
+
+**`pkg/procmem`** — add `SetOptions`:
+```go
+// SetOptions sets ptrace options on the attached process.
+// Call after FollowChild or Attach, before Detach.
+func (t *Tracer) SetOptions(opts int) error
+```
+
+**`pkg/inject`** — add `FollowChildren` on `Handle`:
+```go
+// FollowChildren sets PTRACE_O_TRACEFORK on the target and returns a channel
+// that emits the PID of each newly forked child (already stopped, ready for
+// injection). The caller is responsible for injecting into each child and
+// calling PTRACE_CONT on it.
+func (h *Handle) FollowChildren() (<-chan int, error)
+```
+
+**`pkg/faketime`** — `ChildTracker` runs a background goroutine:
+1. Set `PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE` on the
+   parent via `pkg/inject`.
+2. Loop on `waitpid(-1, ...)` to receive events from any traced process.
+3. On `PTRACE_EVENT_FORK`: call `PTRACE_GETEVENTMSG` to get the child PID,
+   inject at `h.effectiveTime()` using the child's FollowChild stop, resume child.
+4. On normal stops (signals delivered to parent/children): forward the signal
+   and continue.
+5. On `Close`: send `SIGSTOP` to each tracked child, reset clock, detach.
+
+### Caveats
+
+- Keeping ptrace active on the parent adds a small overhead on each `fork` call
+  (the child stops briefly for injection). For Postgres this is acceptable since
+  backends are long-lived and fork is infrequent.
+- `PTRACE_O_TRACECLONE` covers `clone()`-based thread creation. Go's runtime
+  uses `clone` for goroutine threads — this will generate many events. Filter by
+  checking whether the new "child" shares the parent's memory (thread vs process)
+  via `/proc/<pid>/status` `VmRSS` or the `CLONE_VM` flag in the clone flags
+  (available via `PTRACE_GETEVENTMSG` on `PTRACE_EVENT_CLONE`). Only inject into
+  true child processes, not threads.
+
+### Files changed
+
+- `pkg/procmem/procmem.go` — add `SetOptions`
+- `pkg/inject/inject.go` — add `FollowChildren` channel API
+- `pkg/faketime/faketime.go` — add `Handle.FollowChildren`, `ChildTracker` type
+- `pkg/faketime/faketime_stub.go` — stub `FollowChildren` returning `errNotSupported`
+- `pkg/faketime/example_test.go` — `ExampleHandle_FollowChildren` (Postgres postmaster pattern)
+
+---
+
+## Phase 40 — exec-survivor injection (`PTRACE_O_TRACEEXEC`)
+
+### Motivation
+
+`fork()` copies the parent's address space, so forked children inherit the trampoline for free (Phase 39). `exec()` (execve) *replaces* the process image entirely — the kernel loads a fresh ELF, remaps the vDSO clean, and the trampoline page is gone. Two patterns destroy injection this way:
+
+- **Self-exec** (same PID): PEX bootstrap calls `os.execv()` on itself. No fork event fires; the existing Handle for that PID becomes invalid.
+- **fork + exec**: shells, build runners, and test harnesses fork a child and immediately exec a new binary. Phase 39 detects the fork and creates a `ChildHandle`, but the child's subsequent `exec()` destroys the trampoline before (or shortly after) we can use it.
+
+`PTRACE_O_TRACEEXEC` delivers `PTRACE_EVENT_EXEC` to the tracer after `execve` has mapped the new binary but before the new `_start` runs. At that stop the process is quiescent and can be re-injected.
+
+### Kernel behaviour
+
+When `PTRACE_O_TRACEEXEC` is set on a tracee, every successful `execve` call causes a ptrace-stop:
+
+```
+wait4() → pid, status where:
+  status.StopSignal() == SIGTRAP
+  (int(status) >> 16) & 0xFF == PTRACE_EVENT_EXEC
+```
+
+`PTRACE_GETEVENTMSG` on the stopped process returns the **pre-exec PID** (useful when a multi-threaded process execs — the surviving thread may have a different PID than the one that called `execve`).
+
+At the `PTRACE_EVENT_EXEC` stop:
+- The new ELF is fully mapped
+- The vDSO is freshly mapped with no JMP patch
+- No user-space code has run yet
+- Full re-injection is safe (vDSO locate → mmap trampoline → PokeText → write state)
+
+### Integration with `ChildTracker`
+
+`ChildTracker.watchLoop` already handles `PTRACE_EVENT_FORK` and `PTRACE_EVENT_VFORK`. Add `PTRACE_EVENT_EXEC` handling alongside them:
+
+```go
+case ptraceEvent == unix.PTRACE_EVENT_EXEC:
+    // pid is the post-exec PID (may differ from pre-exec in multi-threaded case).
+    // Determine what time this process should have.
+    // If pid == c.parentPID: re-inject parent (self-exec case).
+    // If pid is in c.children: re-inject child (fork+exec case).
+    // Otherwise: unknown exec, skip.
+    target := c.targetTimeForPID(pid)
+    newIH, err := inject.ReInjectAfterExec(c.tracer, pid, target, mask)
+    if err != nil {
+        // process_vm_writev to a dead process or permissions error; skip
+        c.tracer.ContPID(pid, 0)
+        return
+    }
+    c.updateHandle(pid, newIH)
+    c.tracer.ContPID(pid, 0)
+```
+
+`PTRACE_O_TRACEEXEC` must be added to the `SetOptions` call in `injectFollowChildKeepTracer`:
+
+```go
+tr.SetOptions(
+    unix.PTRACE_O_TRACEFORK |
+    unix.PTRACE_O_TRACEVFORK |
+    unix.PTRACE_O_TRACEEXEC,
+)
+```
+
+And set on each child after its initial stop (children do not inherit options from the parent).
+
+### New `pkg/inject` function
+
+```go
+// ReInjectAfterExec re-injects into a process that just called exec().
+// The process must be stopped at a PTRACE_EVENT_EXEC ptrace-stop.
+// It performs the full injection sequence (vDSO locate, trampoline mmap,
+// PokeText, state write) and returns a new Handle without detaching.
+func ReInjectAfterExec(tr *procmem.Tracer, pid int, sec, nsec int64, mask uint64) (*Handle, error)
+```
+
+This is identical to `injectFollowChildKeepTracer` minus the `SetOptions` call (options are set by the caller after the child's first stop).
+
+### Edge cases
+
+- **Multi-threaded exec**: only one thread survives `execve`; the others are silently removed by the kernel. The surviving thread PID is what `wait4` returns. `PTRACE_GETEVENTMSG` gives the pre-exec leader PID if they differ; use `wait4`'s return value as the authoritative post-exec PID.
+- **exec in an untracked process**: if `pid` is neither `c.parentPID` nor in `c.children`, ignore and cont. This can happen if a child forked a grandchild that we aren't tracking (no recursive `PTRACE_O_TRACEFORK` on children yet).
+- **Failed exec**: if `execve` fails, no `PTRACE_EVENT_EXEC` fires; the process resumes as before. Existing injection remains valid.
+- **PEX specifically**: PEX bootstrap calls `execv` in the same process (self-exec). `PTRACE_EVENT_EXEC` fires on `c.parentPID`. Re-injection restores fake time in the final Python interpreter that runs the actual application.
+
+### Files to change
+
+- `pkg/procmem/procmem.go` — `SetOptionsPID(pid, opts int) error` for setting options on newly stopped children
+- `pkg/inject/inject.go` — `ReInjectAfterExec`
+- `pkg/faketime/faketime.go` — add `PTRACE_EVENT_EXEC` case to `handleEvent`; add `setOptionsOnChild` helper; update `injectFollowChildKeepTracer` options mask
+- `pkg/faketime/faketime_stub.go` — no changes needed (stubs already cover `ChildTracker`)
