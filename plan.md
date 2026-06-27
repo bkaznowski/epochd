@@ -1605,3 +1605,87 @@ A minimal kind config that:
 Add a new GitHub Actions workflow `e2e.yml` that runs `make test-integration` on
 `push` to `main` and on PRs that touch `cmd/`, `pkg/`, or `deploy/`. Use a
 `ubuntu-latest` runner (kind works on GitHub Actions without Docker-in-Docker).
+
+---
+
+## Phase 38 — `pkg/faketime` API ergonomics
+
+### Goal
+
+Fill four small gaps in the `pkg/faketime` public API that require callers to
+track state themselves or produce confusing errors.
+
+### `Handle.EffectiveTime() time.Time`
+
+`effectiveTime()` already exists as an unexported method. Export it:
+
+```go
+// EffectiveTime returns the fake time the process currently sees.
+// For advancing handles this is time.Now() + offset; for frozen handles
+// it is the pinned instant.
+func (h *Handle) EffectiveTime() time.Time {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+    return h.effectiveTime()
+}
+```
+
+Useful for test assertions without having to track the target time separately.
+
+### `Handle.PID() int`
+
+```go
+// PID returns the PID of the target process.
+func (h *Handle) PID() int { return h.h.PID }
+```
+
+Callers that spawn via `faketime.Start` currently must retain `cmd.Process.Pid`
+themselves. This exposes it directly from the handle.
+
+### `Session.Close() error`
+
+Currently callers must track `[]*exec.Cmd` alongside the session to kill child
+processes outside of the test helpers. `Session` already stores `cmds` internally:
+
+```go
+// Close resets all handles to the real clock, kills all child processes
+// started via Session.Start, and waits for them to exit.
+// Errors from Reset and Wait are joined and returned.
+func (s *Session) Close() error {
+    resetErr := s.Reset()
+    s.mu.Lock()
+    cmds := make([]*exec.Cmd, len(s.cmds))
+    copy(cmds, s.cmds)
+    s.mu.Unlock()
+    var errs []error
+    for _, cmd := range cmds {
+        cmd.Process.Kill() //nolint:errcheck
+        if err := cmd.Wait(); err != nil {
+            errs = append(errs, err)
+        }
+    }
+    return errors.Join(append(errs, resetErr)...)
+}
+```
+
+### `Handle.IsAlive() bool`
+
+A dead process produces an opaque `process_vm_writev: no such process` error on
+the next `SetTime` call. `IsAlive` surfaces this proactively:
+
+```go
+// IsAlive reports whether the target process is still running.
+func (h *Handle) IsAlive() bool {
+    err := syscall.Kill(h.h.PID, 0)
+    return err == nil || errors.Is(err, syscall.EPERM)
+}
+```
+
+`EPERM` means the process exists but is owned by another user — still alive.
+`ESRCH` means it is gone.
+
+### Files changed
+
+- `pkg/faketime/faketime.go` — add `EffectiveTime`, `PID`, `IsAlive` to `Handle`; add `Close` to `Session`
+- `pkg/faketime/faketime_stub.go` — add stub implementations returning `errNotSupported`
+- `pkg/faketime/example_test.go` — add `ExampleHandle_EffectiveTime`, `ExampleHandle_IsAlive`, `ExampleSession_Close`

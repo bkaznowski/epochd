@@ -703,6 +703,7 @@ err = session.Advance(24 * time.Hour)
 | 35 | Advance-by-duration (`PATCH duration`, `advance --by`, `AdvanceTimeshift`, `Handle.Advance`) | ✅ |
 | 36 | Offset-based timeshift storage (live `time` in GET responses) | ✅ |
 | 37 | proto `freeze` field on `InjectRequest` / `SetTimeRequest` | ✅ |
+| 38 | `pkg/faketime`: `Handle.EffectiveTime()`, `Handle.PID()`, `Session.Close()`, `Handle.IsAlive()` | 🔲 |
 
 See `plan.md` for the detailed specification of all phases.
 See `FUTURE.md` for longer-horizon improvements (auth, multi-arch, Helm, HA).
