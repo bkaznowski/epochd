@@ -21,6 +21,7 @@
 //
 //	inject   --pid=PID --time=RFC3339
 //	reset    --pid=PID
+//	run      --time=RFC3339 [--freeze] [--track] [--] COMMAND [ARGS]
 package main
 
 import (
@@ -71,6 +72,8 @@ func run(args []string) error {
 		return cmdInject(args[1:])
 	case "reset":
 		return cmdReset(args[1:])
+	case "run":
+		return cmdRun(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q\nRun 'faketimectl help' for usage", args[0])
 	}
@@ -89,8 +92,9 @@ Controller subcommands (require --url flag or EPOCHD_URL environment variable):
   resolve  --namespace=NS --selector=SEL
 
 Local injection subcommands (Linux only, requires CAP_SYS_PTRACE or root):
-  inject   --pid=PID --time=RFC3339
-  reset    --pid=PID`
+  inject   --pid=PID --time=RFC3339 [--freeze]
+  reset    --pid=PID
+  run      --time=RFC3339 [--freeze] [--track] [--] COMMAND [ARGS]`
 
 func printUsage() {
 	fmt.Fprintln(stdout, usageText)

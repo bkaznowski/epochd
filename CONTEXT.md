@@ -1,9 +1,11 @@
-# epochd — implementation context (current phase: 37)
+# epochd — implementation context (current phase: 40)
 
 This file is a dense reference for an agent or developer continuing the project. It
-captures the state of the codebase after phases 0–37, the exact APIs that exist, every
-non-obvious decision that was made and why, and discovered gotchas. All planned phases
-are complete; see `FUTURE.md` for longer-horizon improvements.
+captures the state of the codebase after phases 0–40, the exact APIs that exist, every
+non-obvious decision that was made and why, and discovered gotchas. Phase 38
+(`Handle.EffectiveTime`, `Handle.PID`, `Session.Close`, `Handle.IsAlive`) is planned but
+not yet implemented. Phases 39–40 are complete. See `FUTURE.md` for longer-horizon
+improvements.
 
 ---
 
@@ -81,6 +83,39 @@ func (t *Tracer) PokeText(addr uintptr, buf []byte) error
 // Bulk IO — does NOT need ptrace stop; does need ptrace relationship or CAP_SYS_PTRACE.
 func ReadMem(pid int, addr uintptr, buf []byte) (int, error)   // process_vm_readv
 func WriteMem(pid int, addr uintptr, buf []byte) (int, error)  // process_vm_writev
+
+// Added in phases 39–40 (child tracking / exec-survivor injection):
+
+// SetTracee changes which PID Tracer methods operate on. Used when temporarily
+// re-targeting to inject into an exec'd child; caller must restore the original PID.
+func (t *Tracer) SetTracee(pid int)
+
+// SetOptions sets PTRACE_O_* options on the current tracee (must be ptrace-stopped).
+func (t *Tracer) SetOptions(opts int) error
+
+// SetOptionsPID sets PTRACE_O_* options on an arbitrary ptrace-stopped PID without
+// changing t.pid. Used to arm forked children with their own TRACEFORK/TRACEEXEC.
+func (t *Tracer) SetOptionsPID(pid, opts int) error
+
+// WaitAnyNonBlocking checks for a stop from any traced child without blocking.
+// Returns pid=0 when no events are pending; ECHILD when no traced children remain.
+func (t *Tracer) WaitAnyNonBlocking() (int, unix.WaitStatus, error)
+
+// GetEventMsgPID returns the ptrace event message from an arbitrary stopped PID.
+// After PTRACE_EVENT_FORK/VFORK it returns the child PID; after PTRACE_EVENT_EXEC
+// it returns the pre-exec PID.
+func (t *Tracer) GetEventMsgPID(pid int) (uint, error)
+
+// ContPID resumes an arbitrary ptrace-stopped PID. sig=0 delivers no signal.
+func (t *Tracer) ContPID(pid, sig int) error
+
+// InterruptDetach sends PTRACE_INTERRUPT to the current tracee, waits for the
+// resulting stop, then detaches. Safe to call when the tracee is running.
+func (t *Tracer) InterruptDetach() error
+
+// DetachAll interrupts and detaches from each PID in the list. ESRCH errors
+// (process already gone) are silently ignored.
+func (t *Tracer) DetachAll(pids []int) error
 ```
 
 **Critical design**: all ptrace syscalls must come from the same OS thread that issued
@@ -169,6 +204,20 @@ func InjectFrozen(pid int, target time.Time) (*Handle, error)   // frozen mode
 // FollowChild path (no elevated perms; child must have SysProcAttr{Ptrace: true}):
 func InjectAtTimeFollowChild(pid int, target time.Time) (*Handle, error)
 func InjectFrozenFollowChild(pid int, target time.Time) (*Handle, error)
+
+// FollowChild path, keeping the Tracer attached for ChildTracker use (phase 39):
+func InjectAtTimeFollowChildKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer, error)
+func InjectFrozenFollowChildKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer, error)
+
+// ChildHandle creates a Handle for a forked child that shares the parent's
+// trampoline (same StateAddr, different PID). No injection needed — fork copies
+// the address space including the trampoline page and vDSO patch.
+func ChildHandle(parent *Handle, childPID int) *Handle
+
+// Re-injection after exec() (phase 40). Temporarily retargets tr to pid, performs
+// a full fresh injection (vDSO locate → mmap → patch), then restores tr to parentPID.
+func ReInjectAtTimeAfterExec(tr *procmem.Tracer, parentPID, pid int, target time.Time) (*Handle, error)
+func ReInjectFrozenAfterExec(tr *procmem.Tracer, parentPID, pid int, target time.Time) (*Handle, error)
 
 // Live updates — single process_vm_writev, no ptrace stop required.
 func (h *Handle) SetTime(target time.Time) error    // advancing mode
@@ -289,6 +338,7 @@ injection target with `faketimectl`. The inject tests use an in-binary helper in
 | `pkg/api` | 8 | Shared HTTP request/response types (no build tag) |
 | `pkg/sdk` | 10 | Go client library; `Client`, `Timeshift`, `WithTimeT`, `ListTimeshifts`, `AdvanceTimeshift`, freeze helpers |
 | `pkg/faketime` | 25 | Non-Kubernetes injection: `Start`, `StartFrozen`, `Attach`, `AttachFrozen`, `Handle`, `Session` |
+| `pkg/faketime` (39–40) | 39–40 | `StartWithTracking`, `StartFrozenWithTracking`, `ChildTracker` (fork + exec-survivor auto-injection) |
 | `cmd/agent` | 7 | gRPC daemon: CRI→PID, inject, SetTime, Reset, handle map |
 | `cmd/controller` | 8 | HTTP+JSON API: timeshifts CRUD, TTL sweeper, pod watcher, advance-by-duration |
 | `deploy/` | 9 | `rbac.yaml`, `daemonset.yaml`, `controller-deployment.yaml` |
@@ -317,6 +367,12 @@ func StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error) // frozen
 func Attach(pid int, target time.Time) (*Handle, error)
 func AttachFrozen(pid int, target time.Time) (*Handle, error)
 
+// Child-tracking constructors (phase 39) — keep ptrace attached after injection
+// so the returned ChildTracker can watch for fork/exec events in the background.
+// No elevated permissions required (FollowChild path).
+func StartWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error)
+func StartFrozenWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error)
+
 // Update methods (all use process_vm_writev — no ptrace stop):
 func (h *Handle) SetTime(target time.Time) error   // switch to advancing mode
 func (h *Handle) Freeze(target time.Time) error    // switch to frozen mode
@@ -326,6 +382,44 @@ func (h *Handle) Reset() error                      // snap back to real clock
 
 `Handle` tracks its own `offset`/`frozenAt`/`frozen` state (under a `sync.Mutex`) so
 `effectiveTime()` can report the live fake time without re-reading process memory.
+
+#### `ChildTracker` — automatic fork + exec tracking (phases 39–40)
+
+`ChildTracker` keeps ptrace attached to the parent after injection and runs a
+background goroutine that watches for `PTRACE_EVENT_FORK`/`PTRACE_EVENT_VFORK` and
+`PTRACE_EVENT_EXEC` notifications.
+
+```go
+type ChildTracker struct {
+    // Handle is the parent process's fake-time handle.
+    Handle *Handle
+    // unexported: tracer, parentPID, children map, pendingStop map, done chan, wg, loopErr
+}
+
+// Children returns Handles for all child processes currently tracked.
+func (c *ChildTracker) Children() []*Handle
+
+// Err returns the first error the background watch loop encountered, if any.
+func (c *ChildTracker) Err() error
+
+// Close stops the watch loop, resets all tracked children to the real clock,
+// and detaches ptrace from the parent and all children.
+func (c *ChildTracker) Close() error
+```
+
+**Fork handling**: `PTRACE_EVENT_FORK`/`PTRACE_EVENT_VFORK` → read child PID via
+`GetEventMsgPID` → call `inject.ChildHandle` (same `StateAddr`, new PID — no re-injection
+needed because fork copies the address space including the trampoline page) → add to
+`children` and `pendingStop` → resume parent. When the child's implicit SIGSTOP arrives,
+arm it with `SetOptionsPID(TRACEFORK|TRACEVFORK|TRACEEXEC)` → resume child.
+
+**Exec handling** (phase 40): `PTRACE_EVENT_EXEC` → look up the Handle for `pid` →
+call `inject.ReInjectAtTimeAfterExec` / `inject.ReInjectFrozenAfterExec` (full fresh
+injection — vDSO locate, mmap trampoline, PokeText, write state) → swap `h.h` to the new
+`inject.Handle` so future `SetTime`/`Freeze` calls write to the new trampoline.
+
+**Self-exec** (PEX bootstrap, `os.Execv`): if `pid == c.parentPID`, the same logic runs
+on `c.Handle` rather than a child entry.
 
 #### `Session` — multi-process injection
 
@@ -692,7 +786,7 @@ self-contained.
 
 ---
 
-## File tree as of phase 37
+## File tree as of phase 40
 
 ```
 epochd/
@@ -733,7 +827,7 @@ epochd/
 │   │   ├── vdso.go                            # ✅ Locate(pid) → VDSOInfo
 │   │   └── locate_test.go                     # ✅
 │   ├── procmem/
-│   │   ├── procmem.go                         # ✅ Tracer, ReadMem, WriteMem, PokeText, FollowChild
+│   │   ├── procmem.go                         # ✅ Tracer, ReadMem, WriteMem, PokeText, FollowChild; SetTracee, SetOptions, SetOptionsPID, WaitAnyNonBlocking, GetEventMsgPID, ContPID, InterruptDetach, DetachAll
 │   │   └── procmem_test.go                    # ✅ TestTracerBasic
 │   ├── trampoline/
 │   │   ├── trampoline.asm                     # ✅ NASM source (118 bytes); MaskEnabled=1, MaskFrozen=3
@@ -741,11 +835,14 @@ epochd/
 │   │   ├── trampoline.go                      # ✅ Payload, StateOffset=86, EncodeState, DecodeState, MaskEnabled, MaskFrozen
 │   │   └── trampoline_test.go                 # ✅ regression + round-trip tests
 │   ├── inject/
-│   │   ├── inject.go                          # ✅ InjectAtTime, InjectFrozen, InjectAtTimeFollowChild, InjectFrozenFollowChild, SetTime, Freeze
+│   │   ├── inject.go                          # ✅ InjectAtTime, InjectFrozen, InjectAtTimeFollowChild, InjectFrozenFollowChild; InjectAtTimeFollowChildKeepTracer, InjectFrozenFollowChildKeepTracer, ChildHandle, ReInjectAtTimeAfterExec, ReInjectFrozenAfterExec
 │   │   ├── inject_test.go                     # ✅ TestRemoteMmap, TestInjectMechanics (uses writeState + MaskEnabled), TestInjectObserved*
 │   │   └── roundtrip_test.go                  # ✅ TestInjectRoundTrip* (inject+verify+reset+verify; uses MaskEnabled)
 │   ├── faketime/                              # standalone module: github.com/bkaznowski/epochd/pkg/faketime
-│   │   ├── faketime.go                       # ✅ Start, StartFrozen, Attach, AttachFrozen, Handle (Advance/Freeze/SetTime/Reset), Session
+│   │   ├── faketime.go                       # ✅ Start, StartFrozen, Attach, AttachFrozen, Handle, Session, ChildTracker, StartWithTracking, StartFrozenWithTracking
+│   │   ├── faketime_stub.go                  # ✅ non-Linux stubs (t.Skip() / errNotSupported); includes ChildTracker stubs
+│   │   ├── example_test.go                   # ✅ niladic Example funcs (ExampleStart, ExampleWithProcess, ExampleWithSession, ExampleStartWithTracking)
+│   │   ├── bench_test.go                     # ✅ BenchmarkClockGettime (faked vs baseline ns/clock_gettime via subprocess)
 │   │   └── go.mod                            # module github.com/bkaznowski/epochd/pkg/faketime; replace github.com/bkaznowski/epochd => ../..
 │   ├── agentpb/                               # ✅ generated from proto/agent/v1/agent.proto (freeze=field 3)
 │   │   └── agent_grpc.pb.go, agent.pb.go

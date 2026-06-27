@@ -172,6 +172,14 @@ func (t *Tracer) PokeText(addr uintptr, buf []byte) error {
 	return err
 }
 
+// SetTracee changes the PID that Tracer methods (GetRegs, SetRegs, PokeText,
+// Cont, Wait) operate on. Used when temporarily injecting into a process other
+// than the primary tracee (e.g. a child that just exec'd). The caller is
+// responsible for restoring the original PID when done.
+func (t *Tracer) SetTracee(pid int) {
+	t.run(func() { t.pid = pid })
+}
+
 // SetOptions sets PTRACE_O_* options on the current tracee.
 // Must be called while the tracee is ptrace-stopped.
 func (t *Tracer) SetOptions(opts int) error {
@@ -179,6 +187,18 @@ func (t *Tracer) SetOptions(opts int) error {
 	t.run(func() {
 		if e := unix.PtraceSetOptions(t.pid, opts); e != nil {
 			err = fmt.Errorf("procmem: PTRACE_SETOPTIONS pid %d: %w", t.pid, e)
+		}
+	})
+	return err
+}
+
+// SetOptionsPID sets PTRACE_O_* options on an arbitrary ptrace-stopped PID
+// without changing the Tracer's primary tracee (t.pid).
+func (t *Tracer) SetOptionsPID(pid, opts int) error {
+	var err error
+	t.run(func() {
+		if e := unix.PtraceSetOptions(pid, opts); e != nil {
+			err = fmt.Errorf("procmem: PTRACE_SETOPTIONS pid %d: %w", pid, e)
 		}
 	})
 	return err

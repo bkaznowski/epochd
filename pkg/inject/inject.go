@@ -96,7 +96,7 @@ func injectFollowChildKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle
 		tr.Detach() //nolint:errcheck
 		return nil, nil, err
 	}
-	if err := tr.SetOptions(unix.PTRACE_O_TRACEFORK | unix.PTRACE_O_TRACEVFORK); err != nil {
+	if err := tr.SetOptions(unix.PTRACE_O_TRACEFORK | unix.PTRACE_O_TRACEVFORK | unix.PTRACE_O_TRACEEXEC); err != nil {
 		tr.Detach() //nolint:errcheck
 		return nil, nil, fmt.Errorf("inject: SetOptions: %w", err)
 	}
@@ -106,6 +106,34 @@ func injectFollowChildKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle
 		return nil, nil, fmt.Errorf("inject: Cont parent: %w", err)
 	}
 	return h, tr, nil
+}
+
+// ReInjectAtTimeAfterExec re-injects into pid in advancing mode after the
+// process has called exec(). pid must be stopped at a PTRACE_EVENT_EXEC stop.
+// It performs the full injection sequence on the new address space (vDSO
+// locate, trampoline mmap, PokeText, state write). The Tracer's primary tracee
+// is temporarily switched to pid and restored to parentPID on return.
+func ReInjectAtTimeAfterExec(tr *procmem.Tracer, parentPID, pid int, target time.Time) (*Handle, error) {
+	sec, nsec := diffSecNsec(target, time.Now())
+	return reInjectAfterExec(tr, parentPID, pid, sec, nsec, trampoline.MaskEnabled)
+}
+
+// ReInjectFrozenAfterExec re-injects into pid in frozen mode after exec().
+// pid must be stopped at a PTRACE_EVENT_EXEC stop.
+func ReInjectFrozenAfterExec(tr *procmem.Tracer, parentPID, pid int, target time.Time) (*Handle, error) {
+	sec := target.Unix()
+	nsec := int64(target.Nanosecond())
+	return reInjectAfterExec(tr, parentPID, pid, sec, nsec, trampoline.MaskFrozen)
+}
+
+func reInjectAfterExec(tr *procmem.Tracer, parentPID, pid int, sec, nsec int64, mask uint64) (*Handle, error) {
+	tr.SetTracee(pid)
+	defer tr.SetTracee(parentPID) // always restore, even on error
+	info, err := vdso.Locate(pid)
+	if err != nil {
+		return nil, fmt.Errorf("inject: vdso.Locate after exec pid %d: %w", pid, err)
+	}
+	return injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
 }
 
 // ChildHandle returns a Handle for a process that forked from parent's target.

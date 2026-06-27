@@ -439,10 +439,11 @@ func (c *ChildTracker) handleEvent(pid int, ws unix.WaitStatus) {
 		return
 	}
 
-	// Check for a fork or vfork ptrace event.
+	// Check for fork, vfork, or exec ptrace events.
 	ptraceEvent := (int(ws) >> 16) & 0xFF
-	isFork := ws.StopSignal() == syscall.SIGTRAP &&
-		(ptraceEvent == unix.PTRACE_EVENT_FORK || ptraceEvent == unix.PTRACE_EVENT_VFORK)
+	isSIGTRAP := ws.StopSignal() == syscall.SIGTRAP
+	isFork := isSIGTRAP && (ptraceEvent == unix.PTRACE_EVENT_FORK || ptraceEvent == unix.PTRACE_EVENT_VFORK)
+	isExec := isSIGTRAP && ptraceEvent == unix.PTRACE_EVENT_EXEC
 
 	if isFork {
 		childPIDMsg, err := c.tracer.GetEventMsgPID(pid)
@@ -472,6 +473,11 @@ func (c *ChildTracker) handleEvent(pid int, ws unix.WaitStatus) {
 		return
 	}
 
+	if isExec {
+		c.handleExec(pid)
+		return
+	}
+
 	// Child's initial ptrace stop (auto-attached by PTRACE_O_TRACEFORK).
 	c.mu.Lock()
 	isPending := c.pendingStop[pid]
@@ -481,7 +487,9 @@ func (c *ChildTracker) handleEvent(pid int, ws unix.WaitStatus) {
 	c.mu.Unlock()
 
 	if isPending {
-		// Resume without forwarding the implicit stop signal.
+		// Set options on the child so its own fork/exec events are tracked.
+		c.tracer.SetOptionsPID(pid, //nolint:errcheck
+			unix.PTRACE_O_TRACEFORK|unix.PTRACE_O_TRACEVFORK|unix.PTRACE_O_TRACEEXEC)
 		c.tracer.ContPID(pid, 0) //nolint:errcheck
 		return
 	}
@@ -492,6 +500,71 @@ func (c *ChildTracker) handleEvent(pid int, ws unix.WaitStatus) {
 		sig = int(ws.StopSignal())
 	}
 	c.tracer.ContPID(pid, sig) //nolint:errcheck
+}
+
+// handleExec re-injects fake time into pid after it called exec(). pid must be
+// stopped at a PTRACE_EVENT_EXEC ptrace-stop. Handles both self-exec
+// (pid == c.parentPID, e.g. PEX bootstrap) and fork+exec (pid is a child).
+func (c *ChildTracker) handleExec(pid int) {
+	// Identify which handle belongs to this PID and what time it should show.
+	var target time.Time
+	var frozen bool
+
+	if pid == c.parentPID {
+		c.Handle.mu.Lock()
+		target = c.Handle.effectiveTime()
+		frozen = c.Handle.frozen
+		c.Handle.mu.Unlock()
+	} else {
+		c.mu.Lock()
+		childH, ok := c.children[pid]
+		c.mu.Unlock()
+		if !ok {
+			// Unknown PID — not tracked; just resume.
+			c.tracer.ContPID(pid, 0) //nolint:errcheck
+			return
+		}
+		childH.mu.Lock()
+		target = childH.effectiveTime()
+		frozen = childH.frozen
+		childH.mu.Unlock()
+	}
+
+	// Re-inject into the fresh address space. The Tracer temporarily switches
+	// its primary tracee to pid and restores it to c.parentPID on return.
+	var newIH *inject.Handle
+	var err error
+	if frozen {
+		newIH, err = inject.ReInjectFrozenAfterExec(c.tracer, c.parentPID, pid, target)
+	} else {
+		newIH, err = inject.ReInjectAtTimeAfterExec(c.tracer, c.parentPID, pid, target)
+	}
+	if err != nil {
+		c.mu.Lock()
+		if c.loopErr == nil {
+			c.loopErr = fmt.Errorf("faketime: re-inject after exec pid %d: %w", pid, err)
+		}
+		c.mu.Unlock()
+		c.tracer.ContPID(pid, 0) //nolint:errcheck
+		return
+	}
+
+	// Swap the inject.Handle so future SetTime/Freeze calls write to the new
+	// trampoline page in the exec'd address space.
+	if pid == c.parentPID {
+		c.Handle.mu.Lock()
+		c.Handle.h = newIH
+		c.Handle.mu.Unlock()
+	} else {
+		c.mu.Lock()
+		childH := c.children[pid]
+		c.mu.Unlock()
+		childH.mu.Lock()
+		childH.h = newIH
+		childH.mu.Unlock()
+	}
+
+	c.tracer.ContPID(pid, 0) //nolint:errcheck
 }
 
 func (c *ChildTracker) cleanup() {

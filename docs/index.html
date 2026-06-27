@@ -359,6 +359,7 @@ tr:last-child td { border-bottom: none; }
   <a href="#local-overview">Overview</a>
   <a href="#local-quickstart">Quickstart</a>
   <a href="#local-api">API reference</a>
+  <a href="#child-tracking">Fork &amp; exec tracking</a>
 
   <div class="nav-section-label">CLI tool</div>
   <a href="#cli-install">Install &amp; run</a>
@@ -1217,6 +1218,82 @@ if err := s.Reset(); err != nil { ... }</code></pre>
 }</code></pre>
 
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+<h2 id="child-tracking">Fork &amp; exec tracking — ChildTracker</h2>
+
+<p>When the target process spawns child processes via <code>fork</code>/<code>vfork</code>, the children inherit the patched vDSO mapping and see the same fake time automatically. However, if a child (or the parent itself) calls <code>exec()</code>, the new process image replaces the trampoline page and injection is lost.</p>
+
+<p><code>StartWithTracking</code> and <code>StartFrozenWithTracking</code> keep ptrace attached after the initial injection and run a background goroutine that handles both cases:</p>
+
+<ul>
+  <li><strong>Fork events</strong> (<code>PTRACE_EVENT_FORK</code> / <code>PTRACE_EVENT_VFORK</code>) — a <code>Handle</code> is created for the child immediately, pointing at the same trampoline the child inherited. No re-injection needed.</li>
+  <li><strong>Exec events</strong> (<code>PTRACE_EVENT_EXEC</code>) — the process is re-injected from scratch (new mmap, new trampoline, new vDSO patch) before it runs any user code. This covers both <em>self-exec</em> (same PID, e.g. PEX bootstrap) and <em>fork+exec</em> (child executes a new binary).</li>
+</ul>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Function / method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>StartWithTracking(cmd, target) (*ChildTracker, error)</code></td>
+      <td>Starts <code>cmd</code> in advancing mode and returns a <code>ChildTracker</code> that automatically handles all descendant forks and execs. No elevated permissions required.</td>
+    </tr>
+    <tr>
+      <td><code>StartFrozenWithTracking(cmd, target) (*ChildTracker, error)</code></td>
+      <td>Same as <code>StartWithTracking</code> but starts with the clock frozen at <code>target</code>.</td>
+    </tr>
+    <tr>
+      <td><code>ct.Handle</code></td>
+      <td>The parent process's fake-time <code>Handle</code>. Call <code>SetTime</code>, <code>Freeze</code>, or <code>Advance</code> on it to update the parent's clock.</td>
+    </tr>
+    <tr>
+      <td><code>ct.Children() []*Handle</code></td>
+      <td>Returns <code>Handle</code>s for all child processes currently tracked. The list grows as new children are forked.</td>
+    </tr>
+    <tr>
+      <td><code>ct.Err() error</code></td>
+      <td>Returns the first error the background loop encountered, if any. Check after <code>Close</code>.</td>
+    </tr>
+    <tr>
+      <td><code>ct.Close() error</code></td>
+      <td>Stops the watch loop, resets all tracked children to the real clock, and detaches ptrace from the parent and all children. The parent process continues running.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Example — Postgres postmaster pattern</h3>
+<pre><code class="language-go">func TestPostgresTimeshift(t *testing.T) {
+    cmd := exec.Command("postgres", "-D", "/tmp/pgdata")
+    target := time.Now().Add(365 * 24 * time.Hour)
+
+    ct, err := faketime.StartWithTracking(cmd, target)
+    if err != nil {
+        t.Fatalf("StartWithTracking: %v", err)
+    }
+    t.Cleanup(func() {
+        ct.Close()        // detaches ptrace, resets children's clocks
+        cmd.Process.Kill()
+        cmd.Wait()
+    })
+
+    // ct.Handle controls the postmaster's clock.
+    // Any backend processes forked by the postmaster are automatically tracked
+    // and see the same fake time.
+    // Advance all clocks by 30 days:
+    if err := ct.Handle.Advance(30 * 24 * time.Hour); err != nil {
+        t.Fatal(err)
+    }
+    // ct.Children() now includes handles for each forked backend.
+}</code></pre>
+
+<div class="callout info">
+  <span class="callout-icon">💡</span>
+  <div class="callout-body">
+    <p><code>StartWithTracking</code> keeps ptrace attached to the parent for the duration of tracking. This adds a brief ptrace-stop on each <code>fork</code> call (typically microseconds) while the child is registered. For long-lived child processes this overhead is negligible, but avoid it for processes that fork thousands of times per second.</p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <h2 id="cli-install">CLI tool — faketimectl</h2>
 
 <p><code>faketimectl</code> is a command-line tool for managing epochd timeshifts. It has two sets of subcommands: <strong>controller subcommands</strong> that talk to a running epochd controller over HTTP, and <strong>local injection subcommands</strong> that inject directly into a process via ptrace.</p>
@@ -1320,7 +1397,7 @@ faketimectl status b3f5c2d1-...
 faketimectl delete b3f5c2d1-...</code></pre>
 
 <h3>Local injection subcommands</h3>
-<p>These subcommands inject directly into a process via ptrace. No epochd controller is required, but the target process must be owned by you and the kernel ptrace scope must permit it (see the warning below).</p>
+<p>These subcommands inject directly into a process via ptrace. No epochd controller is required.</p>
 
 <div class="table-wrap">
 <table>
@@ -1329,26 +1406,33 @@ faketimectl delete b3f5c2d1-...</code></pre>
     <tr>
       <td><code>inject</code></td>
       <td><code>--pid=PID --time=RFC3339 [--freeze]</code></td>
-      <td>Inject fake time into a running process. <code>--freeze</code> pins the clock so it never advances.</td>
+      <td>Inject fake time into an already-running process via <code>PTRACE_ATTACH</code>. Requires <code>CAP_SYS_PTRACE</code> and <code>ptrace_scope ≤ 1</code>.</td>
     </tr>
     <tr>
       <td><code>reset</code></td>
       <td><code>--pid=PID</code></td>
       <td>Snap the target process back to the real clock.</td>
     </tr>
+    <tr>
+      <td><code>run</code></td>
+      <td><code>--time=RFC3339 [--freeze] [--track] [--] CMD [ARGS]</code></td>
+      <td>Start <code>CMD</code> with fake time injected from the first instruction. <code>--freeze</code> pins the clock. <code>--track</code> tracks all forked children and re-injects after <code>exec()</code>. No elevated permissions required — uses the FollowChild ptrace path.</td>
+    </tr>
   </tbody>
 </table>
 </div>
 
-<h3>Local injection example</h3>
-<pre><code class="language-bash"># Terminal 1: run the sample clock-printer target
+<h3>Local injection examples</h3>
+<pre><code class="language-bash"># --- inject / reset: attach to an already-running process ---
+
+# Terminal 1: run the sample clock-printer target
 ./clockprinter
-# 2026-06-26T10:00:00Z
-# 2026-06-26T10:00:01Z
+# 2026-06-27T10:00:00Z
+# 2026-06-27T10:00:01Z
 
 # Terminal 2: inject a fake time
 sudo faketimectl inject --pid=$(pgrep clockprinter) --time=2030-01-01T00:00:00Z
-# pid 12345: clock set to 2030-01-01T00:00:00Z (+3y from now, state=0x7ffe...)
+# pid 12345: clock set to 2030-01-01T00:00:00Z (advancing, state=0x7ffe...)
 
 # Terminal 1 now prints:
 # 2030-01-01T00:00:00Z
@@ -1356,7 +1440,29 @@ sudo faketimectl inject --pid=$(pgrep clockprinter) --time=2030-01-01T00:00:00Z
 
 # Terminal 2: reset to real time
 sudo faketimectl reset --pid=$(pgrep clockprinter)
-# pid 12345: clock reset to real time (state=0x7ffe...)</code></pre>
+# pid 12345: clock reset to real time (state=0x7ffe...)
+
+# --- run: start a new process with fake time ---
+
+# Start a command with the clock set to 2030, advancing normally.
+# No root or CAP_SYS_PTRACE required.
+faketimectl run --time=2030-01-01T00:00:00Z -- ./clockprinter
+# faketimectl: pid 12346: clock set to 2030-01-01T00:00:00Z (advancing)
+# 2030-01-01T00:00:00Z
+# 2030-01-01T00:00:01Z
+
+# Freeze the clock at a specific instant:
+faketimectl run --time=2030-01-01T00:00:00Z --freeze -- ./clockprinter
+# faketimectl: pid 12347: clock set to 2030-01-01T00:00:00Z (frozen)
+# 2030-01-01T00:00:00Z
+# 2030-01-01T00:00:00Z   ← same every second
+
+# Start a server that forks worker processes; track all children and
+# re-inject after any exec() so every descendant sees fake time:
+faketimectl run --time=2030-01-01T00:00:00Z --track -- postgres -D /tmp/pgdata
+# faketimectl: pid 12348: clock set to 2030-01-01T00:00:00Z (advancing, tracking children)
+# faketimectl: fork: pid 12348 -> child 12349
+# faketimectl: exec: re-injected pid 12349</code></pre>
 
 <div class="callout warn">
   <span class="callout-icon">⚠️</span>
@@ -1454,8 +1560,8 @@ sudo faketimectl reset --pid=$(pgrep clockprinter)
     </tr>
     <tr>
       <td><strong>Forked children inherit the injection</strong></td>
-      <td>Processes forked after injection share the same vDSO mapping and see the same fake time. This is usually desirable.</td>
-      <td>Intended behaviour. The Go runtime's <code>os/exec</code> creates new processes, not forks, so child processes started via <code>exec.Command</code> do <em>not</em> inherit the injection unless you start them with <code>faketime.Start</code>.</td>
+      <td>Processes forked after injection share the same vDSO mapping and see the same fake time. This is usually desirable but the caller has no handle to update the child's clock independently.</td>
+      <td>Use <code>faketime.StartWithTracking</code> to obtain per-child <code>Handle</code>s and automatically re-inject after any <code>exec()</code> call. For simple cases where the same fake time is sufficient, the inherited injection is enough.</td>
     </tr>
     <tr>
       <td><strong>No HA for the controller</strong></td>
@@ -1564,6 +1670,11 @@ sudo faketimectl reset --pid=$(pgrep clockprinter)
 
 <h3>What happens if the target process calls <code>fork</code>?</h3>
 <p>Forked children inherit the parent's vDSO mapping, which includes the patched <code>JMP</code> and the trampoline page. Children see the same fake time as the parent. This is usually the desired behaviour when testing a multi-process server.</p>
+<p>If you need a <code>Handle</code> for each child (to update clocks independently, or to track when children exit), use <code>faketime.StartWithTracking</code> instead of <code>faketime.Start</code>. It runs a background goroutine that watches for <code>PTRACE_EVENT_FORK</code> notifications and registers a <code>Handle</code> for each child as it is created.</p>
+
+<h3>What happens if the target process calls <code>exec</code>?</h3>
+<p><code>exec()</code> replaces the entire process image. The kernel remaps the vDSO clean and the trampoline page is gone — the process returns to seeing real time.</p>
+<p>Use <code>faketime.StartWithTracking</code> to handle this automatically. The background goroutine listens for <code>PTRACE_EVENT_EXEC</code> stops (fired before the new binary's <code>_start</code> runs) and performs a fresh injection into the new address space. This covers both self-exec (same PID, e.g. a PEX bootstrap calling <code>os.Execv</code> on itself) and fork+exec patterns (a child process executing a new binary).</p>
 
 <h3>What if the agent restarts?</h3>
 <p>The agent holds the inject handle map in memory. When it restarts, the handles are gone. The controller detects this: a failed gRPC call returns "handle not found", which triggers re-injection. Additionally, the pod watcher detects the agent's container ID changing and proactively re-injects all affected timeshifts. A brief window (typically under a few seconds) where the target process sees real time is possible during an agent restart.</p>
