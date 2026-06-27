@@ -1,4 +1,4 @@
-﻿//go:build linux
+//go:build linux
 
 // Command agent is the node-level gRPC daemon that performs vDSO clock
 // injection on behalf of the epochd controller.

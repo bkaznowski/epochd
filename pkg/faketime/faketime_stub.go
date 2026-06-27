@@ -1,4 +1,4 @@
-﻿//go:build !linux
+//go:build !linux
 
 // Package faketime injects fake time into local (non-Kubernetes) processes.
 // This stub is compiled on non-Linux platforms; all operations return errors.

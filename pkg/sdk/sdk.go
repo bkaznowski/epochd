@@ -1,4 +1,4 @@
-﻿// Package sdk is the Go client library for the epochd controller API.
+// Package sdk is the Go client library for the epochd controller API.
 // It is safe to use from any OS and has no Linux-specific dependencies.
 //
 // Typical e2e test usage:

@@ -1,4 +1,4 @@
-﻿//go:build linux
+//go:build linux
 
 // Package inject ties vDSO discovery, ptrace, and the trampoline payload into
 // the public injection API.

@@ -1,4 +1,4 @@
-﻿// Package main implements the epochd controller: an HTTP+JSON service that
+// Package main implements the epochd controller: an HTTP+JSON service that
 // resolves pods via the Kubernetes API and orchestrates clock injection via
 // per-node gRPC agents.
 package main

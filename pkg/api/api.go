@@ -1,4 +1,4 @@
-﻿// Package api holds the HTTP+JSON request and response types for the epochd
+// Package api holds the HTTP+JSON request and response types for the epochd
 // controller's REST API. These types are shared between the controller
 // implementation and any Go client (e.g. the e2e test SDK in phase 10).
 // No build tag — the types are pure structs with no OS-specific dependencies.

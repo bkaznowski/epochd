@@ -1,4 +1,4 @@
-﻿// Package agentclient provides a connection pool for the epochd node agent's
+// Package agentclient provides a connection pool for the epochd node agent's
 // gRPC API. One gRPC connection is maintained per node IP and reused across
 // calls. Connections are created lazily on first use and closed by Close.
 package agentclient

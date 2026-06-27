@@ -1,4 +1,4 @@
-﻿//go:build linux
+//go:build linux
 
 // Package trampoline holds the hand-assembled vDSO hook payload and the helpers
 // needed to encode and decode the state struct that sits immediately after it.
