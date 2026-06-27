@@ -37,7 +37,7 @@ jobs:
             echo ""
             echo "### pkg/faketime"
             echo '```'
-            go tool cover -func=pkg/faketime/coverage-faketime.out
+            (cd pkg/faketime && go tool cover -func=coverage-faketime.out)
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -99,7 +99,8 @@ jobs:
 
           # Per-module HTML coverage reports.
           go tool cover -html=coverage-root.out -o pages/coverage/root.html
-          go tool cover -html=pkg/faketime/coverage-faketime.out -o pages/coverage/faketime.html
+          # pkg/faketime is a separate module; go tool cover must run inside it.
+          (cd pkg/faketime && go tool cover -html=coverage-faketime.out -o ../../pages/coverage/faketime.html)
 
           # Extract total coverage percentage for the badge.
           pct=$(go tool cover -func=coverage-root.out | awk '/^total:/{gsub(/%/,""); print $3}')
