@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestHelperBlock is the tracee target for TestTracerBasic.
@@ -149,6 +151,180 @@ func TestTracerBasic(t *testing.T) {
 	// Child must still be alive after detach.
 	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
 		t.Errorf("child not running after Detach: %v", err)
+	}
+}
+
+// TestTracerOps exercises Tracer methods that require a stopped ptrace child:
+// SingleStep, Cont, Wait, SetTracee, SetOptions, SetOptionsPID,
+// WaitAnyNonBlocking, ContPID, InterruptDetach, DetachAll, isNoProcess.
+func TestTracerOps(t *testing.T) {
+	spawnHelper := func(t *testing.T) (int, *Tracer) {
+		t.Helper()
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatalf("os.Executable: %v", err)
+		}
+		cmd := exec.Command(exe, "-test.run=TestHelperBlock", "-test.v")
+		cmd.Env = append(os.Environ(), "EPOCHD_TRACER_HELPER=1")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("cmd.Start: %v", err)
+		}
+		t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+		tr := NewTracer()
+		if err := tr.FollowChild(cmd.Process.Pid); err != nil {
+			t.Fatalf("FollowChild: %v", err)
+		}
+		return cmd.Process.Pid, tr
+	}
+
+	t.Run("SingleStep_Wait", func(t *testing.T) {
+		pid, tr := spawnHelper(t)
+		defer tr.Detach() //nolint:errcheck
+
+		if err := tr.SingleStep(); err != nil {
+			t.Fatalf("SingleStep: %v", err)
+		}
+		ws, err := tr.Wait()
+		if err != nil {
+			t.Fatalf("Wait after SingleStep: %v", err)
+		}
+		if !ws.Stopped() {
+			t.Errorf("expected stopped status after SingleStep, pid=%d status=0x%08x", pid, uint32(ws))
+		}
+	})
+
+	t.Run("SetOptions", func(t *testing.T) {
+		_, tr := spawnHelper(t)
+		defer tr.Detach() //nolint:errcheck
+
+		if err := tr.SetOptions(unix.PTRACE_O_TRACEFORK); err != nil {
+			t.Fatalf("SetOptions: %v", err)
+		}
+	})
+
+	t.Run("SetOptionsPID", func(t *testing.T) {
+		pid, tr := spawnHelper(t)
+		defer tr.Detach() //nolint:errcheck
+
+		if err := tr.SetOptionsPID(pid, unix.PTRACE_O_TRACEFORK); err != nil {
+			t.Fatalf("SetOptionsPID: %v", err)
+		}
+	})
+
+	t.Run("SetTracee", func(t *testing.T) {
+		pid, tr := spawnHelper(t)
+		defer tr.Detach() //nolint:errcheck
+
+		// Change tracee and back — purely exercises the mutex-locked field update.
+		tr.SetTracee(0)
+		tr.SetTracee(pid)
+	})
+
+	t.Run("Cont_Wait", func(t *testing.T) {
+		pid, tr := spawnHelper(t)
+		defer tr.Detach() //nolint:errcheck
+
+		if err := tr.Cont(0); err != nil {
+			t.Fatalf("Cont: %v", err)
+		}
+		// Send SIGSTOP so we can wait for a stop event.
+		if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+			t.Fatalf("SIGSTOP: %v", err)
+		}
+		ws, err := tr.Wait()
+		if err != nil {
+			t.Fatalf("Wait after Cont/SIGSTOP: %v", err)
+		}
+		if !ws.Stopped() {
+			t.Errorf("expected stopped status, got 0x%08x", uint32(ws))
+		}
+	})
+
+	t.Run("WaitAnyNonBlocking", func(t *testing.T) {
+		_, tr := spawnHelper(t)
+		defer tr.Detach() //nolint:errcheck
+
+		// Child is stopped at the initial SIGTRAP — there should be a pending event.
+		// Non-blocking wait may or may not return the stopped child depending on
+		// whether the kernel surfaces it; just assert no error.
+		_, _, err := tr.WaitAnyNonBlocking()
+		if err != nil {
+			t.Fatalf("WaitAnyNonBlocking: %v", err)
+		}
+	})
+
+	t.Run("ContPID", func(t *testing.T) {
+		pid, tr := spawnHelper(t)
+
+		if err := tr.ContPID(pid, 0); err != nil {
+			t.Fatalf("ContPID: %v", err)
+		}
+		// Interrupt and detach so the cleanup doesn't double-detach.
+		tr.InterruptDetach() //nolint:errcheck
+	})
+
+	t.Run("InterruptDetach", func(t *testing.T) {
+		_, tr := spawnHelper(t)
+
+		if err := tr.Cont(0); err != nil {
+			t.Fatalf("Cont before InterruptDetach: %v", err)
+		}
+		if err := tr.InterruptDetach(); err != nil {
+			t.Fatalf("InterruptDetach: %v", err)
+		}
+	})
+
+	t.Run("DetachAll", func(t *testing.T) {
+		pid, tr := spawnHelper(t)
+
+		// DetachAll sends PTRACE_INTERRUPT then waits; child must be running first.
+		if err := tr.Cont(0); err != nil {
+			t.Fatalf("Cont before DetachAll: %v", err)
+		}
+		if err := tr.DetachAll([]int{pid}); err != nil {
+			t.Fatalf("DetachAll: %v", err)
+		}
+	})
+
+	t.Run("DetachAll_DeadPID_isNoProcess", func(t *testing.T) {
+		// A PID we're not the parent of causes PtraceInterrupt→ESRCH (ignored),
+		// Wait4→ECHILD (ignored), PtraceDetach→ESRCH (swallowed by isNoProcess).
+		// DetachAll must return nil.
+		tr := NewTracer()
+		if err := tr.DetachAll([]int{999999999}); err != nil {
+			t.Fatalf("DetachAll with non-existent PID: %v", err)
+		}
+	})
+}
+
+// TestTracerAttach tests Attach on a running process. In privileged Docker this
+// succeeds; on hosts with Yama ptrace_scope=1+ it is skipped.
+func TestTracerAttach(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestHelperBlock", "-test.v")
+	cmd.Env = append(os.Environ(), "EPOCHD_TRACER_HELPER=1")
+	// No Ptrace:true — we want a freely-running process.
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+
+	pid := cmd.Process.Pid
+	tr := NewTracer()
+
+	if err := tr.Attach(pid); err != nil {
+		// Skip if Yama or permissions prevent PTRACE_ATTACH.
+		t.Skipf("Attach not permitted (ptrace_scope): %v", err)
+	}
+	t.Cleanup(func() { tr.Detach() }) //nolint:errcheck
+
+	// After PTRACE_ATTACH the process is stopped — GetRegs should succeed.
+	if _, err := tr.GetRegs(); err != nil {
+		t.Fatalf("GetRegs after Attach: %v", err)
 	}
 }
 

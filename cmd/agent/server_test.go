@@ -174,6 +174,26 @@ func TestDrainEmpty(t *testing.T) {
 	s.drain(context.Background()) // must not panic
 }
 
+// TestShortID verifies that shortID strips the runtime:// prefix and truncates.
+func TestShortID(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"containerd://abcdef123456789", "abcdef123456"},
+		{"docker://short", "short"},
+		{"", ""},
+		{"noslash", "noslash"},
+		{"containerd://abc", "abc"},
+	}
+	for _, tc := range tests {
+		got := shortID(tc.input)
+		if got != tc.want {
+			t.Errorf("shortID(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
 // TestDrainRespectsTimeout verifies that drain stops early when its context
 // expires. We use a pre-cancelled context to trigger the timeout immediately.
 func TestDrainRespectsTimeout(t *testing.T) {
