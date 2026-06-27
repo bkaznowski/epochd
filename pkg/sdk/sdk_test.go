@@ -33,6 +33,12 @@ type fakeServer struct {
 	// statusContainerError, if non-empty, is the Error field returned for the
 	// container in every status response. Takes precedence over notReadyCount.
 	statusContainerError string
+
+	// conflictOnCreate, when true, makes POST /timeshifts return 409 Conflict.
+	conflictOnCreate bool
+
+	// pods is returned by GET /resolve.
+	pods []api.ResolvedPod
 }
 
 func newFakeServer() *fakeServer {
@@ -43,6 +49,7 @@ func newFakeServer() *fakeServer {
 	fs.mux.HandleFunc("PATCH /timeshifts/{id}", fs.handleUpdate)
 	fs.mux.HandleFunc("DELETE /timeshifts/{id}", fs.handleDelete)
 	fs.mux.HandleFunc("GET /timeshifts/{id}/status", fs.handleStatus)
+	fs.mux.HandleFunc("GET /resolve", fs.handleResolve)
 	return fs
 }
 
@@ -61,6 +68,10 @@ func (fs *fakeServer) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (fs *fakeServer) handleCreate(w http.ResponseWriter, r *http.Request) {
+	if fs.conflictOnCreate {
+		writeErr(w, http.StatusConflict, "selector conflicts with existing timeshift")
+		return
+	}
 	var req api.CreateTimeshiftRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad json")
@@ -74,6 +85,7 @@ func (fs *fakeServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		ID:        "test-id-1234",
 		Namespace: req.Namespace,
 		Time:      req.Time,
+		Frozen:    req.Freeze,
 		AppliedTo: []string{"pod-a/main"},
 	}
 	if req.TTL != "" {
@@ -104,8 +116,17 @@ func (fs *fakeServer) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad json")
 		return
 	}
-	fs.stored.Time = req.Time
+	if req.Time != "" {
+		fs.stored.Time = req.Time
+	}
+	if req.Freeze {
+		fs.stored.Frozen = true
+	}
 	writeJSON(w, http.StatusOK, fs.stored)
+}
+
+func (fs *fakeServer) handleResolve(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, api.ResolveResponse{Pods: fs.pods})
 }
 
 func (fs *fakeServer) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -556,5 +577,165 @@ func TestWithTimeCleansUpOnWaitError(t *testing.T) {
 	}
 	if fs.stored != nil {
 		t.Error("timeshift was not deleted after WaitForActive failure")
+	}
+}
+
+func TestCreateFrozenTimeshift(t *testing.T) {
+	client, _ := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	ts, err := client.CreateFrozenTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateFrozenTimeshift: %v", err)
+	}
+	if !ts.Frozen {
+		t.Error("expected Frozen=true")
+	}
+	if !ts.Time.Equal(target) {
+		t.Errorf("Time: got %v want %v", ts.Time, target)
+	}
+}
+
+func TestFreezeTimeshift(t *testing.T) {
+	client, _ := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	created, err := client.CreateTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateTimeshift: %v", err)
+	}
+
+	frozen, err := client.FreezeTimeshift(context.Background(), created.ID, target.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("FreezeTimeshift: %v", err)
+	}
+	if !frozen.Frozen {
+		t.Error("expected Frozen=true after FreezeTimeshift")
+	}
+}
+
+func TestAdvanceTimeshift(t *testing.T) {
+	client, _ := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	created, err := client.CreateTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateTimeshift: %v", err)
+	}
+
+	advanced, err := client.AdvanceTimeshift(context.Background(), created.ID, 6*time.Hour)
+	if err != nil {
+		t.Fatalf("AdvanceTimeshift: %v", err)
+	}
+	if advanced.ID != created.ID {
+		t.Errorf("ID mismatch: got %q want %q", advanced.ID, created.ID)
+	}
+}
+
+func TestAdvanceTimeshiftNotFound(t *testing.T) {
+	client, _ := startFake(t)
+
+	_, err := client.AdvanceTimeshift(context.Background(), "no-such-id", time.Hour)
+	if !sdk.IsNotFound(err) {
+		t.Errorf("expected IsNotFound, got %v", err)
+	}
+}
+
+func TestResolve(t *testing.T) {
+	client, fs := startFake(t)
+	fs.pods = []api.ResolvedPod{
+		{Name: "web-abc", Namespace: "default", NodeIP: "10.0.0.1", Containers: []string{"app"}},
+	}
+
+	pods, err := client.Resolve(context.Background(), "default", "app=web")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if len(pods) != 1 {
+		t.Fatalf("expected 1 pod, got %d", len(pods))
+	}
+	if pods[0].Name != "web-abc" {
+		t.Errorf("pod name: got %q want %q", pods[0].Name, "web-abc")
+	}
+}
+
+func TestResolveEmpty(t *testing.T) {
+	client, _ := startFake(t)
+
+	pods, err := client.Resolve(context.Background(), "default", "app=nothing")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if len(pods) != 0 {
+		t.Errorf("expected 0 pods, got %d", len(pods))
+	}
+}
+
+func TestWithFrozenTime(t *testing.T) {
+	client, fs := startFake(t)
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	var capturedFrozen bool
+	err := sdk.WithFrozenTime(context.Background(), client, "default", "app=svc", target, time.Hour,
+		func(ctx context.Context, ts *sdk.Timeshift) error {
+			capturedFrozen = ts.Frozen
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("WithFrozenTime: %v", err)
+	}
+	if !capturedFrozen {
+		t.Error("expected Frozen=true inside WithFrozenTime callback")
+	}
+	if fs.stored != nil {
+		t.Error("timeshift was not deleted after WithFrozenTime")
+	}
+}
+
+func TestIsConflict(t *testing.T) {
+	client, fs := startFake(t)
+	fs.conflictOnCreate = true
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	_, err := client.CreateTimeshift(context.Background(), "default", "app=svc", target, time.Hour)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !sdk.IsConflict(err) {
+		t.Errorf("expected IsConflict, got %v", err)
+	}
+	if sdk.IsNotFound(err) {
+		t.Error("IsNotFound should be false for a conflict error")
+	}
+}
+
+func TestWithHTTPClient(t *testing.T) {
+	client, _ := startFake(t)
+	custom := &http.Client{Timeout: 5 * time.Second}
+	client2 := client.WithHTTPClient(custom)
+	if client2 == client {
+		t.Error("WithHTTPClient should return a new client, not the same pointer")
+	}
+}
+
+func TestWithTimeTRunsFn(t *testing.T) {
+	client, _ := startFake(t)
+	t.Setenv("EPOCHD_URL", "http://fake") // non-empty → WithTimeT should not skip
+	target := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	called := false
+	t.Run("inner", func(t *testing.T) {
+		sdk.WithTimeT(t, client, "default", "app=svc", target, time.Hour,
+			func(t *testing.T, ts *sdk.Timeshift) {
+				called = true
+				if ts.ID == "" {
+					t.Error("expected non-empty ID inside WithTimeT")
+				}
+			},
+		)
+	})
+	if !called {
+		t.Error("WithTimeT fn body was not called when EPOCHD_URL is set")
 	}
 }

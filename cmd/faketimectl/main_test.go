@@ -46,6 +46,7 @@ func (fc *fakeController) handleCreate(w http.ResponseWriter, r *http.Request) {
 		ID:        "abc1234",
 		Namespace: req.Namespace,
 		Time:      req.Time,
+		Frozen:    req.Freeze,
 		AppliedTo: []string{"web-abc/app"},
 	}
 	if req.TTL != "" {
@@ -81,7 +82,9 @@ func (fc *fakeController) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req api.UpdateTimeshiftRequest
 	json.NewDecoder(r.Body).Decode(&req) //nolint:errcheck
-	fc.stored.Time = req.Time
+	if req.Time != "" {
+		fc.stored.Time = req.Time
+	}
 	fcWriteJSON(w, http.StatusOK, fc.stored)
 }
 
@@ -391,5 +394,52 @@ func TestHelpShowsUsage(t *testing.T) {
 	})
 	if !strings.Contains(out, "create") || !strings.Contains(out, "status") {
 		t.Errorf("help output missing subcommands: %q", out)
+	}
+}
+
+func TestCmdAdvance(t *testing.T) {
+	fc, url := startFake(t)
+	fc.stored = &api.TimeshiftResponse{
+		ID:        "abc1234",
+		Namespace: "default",
+		Time:      "2030-01-01T00:00:00Z",
+		AppliedTo: []string{"web-abc/app"},
+	}
+	out := mustRun(t, []string{"advance", "--url=" + url, "--by=24h", "abc1234"})
+	if !strings.Contains(out, "advanced") {
+		t.Errorf("advance output missing 'advanced': %q", out)
+	}
+	if !strings.Contains(out, "abc1234") {
+		t.Errorf("advance output missing ID: %q", out)
+	}
+}
+
+func TestCmdAdvanceMissingBy(t *testing.T) {
+	fc, url := startFake(t)
+	fc.stored = &api.TimeshiftResponse{ID: "abc1234", Time: "2030-01-01T00:00:00Z"}
+	mustFail(t, []string{"advance", "--url=" + url, "abc1234"}, "--by")
+}
+
+func TestCmdAdvanceMissingID(t *testing.T) {
+	_, url := startFake(t)
+	mustFail(t, []string{"advance", "--url=" + url, "--by=24h"}, "ID required")
+}
+
+func TestCmdAdvanceNotFound(t *testing.T) {
+	_, url := startFake(t)
+	mustFail(t, []string{"advance", "--url=" + url, "--by=24h", "no-such-id"}, "not found")
+}
+
+func TestCmdCreateFrozen(t *testing.T) {
+	_, url := startFake(t)
+	out := mustRun(t, []string{"create",
+		"--url=" + url,
+		"--namespace=default",
+		"--selector=app=web",
+		"--time=2030-01-01T00:00:00Z",
+		"--freeze",
+	})
+	if !strings.Contains(out, "created timeshift") {
+		t.Errorf("output missing 'created timeshift': %q", out)
 	}
 }
