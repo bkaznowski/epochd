@@ -236,7 +236,7 @@ func (t *Tracer) ContPID(pid, sig int) error {
 func (t *Tracer) InterruptDetach() error {
 	var err error
 	t.run(func() {
-		unix.PtraceInterrupt(t.pid) //nolint:errcheck — may already be stopped/dead
+		unix.PtraceInterrupt(t.pid) //nolint:errcheck // may already be stopped/dead
 		var ws unix.WaitStatus
 		unix.Wait4(t.pid, &ws, 0, nil) //nolint:errcheck
 		if e := unix.PtraceDetach(t.pid); e != nil && !isNoProcess(e) {

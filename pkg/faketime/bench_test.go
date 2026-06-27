@@ -63,7 +63,7 @@ func measureClockInChild(b *testing.B, withFakeTime bool) int64 {
 			b.Fatal(err)
 		}
 	}
-	cmd.Wait() //nolint:errcheck — PASS/FAIL exit code; we check the output
+	cmd.Wait() //nolint:errcheck // PASS/FAIL exit code; we check the output
 
 	// Find the first line that parses as a positive integer (ignoring "PASS" etc.).
 	var nsPer int64
