@@ -154,7 +154,7 @@ jobs:
               <li><a href="root.html">Root module (github.com/bkaznowski/epochd)</a></li>
               <li><a href="faketime.html">pkg/faketime (github.com/bkaznowski/epochd/pkg/faketime)</a></li>
             </ul>
-            <p><a href="/">← Back to docs</a></p>
+            <p><a href="../">← Back to docs</a></p>
           </body>
           </html>
           HTMLEOF
