@@ -45,6 +45,8 @@ func (s *Session) SetTime(_ time.Time) error              { return errNotSupport
 func (s *Session) Freeze(_ time.Time) error               { return errNotSupported }
 func (s *Session) Reset() error                           { return errNotSupported }
 func (s *Session) Close() error                           { return errNotSupported }
+func (s *Session) Prune() int                             { return 0 }
+func (s *Session) PIDs() []int                            { return nil }
 func (s *Session) Len() int                               { return 0 }
 
 // WithProcess skips the test on non-Linux platforms.
@@ -53,8 +55,26 @@ func WithProcess(t *testing.T, _ *exec.Cmd, _ time.Time, _ func(*testing.T, *Han
 	t.Skip("faketime: not supported on this platform (Linux only)")
 }
 
+// WithFrozenProcess skips the test on non-Linux platforms.
+func WithFrozenProcess(t *testing.T, _ *exec.Cmd, _ time.Time, _ func(*testing.T, *Handle)) {
+	t.Helper()
+	t.Skip("faketime: not supported on this platform (Linux only)")
+}
+
 // WithPID skips the test on non-Linux platforms.
 func WithPID(t *testing.T, _ int, _ time.Time, _ func(*testing.T, *Handle)) {
+	t.Helper()
+	t.Skip("faketime: not supported on this platform (Linux only)")
+}
+
+// WithFrozenPID skips the test on non-Linux platforms.
+func WithFrozenPID(t *testing.T, _ int, _ time.Time, _ func(*testing.T, *Handle)) {
+	t.Helper()
+	t.Skip("faketime: not supported on this platform (Linux only)")
+}
+
+// WithFrozenChildTracker skips the test on non-Linux platforms.
+func WithFrozenChildTracker(t *testing.T, _ *exec.Cmd, _ time.Time, _ func(*testing.T, *ChildTracker)) {
 	t.Helper()
 	t.Skip("faketime: not supported on this platform (Linux only)")
 }

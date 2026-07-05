@@ -1186,6 +1186,8 @@ if err := s.Reset(); err != nil { ... }</code></pre>
     <tr><td><code>s.Advance(d time.Duration) error</code></td><td>Shifts all handles by <code>d</code> concurrently, preserving the current mode.</td></tr>
     <tr><td><code>s.Reset() error</code></td><td>Resets all processes to real time.</td></tr>
     <tr><td><code>s.Close() error</code></td><td>Stops all <code>ChildTracker</code> watch goroutines started by <code>WithTracking()</code>. No-op if tracking was not enabled. Always call this (or rely on <code>WithSession</code> cleanup) when using <code>WithTracking()</code>.</td></tr>
+    <tr><td><code>s.Prune() int</code></td><td>Removes handles for processes that are no longer alive and returns the count removed. For sessions with <code>WithTracking()</code>, trackers whose parent has exited are also closed. Call before <code>SetTime</code> when processes are expected to exit (e.g. short-lived workers).</td></tr>
+    <tr><td><code>s.PIDs() []int</code></td><td>Returns the process IDs of all handles currently in the session. Useful for debugging and assertions.</td></tr>
     <tr><td><code>s.Len() int</code></td><td>Returns the number of handles in the session.</td></tr>
   </tbody>
 </table>
@@ -1209,6 +1211,18 @@ if err := s.Reset(); err != nil { ... }</code></pre>
     <tr>
       <td><code>WithChildTracker(t, cmd, target, fn)</code></td>
       <td>Starts <code>cmd</code> with fake time and fork/exec tracking, calls <code>fn(t, *ChildTracker)</code>, then resets all clocks, stops the tracker goroutine, and kills the process.</td>
+    </tr>
+    <tr>
+      <td><code>WithFrozenProcess(t, cmd, target, fn)</code></td>
+      <td>Like <code>WithProcess</code> but starts with the clock frozen at <code>target</code>.</td>
+    </tr>
+    <tr>
+      <td><code>WithFrozenPID(t, pid, target, fn)</code></td>
+      <td>Like <code>WithPID</code> but attaches with the clock frozen at <code>target</code>. Requires <code>CAP_SYS_PTRACE</code>.</td>
+    </tr>
+    <tr>
+      <td><code>WithFrozenChildTracker(t, cmd, target, fn)</code></td>
+      <td>Like <code>WithChildTracker</code> but starts with the clock frozen at <code>target</code>.</td>
     </tr>
     <tr>
       <td><code>WithSession(t, target, setup, fn, opts...)</code></td>

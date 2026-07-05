@@ -427,14 +427,17 @@ func (c *ChildTracker) Children() []*Handle {
 }
 
 // applyAll calls fn on the parent handle and all currently tracked children
-// concurrently. Errors are joined; a partial failure leaves successful handles
-// at the new state.
+// concurrently. Children that have exited (ESRCH) are silently removed from
+// the tracked set. ESRCH on the parent is also cleared — calling Reset or
+// SetTime on an already-dead parent is not an error.
 func (c *ChildTracker) applyAll(fn func(*Handle) error) error {
 	c.mu.Lock()
 	handles := make([]*Handle, 0, 1+len(c.children))
 	handles = append(handles, c.Handle)
-	for _, h := range c.children {
+	childPIDs := make([]int, 0, len(c.children))
+	for pid, h := range c.children {
 		handles = append(handles, h)
+		childPIDs = append(childPIDs, pid)
 	}
 	c.mu.Unlock()
 
@@ -448,6 +451,20 @@ func (c *ChildTracker) applyAll(fn func(*Handle) error) error {
 		}(i, h)
 	}
 	wg.Wait()
+
+	// Clear ESRCH on the parent and prune dead children.
+	c.mu.Lock()
+	if errors.Is(errs[0], unix.ESRCH) {
+		errs[0] = nil
+	}
+	for i, pid := range childPIDs {
+		if errors.Is(errs[i+1], unix.ESRCH) {
+			delete(c.children, pid)
+			errs[i+1] = nil
+		}
+	}
+	c.mu.Unlock()
+
 	return errors.Join(errs...)
 }
 
@@ -775,20 +792,22 @@ func (c *ChildTracker) cleanup() {
 
 // applyAll calls fn on every handle concurrently and then, if no errors
 // occurred, calls updateState under the session lock to commit the new state.
-// Per-handle errors are joined; a partial failure leaves the session state
-// unchanged so the next call retries with the old values.
+// Handles whose process has exited (ESRCH) are silently removed from the
+// session; all other per-handle errors are joined and returned.
 func (s *Session) applyAll(fn func(*Handle) error, updateState func()) error {
 	s.mu.Lock()
-	handles := make([]*Handle, len(s.handles))
-	copy(handles, s.handles)
+	primary := make([]*Handle, len(s.handles))
+	copy(primary, s.handles)
+	var extra []*Handle
 	for _, ct := range s.trackers {
-		handles = append(handles, ct.Children()...)
+		extra = append(extra, ct.Children()...)
 	}
 	s.mu.Unlock()
 
-	errs := make([]error, len(handles))
+	all := append(primary, extra...)
+	errs := make([]error, len(all))
 	var wg sync.WaitGroup
-	for i, h := range handles {
+	for i, h := range all {
 		wg.Add(1)
 		go func(i int, h *Handle) {
 			defer wg.Done()
@@ -797,6 +816,39 @@ func (s *Session) applyAll(fn func(*Handle) error, updateState func()) error {
 	}
 	wg.Wait()
 
+	// Collect dead primary handles (ESRCH) and remove them. Tracker children
+	// are managed by the watchLoop; just clear their ESRCH errors.
+	var dead []*Handle
+	for i, h := range primary {
+		if errors.Is(errs[i], unix.ESRCH) {
+			dead = append(dead, h)
+			errs[i] = nil
+		}
+	}
+	for i := range extra {
+		if errors.Is(errs[len(primary)+i], unix.ESRCH) {
+			errs[len(primary)+i] = nil
+		}
+	}
+	if len(dead) > 0 {
+		s.mu.Lock()
+		live := make([]*Handle, 0, len(s.handles))
+		for _, h := range s.handles {
+			pruned := false
+			for _, d := range dead {
+				if d == h {
+					pruned = true
+					break
+				}
+			}
+			if !pruned {
+				live = append(live, h)
+			}
+		}
+		s.handles = live
+		s.mu.Unlock()
+	}
+
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("faketime: applyAll: %w", err)
 	}
@@ -804,4 +856,67 @@ func (s *Session) applyAll(fn func(*Handle) error, updateState func()) error {
 	updateState()
 	s.mu.Unlock()
 	return nil
+}
+
+// Prune removes handles for processes that are no longer alive and returns the
+// number of handles removed. For sessions created with WithTracking, trackers
+// whose parent process has exited are also closed and removed.
+func (s *Session) Prune() int {
+	// Determine which trackers are dead outside the lock (IsAlive is cheap).
+	s.mu.Lock()
+	liveTrackers := make([]*ChildTracker, 0, len(s.trackers))
+	var deadTrackers []*ChildTracker
+	for _, ct := range s.trackers {
+		if ct.Handle.IsAlive() {
+			liveTrackers = append(liveTrackers, ct)
+		} else {
+			deadTrackers = append(deadTrackers, ct)
+		}
+	}
+	s.trackers = liveTrackers
+
+	// Build a set of handles to remove: dead tracker parents + dead standalone handles.
+	deadSet := make(map[*Handle]bool, len(deadTrackers))
+	for _, ct := range deadTrackers {
+		deadSet[ct.Handle] = true
+	}
+	liveTrackerHandles := make(map[*Handle]bool, len(liveTrackers))
+	for _, ct := range liveTrackers {
+		liveTrackerHandles[ct.Handle] = true
+	}
+
+	n := len(deadTrackers)
+	live := make([]*Handle, 0, len(s.handles))
+	for _, h := range s.handles {
+		switch {
+		case deadSet[h]:
+			// dead tracker parent — already counted above
+		case liveTrackerHandles[h]:
+			live = append(live, h) // alive tracker parent, keep
+		case h.IsAlive():
+			live = append(live, h)
+		default:
+			n++ // dead standalone handle
+		}
+	}
+	s.handles = live
+	s.mu.Unlock()
+
+	// Close dead trackers outside the lock — Close waits for the watchLoop goroutine.
+	for _, ct := range deadTrackers {
+		ct.Close() //nolint:errcheck
+	}
+	return n
+}
+
+// PIDs returns the process IDs of all handles currently in the session,
+// including tracker parent processes. The order is unspecified.
+func (s *Session) PIDs() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pids := make([]int, len(s.handles))
+	for i, h := range s.handles {
+		pids[i] = h.PID()
+	}
+	return pids
 }

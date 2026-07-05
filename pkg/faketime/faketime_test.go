@@ -886,6 +886,248 @@ func TestSessionAttachFrozen(t *testing.T) {
 	}
 }
 
+// TestSessionPruneAndPIDs verifies Session.Prune removes dead handles and
+// Session.PIDs reflects the current live set.
+func TestSessionPruneAndPIDs(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	newCmd := func() *exec.Cmd {
+		cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+		cmd.Env = append(os.Environ(), helperEnv+"=1")
+		return cmd
+	}
+
+	target := time.Now().Add(24 * time.Hour)
+	s := NewSession(target)
+	t.Cleanup(func() { s.Reset() }) //nolint:errcheck
+
+	cmd1 := newCmd()
+	cmd2 := newCmd()
+	if err := s.Start(cmd1); err != nil {
+		t.Fatalf("Start cmd1: %v", err)
+	}
+	if err := s.Start(cmd2); err != nil {
+		t.Fatalf("Start cmd2: %v", err)
+	}
+	t.Cleanup(func() { cmd1.Process.Kill(); cmd1.Wait() }) //nolint:errcheck
+	t.Cleanup(func() { cmd2.Process.Kill(); cmd2.Wait() }) //nolint:errcheck
+
+	if s.Len() != 2 {
+		t.Fatalf("Len() = %d, want 2", s.Len())
+	}
+	pids := s.PIDs()
+	if len(pids) != 2 {
+		t.Fatalf("PIDs() len = %d, want 2", len(pids))
+	}
+	wantPIDs := map[int]bool{cmd1.Process.Pid: true, cmd2.Process.Pid: true}
+	for _, pid := range pids {
+		if !wantPIDs[pid] {
+			t.Errorf("PIDs() contains unexpected PID %d", pid)
+		}
+	}
+
+	// Kill cmd1 and verify Prune removes it.
+	cmd1.Process.Kill() //nolint:errcheck
+	cmd1.Wait()         //nolint:errcheck
+	// Give the OS a moment to mark the PID as gone.
+	time.Sleep(20 * time.Millisecond)
+
+	n := s.Prune()
+	if n != 1 {
+		t.Errorf("Prune() = %d, want 1", n)
+	}
+	if s.Len() != 1 {
+		t.Errorf("Len() after Prune = %d, want 1", s.Len())
+	}
+	pids = s.PIDs()
+	if len(pids) != 1 || pids[0] != cmd2.Process.Pid {
+		t.Errorf("PIDs() after Prune = %v, want [%d]", pids, cmd2.Process.Pid)
+	}
+}
+
+// TestSessionSetTimeAutoprune verifies that SetTime silently drops handles for
+// processes that have exited (ESRCH) rather than returning an error.
+func TestSessionSetTimeAutoprune(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	newCmd := func() *exec.Cmd {
+		cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+		cmd.Env = append(os.Environ(), helperEnv+"=1")
+		return cmd
+	}
+
+	target := time.Now().Add(24 * time.Hour)
+	s := NewSession(target)
+
+	cmd1 := newCmd()
+	cmd2 := newCmd()
+	if err := s.Start(cmd1); err != nil {
+		t.Fatalf("Start cmd1: %v", err)
+	}
+	if err := s.Start(cmd2); err != nil {
+		t.Fatalf("Start cmd2: %v", err)
+	}
+	t.Cleanup(func() {
+		s.Reset()          //nolint:errcheck
+		cmd1.Process.Kill() //nolint:errcheck
+		cmd1.Wait()         //nolint:errcheck
+		cmd2.Process.Kill() //nolint:errcheck
+		cmd2.Wait()         //nolint:errcheck
+	})
+
+	// Kill cmd1 — its handle will get ESRCH on the next SetTime.
+	cmd1.Process.Kill() //nolint:errcheck
+	cmd1.Wait()         //nolint:errcheck
+	time.Sleep(20 * time.Millisecond)
+
+	// SetTime must succeed and auto-remove the dead handle.
+	if err := s.SetTime(time.Now().Add(48 * time.Hour)); err != nil {
+		t.Fatalf("SetTime after one process died: %v", err)
+	}
+	if s.Len() != 1 {
+		t.Errorf("Len() after auto-prune = %d, want 1", s.Len())
+	}
+}
+
+// TestWithFrozenProcess verifies the WithFrozenProcess helper starts a frozen
+// process and calls fn.
+func TestWithFrozenProcess(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = pw
+
+	called := false
+	WithFrozenProcess(t, cmd, frozen, func(t *testing.T, h *Handle) {
+		pw.Close()
+		called = true
+		if got := h.EffectiveTime(); !got.Equal(frozen) {
+			t.Errorf("EffectiveTime() = %v, want %v", got, frozen)
+		}
+		const wantEach = 2
+		sc := bufio.NewScanner(pr)
+		got := 0
+		for sc.Scan() && got < wantEach {
+			ts, ok := parseFaketimeTimestamp(sc.Text())
+			if !ok {
+				continue
+			}
+			if !ts.Equal(frozen) {
+				t.Errorf("frozen timestamp %v != %v", ts, frozen)
+			}
+			got++
+		}
+		if got < wantEach {
+			t.Fatalf("received only %d/%d frozen timestamps", got, wantEach)
+		}
+	})
+	if !called {
+		t.Error("WithFrozenProcess: fn was never called")
+	}
+}
+
+// TestWithFrozenChildTracker verifies the WithFrozenChildTracker helper starts
+// a frozen tracked process and calls fn.
+func TestWithFrozenChildTracker(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = pw
+
+	called := false
+	WithFrozenChildTracker(t, cmd, frozen, func(t *testing.T, ct *ChildTracker) {
+		pw.Close()
+		called = true
+		if got := ct.Handle.EffectiveTime(); !got.Equal(frozen) {
+			t.Errorf("EffectiveTime() = %v, want %v", got, frozen)
+		}
+		const wantEach = 2
+		sc := bufio.NewScanner(pr)
+		got := 0
+		for sc.Scan() && got < wantEach {
+			ts, ok := parseFaketimeTimestamp(sc.Text())
+			if !ok {
+				continue
+			}
+			if !ts.Equal(frozen) {
+				t.Errorf("frozen timestamp %v != %v", ts, frozen)
+			}
+			got++
+		}
+		if got < wantEach {
+			t.Fatalf("received only %d/%d frozen timestamps", got, wantEach)
+		}
+	})
+	if !called {
+		t.Error("WithFrozenChildTracker: fn was never called")
+	}
+}
+
+// TestWithFrozenPID verifies the WithFrozenPID helper (requires ptrace_scope <= 1).
+func TestWithFrozenPID(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	called := false
+
+	WithFrozenPID(t, cmd.Process.Pid, frozen, func(t *testing.T, h *Handle) {
+		called = true
+		if got := h.EffectiveTime(); !got.Equal(frozen) {
+			t.Errorf("EffectiveTime() = %v, want %v", got, frozen)
+		}
+		const wantEach = 2
+		sc := bufio.NewScanner(pr)
+		got := 0
+		for sc.Scan() && got < wantEach {
+			ts, ok := parseFaketimeTimestamp(sc.Text())
+			if !ok {
+				continue
+			}
+			if !ts.Equal(frozen) {
+				t.Errorf("frozen timestamp %v != %v", ts, frozen)
+			}
+			got++
+		}
+		if got < wantEach {
+			t.Fatalf("received only %d/%d frozen timestamps", got, wantEach)
+		}
+	})
+	if !called {
+		t.Error("WithFrozenPID: fn was never called")
+	}
+}
+
 // TestChildTrackerBulkMethods verifies SetTime, Freeze, Advance, and Reset on a
 // ChildTracker (parent process only — no forked children needed to exercise the
 // bulk update path).
