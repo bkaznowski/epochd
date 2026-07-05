@@ -56,7 +56,7 @@ Things that require your input or manual action before the project is fully read
 - [ ] **Phase 31 — Validating webhook admission controller** (reject pod creation when matching timeshift is active and agent is unreachable; separate `cmd/webhook` binary)
 - [ ] **Phase 32 — `pkg/faketime` Attach path** (`Attach(pid, target)` + `WithPID` helper; requires `CAP_SYS_PTRACE`; skip test if `ptrace_scope > 1`)
 - [x] **Phase 33 — Integration test harness** (`make test-integration`; kind cluster lifecycle; `e2e.yml` GitHub Actions workflow)
-- [ ] **Phase 38 — `pkg/faketime` API ergonomics** — `Session.Close()` ✅ done; still pending: `Handle.EffectiveTime()`, `Handle.PID()`, `Handle.IsAlive()`
+- [x] **Phase 38 — `pkg/faketime` API ergonomics** — `Handle.EffectiveTime()`, `Handle.PID()`, `Handle.IsAlive()`, `Session.Close()`
 
 ---
 

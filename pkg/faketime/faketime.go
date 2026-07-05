@@ -38,11 +38,28 @@ func newFrozenHandle(h *inject.Handle, target time.Time) *Handle {
 }
 
 // effectiveTime returns the fake time the process currently sees.
+// Caller must hold h.mu.
 func (h *Handle) effectiveTime() time.Time {
 	if h.frozen {
 		return h.frozenAt
 	}
 	return time.Now().Add(h.offset)
+}
+
+// PID returns the OS process ID of the process this Handle controls.
+func (h *Handle) PID() int { return h.h.PID }
+
+// IsAlive reports whether the process is still running. It sends signal 0,
+// which checks for the process's existence without delivering a signal.
+func (h *Handle) IsAlive() bool { return syscall.Kill(h.h.PID, 0) == nil }
+
+// EffectiveTime returns the fake time the process currently sees. For advancing
+// mode this is time.Now() plus the stored offset; for frozen mode it is the
+// pinned instant.
+func (h *Handle) EffectiveTime() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.effectiveTime()
 }
 
 // Start starts cmd with fake time injected from the moment the process begins.

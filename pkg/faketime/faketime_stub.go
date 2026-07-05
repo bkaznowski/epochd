@@ -26,6 +26,10 @@ type SessionOption func(*Session)
 // On non-Linux platforms it is accepted but has no effect.
 func WithTracking() SessionOption { return func(*Session) {} }
 
+func (h *Handle) PID() int               { return 0 }
+func (h *Handle) IsAlive() bool          { return false }
+func (h *Handle) EffectiveTime() time.Time { return time.Time{} }
+
 func Start(_ *exec.Cmd, _ time.Time) (*Handle, error)       { return nil, errNotSupported }
 func StartFrozen(_ *exec.Cmd, _ time.Time) (*Handle, error) { return nil, errNotSupported }
 func Attach(_ int, _ time.Time) (*Handle, error)            { return nil, errNotSupported }
@@ -56,7 +60,7 @@ func WithPID(t *testing.T, _ int, _ time.Time, _ func(*testing.T, *Handle)) {
 }
 
 // WithSession skips the test on non-Linux platforms.
-func WithSession(t *testing.T, _ time.Time, _ func(*Session) error, _ func(*testing.T, *Session)) {
+func WithSession(t *testing.T, _ time.Time, _ func(*Session) error, _ func(*testing.T, *Session), _ ...SessionOption) {
 	t.Helper()
 	t.Skip("faketime: not supported on this platform (Linux only)")
 }

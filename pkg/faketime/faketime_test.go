@@ -376,6 +376,67 @@ func TestWithSessionTracking(t *testing.T) {
 	)
 }
 
+// TestHandleMethods verifies PID, IsAlive, and EffectiveTime on a live handle.
+func TestHandleMethods(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	const fakeOffset = 24 * time.Hour
+	target := time.Now().Add(fakeOffset)
+
+	h, err := Start(cmd, target)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+
+	t.Run("PID", func(t *testing.T) {
+		if got := h.PID(); got != cmd.Process.Pid {
+			t.Errorf("PID() = %d, want %d", got, cmd.Process.Pid)
+		}
+	})
+
+	t.Run("IsAlive_running", func(t *testing.T) {
+		if !h.IsAlive() {
+			t.Error("IsAlive() = false for a running process")
+		}
+	})
+
+	t.Run("EffectiveTime_advancing", func(t *testing.T) {
+		got := h.EffectiveTime()
+		diff := time.Until(got)
+		const tolerance = 5 * time.Second
+		if diff < fakeOffset-tolerance || diff > fakeOffset+tolerance {
+			t.Errorf("EffectiveTime() = %v (diff %v from now), want ~%v",
+				got, diff.Round(time.Millisecond), fakeOffset)
+		}
+	})
+
+	t.Run("EffectiveTime_frozen", func(t *testing.T) {
+		frozen := time.Now().Add(48 * time.Hour)
+		if err := h.Freeze(frozen); err != nil {
+			t.Fatalf("Freeze: %v", err)
+		}
+		got := h.EffectiveTime()
+		if !got.Equal(frozen) {
+			t.Errorf("EffectiveTime() after Freeze = %v, want %v", got, frozen)
+		}
+	})
+
+	t.Run("IsAlive_dead", func(t *testing.T) {
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+		if h.IsAlive() {
+			t.Error("IsAlive() = true after process was killed")
+		}
+	})
+}
+
 // parseFaketimeTimestamp trims and parses an RFC3339Nano line, returning
 // (zero, false) for test-framework noise or unparseable lines.
 func parseFaketimeTimestamp(line string) (time.Time, bool) {

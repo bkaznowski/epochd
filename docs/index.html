@@ -1139,6 +1139,18 @@ s.Advance(24 * time.Hour)</code></pre>
       <td><code>h.Reset() error</code></td>
       <td>Snaps the process back to the real clock. Equivalent to <code>h.SetTime(time.Now())</code>.</td>
     </tr>
+    <tr>
+      <td><code>h.PID() int</code></td>
+      <td>Returns the OS process ID of the process this Handle controls.</td>
+    </tr>
+    <tr>
+      <td><code>h.IsAlive() bool</code></td>
+      <td>Reports whether the process is still running (sends signal 0). Useful for guarding against stale handles after a process exits.</td>
+    </tr>
+    <tr>
+      <td><code>h.EffectiveTime() time.Time</code></td>
+      <td>Returns the fake time the process currently sees. In advancing mode: <code>time.Now() + offset</code>. In frozen mode: the pinned instant. Thread-safe.</td>
+    </tr>
   </tbody>
 </table>
 </div>
