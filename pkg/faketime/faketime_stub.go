@@ -59,6 +59,12 @@ func WithPID(t *testing.T, _ int, _ time.Time, _ func(*testing.T, *Handle)) {
 	t.Skip("faketime: not supported on this platform (Linux only)")
 }
 
+// WithChildTracker skips the test on non-Linux platforms.
+func WithChildTracker(t *testing.T, _ *exec.Cmd, _ time.Time, _ func(*testing.T, *ChildTracker)) {
+	t.Helper()
+	t.Skip("faketime: not supported on this platform (Linux only)")
+}
+
 // WithSession skips the test on non-Linux platforms.
 func WithSession(t *testing.T, _ time.Time, _ func(*Session) error, _ func(*testing.T, *Session), _ ...SessionOption) {
 	t.Helper()
@@ -80,6 +86,10 @@ func AttachWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
 func AttachFrozenWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
 	return nil, errNotSupported
 }
-func (c *ChildTracker) Children() []*Handle { return nil }
-func (c *ChildTracker) Err() error          { return errNotSupported }
-func (c *ChildTracker) Close() error        { return errNotSupported }
+func (c *ChildTracker) Children() []*Handle       { return nil }
+func (c *ChildTracker) SetTime(_ time.Time) error  { return errNotSupported }
+func (c *ChildTracker) Freeze(_ time.Time) error   { return errNotSupported }
+func (c *ChildTracker) Advance(_ time.Duration) error { return errNotSupported }
+func (c *ChildTracker) Reset() error               { return errNotSupported }
+func (c *ChildTracker) Err() error                 { return errNotSupported }
+func (c *ChildTracker) Close() error               { return errNotSupported }

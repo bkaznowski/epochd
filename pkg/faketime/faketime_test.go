@@ -886,6 +886,190 @@ func TestSessionAttachFrozen(t *testing.T) {
 	}
 }
 
+// TestChildTrackerBulkMethods verifies SetTime, Freeze, Advance, and Reset on a
+// ChildTracker (parent process only — no forked children needed to exercise the
+// bulk update path).
+func TestChildTrackerBulkMethods(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	newTrackedHelper := func(t *testing.T) (*ChildTracker, *bufio.Scanner) {
+		t.Helper()
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+		cmd.Env = append(os.Environ(), helperEnv+"=1")
+		cmd.Stdout = pw
+		ct, err := StartWithTracking(cmd, time.Now()) // initial target overridden per sub-test
+		if err != nil {
+			pw.Close(); pr.Close()
+			t.Fatalf("StartWithTracking: %v", err)
+		}
+		pw.Close()
+		t.Cleanup(func() {
+			ct.Close()         //nolint:errcheck
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
+			pr.Close()
+		})
+		return ct, bufio.NewScanner(pr)
+	}
+
+	readTimestamps := func(t *testing.T, sc *bufio.Scanner, n int) []time.Time {
+		t.Helper()
+		out := make([]time.Time, 0, n)
+		for sc.Scan() && len(out) < n {
+			ts, ok := parseFaketimeTimestamp(sc.Text())
+			if ok {
+				out = append(out, ts)
+			}
+		}
+		return out
+	}
+
+	const tolerance = 5 * time.Second
+
+	t.Run("SetTime", func(t *testing.T) {
+		ct, sc := newTrackedHelper(t)
+		target := time.Now().Add(24 * time.Hour)
+		if err := ct.SetTime(target); err != nil {
+			t.Fatalf("SetTime: %v", err)
+		}
+		got := readTimestamps(t, sc, 2)
+		if len(got) < 2 {
+			t.Fatalf("got %d timestamps, want 2", len(got))
+		}
+		for _, ts := range got {
+			diff := time.Until(ts)
+			if diff < 24*time.Hour-tolerance || diff > 24*time.Hour+tolerance {
+				t.Errorf("SetTime: timestamp %v off by %v", ts, diff-24*time.Hour)
+			}
+		}
+	})
+
+	t.Run("Freeze", func(t *testing.T) {
+		ct, sc := newTrackedHelper(t)
+		frozen := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+		if err := ct.Freeze(frozen); err != nil {
+			t.Fatalf("Freeze: %v", err)
+		}
+		// EffectiveTime must report the frozen instant.
+		if got := ct.Handle.EffectiveTime(); !got.Equal(frozen) {
+			t.Errorf("EffectiveTime() = %v, want %v", got, frozen)
+		}
+		got := readTimestamps(t, sc, 2)
+		if len(got) < 2 {
+			t.Fatalf("got %d timestamps, want 2", len(got))
+		}
+		for _, ts := range got {
+			if !ts.Equal(frozen) {
+				t.Errorf("Freeze: timestamp %v != frozen %v", ts, frozen)
+			}
+		}
+	})
+
+	t.Run("Advance_advancing", func(t *testing.T) {
+		ct, sc := newTrackedHelper(t)
+		base := time.Now().Add(24 * time.Hour)
+		if err := ct.SetTime(base); err != nil {
+			t.Fatalf("SetTime: %v", err)
+		}
+		if err := ct.Advance(24 * time.Hour); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		got := readTimestamps(t, sc, 2)
+		if len(got) < 2 {
+			t.Fatalf("got %d timestamps, want 2", len(got))
+		}
+		for _, ts := range got {
+			diff := time.Until(ts)
+			if diff < 48*time.Hour-tolerance || diff > 48*time.Hour+tolerance {
+				t.Errorf("Advance: timestamp %v off by %v from +48h", ts, diff-48*time.Hour)
+			}
+		}
+	})
+
+	t.Run("Advance_frozen", func(t *testing.T) {
+		ct, sc := newTrackedHelper(t)
+		frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+		if err := ct.Freeze(frozen); err != nil {
+			t.Fatalf("Freeze: %v", err)
+		}
+		if err := ct.Advance(time.Hour); err != nil {
+			t.Fatalf("Advance (frozen): %v", err)
+		}
+		want := frozen.Add(time.Hour)
+		if got := ct.Handle.EffectiveTime(); !got.Equal(want) {
+			t.Errorf("EffectiveTime() after Advance = %v, want %v", got, want)
+		}
+		got := readTimestamps(t, sc, 2)
+		if len(got) < 2 {
+			t.Fatalf("got %d timestamps, want 2", len(got))
+		}
+		for _, ts := range got {
+			if !ts.Equal(want) {
+				t.Errorf("Advance(frozen): timestamp %v != %v", ts, want)
+			}
+		}
+	})
+
+	t.Run("Reset", func(t *testing.T) {
+		ct, sc := newTrackedHelper(t)
+		if err := ct.SetTime(time.Now().Add(24 * time.Hour)); err != nil {
+			t.Fatalf("SetTime: %v", err)
+		}
+		if err := ct.Reset(); err != nil {
+			t.Fatalf("Reset: %v", err)
+		}
+		got := readTimestamps(t, sc, 3)
+		realNow := time.Now()
+		for _, ts := range got {
+			if ts.After(realNow.Add(-time.Hour)) && ts.Before(realNow.Add(time.Hour)) {
+				return // found at least one real-time timestamp
+			}
+		}
+		t.Errorf("Reset: no real-time timestamp found in %v", got)
+	})
+}
+
+// TestWithChildTracker verifies the helper starts tracking, calls fn, and
+// cleans up without deadlocking.
+func TestWithChildTracker(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	target := time.Now().Add(24 * time.Hour)
+	called := false
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	WithChildTracker(t, cmd, target, func(t *testing.T, ct *ChildTracker) {
+		called = true
+		if ct.Handle.PID() != cmd.Process.Pid {
+			t.Errorf("PID() = %d, want %d", ct.Handle.PID(), cmd.Process.Pid)
+		}
+		if !ct.Handle.IsAlive() {
+			t.Error("IsAlive() = false immediately after start")
+		}
+		diff := time.Until(ct.Handle.EffectiveTime())
+		const tolerance = 5 * time.Second
+		if diff < 24*time.Hour-tolerance || diff > 24*time.Hour+tolerance {
+			t.Errorf("EffectiveTime() offset = %v, want ~24h", diff)
+		}
+	})
+
+	if !called {
+		t.Error("WithChildTracker: fn was never called")
+	}
+}
+
 // parseFaketimeTimestamp trims and parses an RFC3339Nano line, returning
 // (zero, false) for test-framework noise or unparseable lines.
 func parseFaketimeTimestamp(line string) (time.Time, bool) {

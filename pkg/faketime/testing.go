@@ -45,6 +45,31 @@ func WithPID(t *testing.T, pid int, target time.Time, fn func(*testing.T, *Handl
 	fn(t, h)
 }
 
+// WithChildTracker starts cmd with fake time and child-process tracking, calls
+// fn, then resets all clocks, stops the tracker goroutine, and kills the
+// process. t.Cleanup handles teardown so it runs even when fn calls t.Fatal.
+// No elevated permissions required.
+//
+// The caller must not call cmd.Start() before passing cmd to WithChildTracker.
+func WithChildTracker(t *testing.T, cmd *exec.Cmd, target time.Time, fn func(*testing.T, *ChildTracker)) {
+	t.Helper()
+	ct, err := StartWithTracking(cmd, target)
+	if err != nil {
+		t.Fatalf("faketime.WithChildTracker: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := ct.Reset(); err != nil {
+			t.Logf("faketime.WithChildTracker: cleanup Reset: %v", err)
+		}
+		if err := ct.Close(); err != nil {
+			t.Logf("faketime.WithChildTracker: cleanup Close: %v", err)
+		}
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+	})
+	fn(t, ct)
+}
+
 // WithSession calls setup to add processes to a new session targeting target,
 // then calls fn. t.Cleanup resets all handles, closes any active trackers, and
 // waits on any commands added via session.Start. Pass WithTracking() in opts to

@@ -426,6 +426,59 @@ func (c *ChildTracker) Children() []*Handle {
 	return out
 }
 
+// applyAll calls fn on the parent handle and all currently tracked children
+// concurrently. Errors are joined; a partial failure leaves successful handles
+// at the new state.
+func (c *ChildTracker) applyAll(fn func(*Handle) error) error {
+	c.mu.Lock()
+	handles := make([]*Handle, 0, 1+len(c.children))
+	handles = append(handles, c.Handle)
+	for _, h := range c.children {
+		handles = append(handles, h)
+	}
+	c.mu.Unlock()
+
+	errs := make([]error, len(handles))
+	var wg sync.WaitGroup
+	for i, h := range handles {
+		wg.Add(1)
+		go func(i int, h *Handle) {
+			defer wg.Done()
+			errs[i] = fn(h)
+		}(i, h)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// SetTime updates the parent and all tracked children to advancing mode at target.
+func (c *ChildTracker) SetTime(target time.Time) error {
+	return c.applyAll(func(h *Handle) error { return h.SetTime(target) })
+}
+
+// Freeze pins the parent and all tracked children at target.
+func (c *ChildTracker) Freeze(target time.Time) error {
+	return c.applyAll(func(h *Handle) error { return h.Freeze(target) })
+}
+
+// Advance shifts the parent's current fake time by d and applies the resulting
+// target to all tracked children. Preserves the current mode of the parent.
+func (c *ChildTracker) Advance(d time.Duration) error {
+	c.Handle.mu.Lock()
+	frozen := c.Handle.frozen
+	target := c.Handle.effectiveTime().Add(d)
+	c.Handle.mu.Unlock()
+	if frozen {
+		return c.Freeze(target)
+	}
+	return c.SetTime(target)
+}
+
+// Reset restores the parent and all tracked children to real time.
+func (c *ChildTracker) Reset() error {
+	return c.applyAll(func(h *Handle) error { return h.Reset() })
+}
+
 // Err returns the first error encountered by the background watch loop, if any.
 func (c *ChildTracker) Err() error {
 	c.mu.Lock()

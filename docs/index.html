@@ -1207,6 +1207,10 @@ if err := s.Reset(); err != nil { ... }</code></pre>
       <td>Attaches to <code>pid</code>, calls <code>fn(t, *Handle)</code>, then resets the clock. Requires <code>CAP_SYS_PTRACE</code>.</td>
     </tr>
     <tr>
+      <td><code>WithChildTracker(t, cmd, target, fn)</code></td>
+      <td>Starts <code>cmd</code> with fake time and fork/exec tracking, calls <code>fn(t, *ChildTracker)</code>, then resets all clocks, stops the tracker goroutine, and kills the process.</td>
+    </tr>
+    <tr>
       <td><code>WithSession(t, target, setup, fn, opts...)</code></td>
       <td>Creates a session, calls <code>setup(s)</code> to populate it, calls <code>fn(t, *Session)</code>, then resets, closes any trackers, and cleans up. Pass <code>WithTracking()</code> as a trailing option to enable child tracking.</td>
     </tr>
@@ -1293,6 +1297,22 @@ if err := s.Reset(); err != nil { ... }</code></pre>
     <tr>
       <td><code>ct.Children() []*Handle</code></td>
       <td>Returns <code>Handle</code>s for all child processes currently tracked. The list grows as new children are forked.</td>
+    </tr>
+    <tr>
+      <td><code>ct.SetTime(target time.Time) error</code></td>
+      <td>Switches the parent and all tracked children to advancing mode at <code>target</code> concurrently.</td>
+    </tr>
+    <tr>
+      <td><code>ct.Freeze(target time.Time) error</code></td>
+      <td>Pins the parent and all tracked children at <code>target</code> concurrently.</td>
+    </tr>
+    <tr>
+      <td><code>ct.Advance(d time.Duration) error</code></td>
+      <td>Shifts the parent's current fake time by <code>d</code> and applies the result to all tracked children. Preserves the current mode.</td>
+    </tr>
+    <tr>
+      <td><code>ct.Reset() error</code></td>
+      <td>Restores the parent and all tracked children to real time.</td>
     </tr>
     <tr>
       <td><code>ct.Err() error</code></td>

@@ -201,6 +201,28 @@ func ExampleNewSession_withTracking() {
 	}
 }
 
+// WithChildTracker is the idiomatic way to test a process that spawns children
+// when you want automatic tracker cleanup.
+// In a real test t comes from the testing framework; the nil here is for
+// illustration only — this example is not executed by go test.
+func ExampleWithChildTracker() {
+	var t *testing.T // replaced by the real *testing.T in your test function
+	target := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	cmd := exec.Command("./postmaster")
+
+	faketime.WithChildTracker(t, cmd, target, func(t *testing.T, ct *faketime.ChildTracker) {
+		// Advance the entire process tree — parent + any forked children.
+		if err := ct.Advance(30 * 24 * time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		// ct.Children() returns Handles for each forked backend.
+		for _, child := range ct.Children() {
+			_ = child // SetTime / Freeze / Advance / Reset also available per-child
+		}
+	})
+	// Process is killed, tracker is closed, and clocks are reset here.
+}
+
 // WithSession is the idiomatic way to run a multi-process test with a shared
 // fake clock.
 // In a real test t comes from the testing framework; the nil here is for
