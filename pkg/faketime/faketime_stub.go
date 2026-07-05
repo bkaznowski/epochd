@@ -26,8 +26,9 @@ type SessionOption func(*Session)
 // On non-Linux platforms it is accepted but has no effect.
 func WithTracking() SessionOption { return func(*Session) {} }
 
-func (h *Handle) PID() int               { return 0 }
-func (h *Handle) IsAlive() bool          { return false }
+func (h *Handle) PID() int                 { return 0 }
+func (h *Handle) IsAlive() bool            { return false }
+func (h *Handle) IsFrozen() bool           { return false }
 func (h *Handle) EffectiveTime() time.Time { return time.Time{} }
 
 func Start(_ *exec.Cmd, _ time.Time) (*Handle, error)       { return nil, errNotSupported }
@@ -106,6 +107,7 @@ func AttachWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
 func AttachFrozenWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
 	return nil, errNotSupported
 }
+func (c *ChildTracker) PIDs() []int               { return nil }
 func (c *ChildTracker) Children() []*Handle       { return nil }
 func (c *ChildTracker) SetTime(_ time.Time) error  { return errNotSupported }
 func (c *ChildTracker) Freeze(_ time.Time) error   { return errNotSupported }

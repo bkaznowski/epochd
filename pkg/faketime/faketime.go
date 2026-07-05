@@ -49,6 +49,13 @@ func (h *Handle) effectiveTime() time.Time {
 // PID returns the OS process ID of the process this Handle controls.
 func (h *Handle) PID() int { return h.h.PID }
 
+// IsFrozen reports whether the handle is currently in frozen mode.
+func (h *Handle) IsFrozen() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.frozen
+}
+
 // IsAlive reports whether the process is still running. It sends signal 0,
 // which checks for the process's existence without delivering a signal.
 func (h *Handle) IsAlive() bool { return syscall.Kill(h.h.PID, 0) == nil }
@@ -413,6 +420,19 @@ type ChildTracker struct {
 	done        chan struct{}
 	wg          sync.WaitGroup
 	loopErr     error
+}
+
+// PIDs returns the process IDs of the parent and all currently tracked
+// children. The parent PID is always first.
+func (c *ChildTracker) PIDs() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	pids := make([]int, 0, 1+len(c.children))
+	pids = append(pids, c.parentPID)
+	for pid := range c.children {
+		pids = append(pids, pid)
+	}
+	return pids
 }
 
 // Children returns Handles for all child processes currently tracked.

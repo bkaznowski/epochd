@@ -1874,3 +1874,43 @@ This is identical to `injectFollowChildKeepTracer` minus the `SetOptions` call (
 - `pkg/inject/inject.go` — `ReInjectAfterExec`
 - `pkg/faketime/faketime.go` — add `PTRACE_EVENT_EXEC` case to `handleEvent`; add `setOptionsOnChild` helper; update `injectFollowChildKeepTracer` options mask
 - `pkg/faketime/faketime_stub.go` — no changes needed (stubs already cover `ChildTracker`)
+
+---
+
+## Phase 41 — `Handle.Detach()` with optional `KeepTracer`
+
+### Motivation
+
+`Handle.Reset()` snaps the fake clock back to real time but leaves the trampoline page mapped and the vDSO still patched to jump through it. `Handle.Detach()` fully uninstalls the injection: restores the original vDSO `clock_gettime` bytes and unmaps the trampoline page, leaving the process completely untouched.
+
+### Design
+
+A `HandleOption` functional option (same pattern as `SessionOption`) lets callers opt in to keeping the tracer alive after injection:
+
+```go
+func KeepTracer() HandleOption { ... }
+
+h, err := faketime.Start(cmd, target)                       // default: tracer detached
+h, err := faketime.Start(cmd, target, faketime.KeepTracer()) // tracer kept for Detach()
+```
+
+`Handle` gains an optional `tracer *procmem.Tracer` field. `Handle.Detach()` branches on whether a tracer is present:
+
+- **Tracer present** (`KeepTracer` was used, or `StartWithTracking`): interrupt → restore vDSO → remote munmap → ptrace detach. No extra permissions needed.
+- **No tracer**: fresh `PTRACE_ATTACH` → same steps → detach. Requires `ptrace_scope ≤ 1`; fails in locked-down Docker.
+
+`StartWithTracking` / `AttachWithTracking` already keep a tracer, so their `Handle.Detach()` uses the tracer path automatically.
+
+### Tradeoffs of `KeepTracer`
+
+- **Fork overhead**: every `fork()` causes a brief ptrace-stop while the event is delivered and the tracer resumes the process.
+- **Blocks other debuggers**: a process can only have one ptrace tracer; `gdb`/`strace`/`dlv` cannot attach while the tracer is alive.
+- **5 ms polling loop**: `WaitAnyNonBlocking` runs every 5 ms per tracked process (minor CPU cost).
+- **Signal delivery delay**: ptrace intercepts signals before they reach the tracee; a slow or GC-paused tracer loop adds latency.
+
+### Files to change
+
+- `pkg/inject/inject.go` — `Detach(tr *procmem.Tracer)` and `DetachFresh(pid int)` (remote munmap + `PokeText` restore + ptrace detach)
+- `pkg/faketime/faketime.go` — `HandleOption` type, `KeepTracer()`, optional `tracer` field on `Handle`, `Handle.Detach()`
+- `pkg/faketime/faketime_stub.go` — `HandleOption`, `KeepTracer()`, `Handle.Detach()`
+- `pkg/faketime/testing.go` — no changes needed (helpers call `Reset`, not `Detach`)

@@ -376,6 +376,68 @@ func TestWithSessionTracking(t *testing.T) {
 	)
 }
 
+// TestHandleIsFrozen verifies IsFrozen reflects mode transitions.
+func TestHandleIsFrozen(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	target := time.Now().Add(24 * time.Hour)
+	h, err := Start(cmd, target)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+
+	if h.IsFrozen() {
+		t.Error("IsFrozen() = true after Start (advancing mode)")
+	}
+	if err := h.Freeze(target); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+	if !h.IsFrozen() {
+		t.Error("IsFrozen() = false after Freeze")
+	}
+	if err := h.SetTime(target); err != nil {
+		t.Fatalf("SetTime: %v", err)
+	}
+	if h.IsFrozen() {
+		t.Error("IsFrozen() = true after SetTime (advancing mode)")
+	}
+}
+
+// TestChildTrackerPIDs verifies PIDs returns the parent PID first and reflects
+// the current tracked set.
+func TestChildTrackerPIDs(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	ct, err := StartWithTracking(cmd, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+	t.Cleanup(func() {
+		ct.Close()         //nolint:errcheck
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+	})
+
+	pids := ct.PIDs()
+	if len(pids) == 0 {
+		t.Fatal("PIDs() returned empty slice")
+	}
+	if pids[0] != cmd.Process.Pid {
+		t.Errorf("PIDs()[0] = %d, want parent PID %d", pids[0], cmd.Process.Pid)
+	}
+}
+
 // TestHandleMethods verifies PID, IsAlive, and EffectiveTime on a live handle.
 func TestHandleMethods(t *testing.T) {
 	exe, err := os.Executable()
