@@ -27,12 +27,23 @@ jobs:
 
       - name: Coverage summary
         run: |
+          # ---------------------------------------------------------------------------
+          # Coverage exclusions — add one entry per generated/vendored package.
+          # Each entry is a path substring matched against the coverage profile lines.
+          # ---------------------------------------------------------------------------
+          exclude_patterns=(
+            '/agentpb/'   # protoc-generated gRPC stubs (agent.pb.go, agent_grpc.pb.go)
+          )
+          # Build grep -e flags from the list and filter the raw profile.
+          grep_args=()
+          for pat in "${exclude_patterns[@]}"; do grep_args+=(-e "$pat"); done
+          grep -v "${grep_args[@]}" coverage-root.out > coverage-root-filtered.out
           {
             echo "## Test coverage"
             echo ""
-            echo "### Root module"
+            echo "### Root module (generated proto files excluded)"
             echo '```'
-            go tool cover -func=coverage-root.out
+            go tool cover -func=coverage-root-filtered.out
             echo '```'
             echo ""
             echo "### pkg/faketime"
@@ -46,7 +57,7 @@ jobs:
         with:
           name: coverage
           path: |
-            coverage-root.out
+            coverage-root-filtered.out
             pkg/faketime/coverage-faketime.out
 
   lint:
@@ -97,13 +108,13 @@ jobs:
           # Preserve the existing docs site at the root.
           cp -r docs/. pages/
 
-          # Per-module HTML coverage reports.
-          go tool cover -html=coverage-root.out -o pages/coverage/root.html
+          # Per-module HTML coverage reports (proto-generated files excluded from root).
+          go tool cover -html=coverage-root-filtered.out -o pages/coverage/root.html
           # pkg/faketime is a separate module; go tool cover must run inside it.
           (cd pkg/faketime && go tool cover -html=coverage-faketime.out -o ../../pages/coverage/faketime.html)
 
-          # Extract total coverage percentage for the badge.
-          pct=$(go tool cover -func=coverage-root.out | awk '/^total:/{gsub(/%/,""); print $3}')
+          # Extract total coverage percentage for the badge (proto files excluded).
+          pct=$(go tool cover -func=coverage-root-filtered.out | awk '/^total:/{gsub(/%/,""); print $3}')
           pct_int="${pct%.*}"
           if [ "${pct_int}" -ge 80 ]; then color="#44cc11"
           elif [ "${pct_int}" -ge 60 ]; then color="#dfb317"

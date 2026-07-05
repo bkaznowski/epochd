@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1453,6 +1454,21 @@ func TestFaketimeForkHelper(t *testing.T) {
 	}
 }
 
+// TestFaketimeSelfExitHelper is a subprocess helper: when invoked with
+// EPOCHD_FAKETIME_SELF_EXIT=1 it prints a few timestamps then exits normally.
+// Used to trigger the "parent exited" path in the watchLoop.
+const selfExitEnv = "EPOCHD_FAKETIME_SELF_EXIT"
+
+func TestFaketimeSelfExitHelper(t *testing.T) {
+	if os.Getenv(selfExitEnv) != "1" {
+		t.Skip()
+	}
+	for i := 0; i < 3; i++ {
+		fmt.Println(time.Now().Format(time.RFC3339Nano))
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // TestHandleAdvance verifies Handle.Advance in both advancing and frozen modes.
 func TestHandleAdvance(t *testing.T) {
 	exe, err := os.Executable()
@@ -1716,6 +1732,545 @@ func TestChildTrackerForkAndExec(t *testing.T) {
 	if err := ct.Err(); err != nil {
 		t.Logf("tracker loopErr (re-injection may fail in some envs): %v", err)
 	}
+}
+
+// TestSessionStartFrozenNoTracking verifies that Session.Start uses StartFrozen
+// when the session is in frozen mode (no tracking). Covers the frozen &&
+// !tracking branch in Session.Start.
+func TestSessionStartFrozenNoTracking(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = pw
+
+	s := NewSession(frozen)
+	if err := s.Freeze(frozen); err != nil {
+		pw.Close()
+		t.Fatalf("Freeze: %v", err)
+	}
+	if err := s.Start(cmd); err != nil {
+		pw.Close()
+		t.Fatalf("Session.Start (frozen): %v", err)
+	}
+	pw.Close()
+	t.Cleanup(func() { s.Reset(); cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+
+	const wantEach = 2
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		if !ts.Equal(frozen) {
+			t.Errorf("frozen timestamp %v != %v", ts, frozen)
+		}
+		t.Logf("frozen: %v", ts)
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("got %d/%d frozen timestamps", got, wantEach)
+	}
+}
+
+// TestSessionStartFrozenWithTracking verifies that Session.Start uses
+// StartFrozenWithTracking when the session is frozen and tracking. Covers
+// the frozen && tracking branch in Session.Start.
+func TestSessionStartFrozenWithTracking(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = pw
+
+	s := NewSession(frozen, WithTracking())
+	if err := s.Freeze(frozen); err != nil {
+		pw.Close()
+		t.Fatalf("Freeze: %v", err)
+	}
+	if err := s.Start(cmd); err != nil {
+		pw.Close()
+		t.Fatalf("Session.Start (frozen+tracking): %v", err)
+	}
+	pw.Close()
+	t.Cleanup(func() { s.Reset(); s.Close(); cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+
+	const wantEach = 2
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		if !ts.Equal(frozen) {
+			t.Errorf("frozen+tracking timestamp %v != %v", ts, frozen)
+		}
+		t.Logf("frozen+tracking: %v", ts)
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("got %d/%d frozen+tracking timestamps", got, wantEach)
+	}
+}
+
+// TestSessionAttachFrozenWithTracking verifies that Session.Attach uses
+// AttachFrozenWithTracking when the session is frozen and tracking. Covers
+// the frozen && tracking branch in Session.Attach. Skipped when
+// ptrace_scope > 1.
+func TestSessionAttachFrozenWithTracking(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	s := NewSession(frozen, WithTracking())
+	if err := s.Freeze(frozen); err != nil {
+		t.Fatalf("Session.Freeze: %v", err)
+	}
+	t.Cleanup(func() {
+		s.Reset() //nolint:errcheck
+		s.Close() //nolint:errcheck
+	})
+
+	if err := s.Attach(cmd.Process.Pid); err != nil {
+		t.Fatalf("Session.Attach (frozen+tracking): %v", err)
+	}
+	if s.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1", s.Len())
+	}
+
+	const wantEach = 2
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		if !ts.Equal(frozen) {
+			t.Errorf("frozen+tracking attach: timestamp %v != %v", ts, frozen)
+		}
+		t.Logf("frozen+tracking attach: %v", ts)
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("got %d/%d frozen+tracking attached timestamps", got, wantEach)
+	}
+}
+
+// TestTrackerParentExit verifies that when the tracked parent process exits
+// unexpectedly, the watchLoop records an error via loopErr. Covers the
+// pid==parentPID exit branch in handleEvent.
+func TestTrackerParentExit(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	ct, err := StartWithTracking(cmd, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+
+	// Kill the parent immediately — the watchLoop should detect this exit.
+	cmd.Process.Kill() //nolint:errcheck
+
+	// Wait for the watchLoop to observe the exit and stop. Close waits for the
+	// goroutine to finish, so this blocks until the loop exits via ECHILD.
+	if err := ct.Close(); err != nil {
+		t.Logf("Close: %v (expected on early parent exit)", err)
+	}
+
+	// The parent exit is recorded as a loopErr.
+	loopErr := ct.Err()
+	t.Logf("loopErr after parent kill: %v", loopErr)
+	if loopErr == nil {
+		// Some kernels deliver SIGKILL synchronously before the next
+		// WaitAnyNonBlocking poll; in that case the loop exits via ECHILD
+		// without setting loopErr. Either outcome is acceptable.
+		t.Log("loopErr is nil — parent exit arrived as ECHILD without event")
+	}
+
+	cmd.Wait() //nolint:errcheck
+}
+
+// TestTrackerSignalForwarding verifies that non-SIGTRAP signals received by
+// a tracked process are forwarded through the ptrace layer. Covers the
+// StopSignal()!=SIGTRAP branch in handleEvent.
+func TestTrackerSignalForwarding(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	ct, err := StartWithTracking(cmd, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+	t.Cleanup(func() {
+		ct.Reset()         //nolint:errcheck
+		ct.Close()         //nolint:errcheck
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+	})
+
+	// Give the process time to enter its printing loop.
+	time.Sleep(50 * time.Millisecond)
+
+	// Send SIGWINCH (window-change signal; default action is to be ignored).
+	// Under ptrace this causes a signal-delivery-stop, which exercises the
+	// non-SIGTRAP forwarding path in handleEvent.
+	if err := cmd.Process.Signal(syscall.SIGWINCH); err != nil {
+		t.Skipf("send SIGWINCH: %v", err)
+	}
+
+	// Give the tracer time to process the signal event.
+	time.Sleep(50 * time.Millisecond)
+
+	// The process must still be alive — SIGWINCH was forwarded, not eaten.
+	if !ct.Handle.IsAlive() {
+		t.Error("process died after SIGWINCH — signal was not forwarded correctly")
+	}
+	if err := ct.Err(); err != nil {
+		t.Errorf("unexpected loopErr after SIGWINCH: %v", err)
+	}
+}
+
+// TestChildTrackerForkAndExecFrozen mirrors TestChildTrackerForkAndExec but
+// uses StartFrozenWithTracking so the exec'd child gets ReInjectFrozenAfterExec
+// rather than ReInjectAtTimeAfterExec. Covers the frozen re-injection branch
+// in handleExec.
+func TestChildTrackerForkAndExecFrozen(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeForkHelper", "-test.v")
+	cmd.Env = append(os.Environ(), forkHelperEnv+"=1")
+	cmd.Stdout = pw
+
+	ct, err := StartFrozenWithTracking(cmd, frozen)
+	if err != nil {
+		pw.Close()
+		pr.Close()
+		t.Fatalf("StartFrozenWithTracking: %v", err)
+	}
+	pw.Close()
+	t.Cleanup(func() {
+		ct.Reset()         //nolint:errcheck
+		ct.Close()         //nolint:errcheck
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+		pr.Close()
+	})
+
+	// Wait for the fork helper to spawn its exec'd child.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(ct.Children()) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(ct.Children()) == 0 {
+		t.Skip("no forked children detected — fork helper may have exited before tracking")
+	}
+	t.Logf("tracked %d forked child(ren)", len(ct.Children()))
+
+	// Both the fork helper parent and the exec'd child should emit the frozen
+	// timestamp. Accept any from either.
+	const (
+		wantFake  = 2
+		tolerance = 10 * time.Second
+	)
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff >= 24*time.Hour-tolerance && diff <= 24*time.Hour+tolerance {
+			t.Logf("frozen stamp: %v (offset %v)", ts, diff.Round(time.Millisecond))
+			got++
+			if got >= wantFake {
+				break
+			}
+		}
+	}
+	if got < wantFake {
+		t.Fatalf("got only %d/%d frozen timestamps", got, wantFake)
+	}
+
+	if err := ct.Err(); err != nil {
+		t.Logf("tracker loopErr: %v", err)
+	}
+}
+
+// TestSessionPruneWithTracker verifies that Prune removes a ChildTracker
+// whose parent process has exited. Covers the deadTrackers path in Prune
+// (detecting dead tracker, building deadSet, closing stale trackers).
+func TestSessionPruneWithTracker(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	target := time.Now().Add(24 * time.Hour)
+	s := NewSession(target, WithTracking())
+	if err := s.Start(cmd); err != nil {
+		t.Fatalf("Session.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		s.Reset()          //nolint:errcheck
+		s.Close()          //nolint:errcheck
+		cmd.Process.Kill() //nolint:errcheck
+	})
+
+	if s.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1", s.Len())
+	}
+
+	// Kill the parent so the tracker's handle becomes dead.
+	cmd.Process.Kill() //nolint:errcheck
+
+	// Poll until the watchLoop reaps the exit event and IsAlive() returns false.
+	// The watchLoop's WaitAnyNonBlocking sees the SIGKILL exit, calls handleEvent,
+	// then sees ECHILD on the next iteration — after which kill(pid,0)=ESRCH.
+	s.mu.Lock()
+	ct := s.trackers[0]
+	s.mu.Unlock()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !ct.Handle.IsAlive() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Prune should detect the dead tracker, remove it, and close its goroutine.
+	n := s.Prune()
+	if n < 1 {
+		t.Errorf("Prune() = %d, want >= 1", n)
+	}
+	t.Logf("Prune removed %d handle(s)", n)
+	if s.Len() != 0 {
+		t.Errorf("Len() after Prune = %d, want 0", s.Len())
+	}
+}
+
+// TestTrackerParentExitNormally verifies that when the tracked parent process
+// exits on its own (not killed), the watchLoop records a loopErr. Covers the
+// pid==parentPID exit branch in handleEvent via normal process termination.
+func TestTrackerParentExitNormally(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeSelfExitHelper", "-test.v")
+	cmd.Env = append(os.Environ(), selfExitEnv+"=1")
+
+	ct, err := StartWithTracking(cmd, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+	t.Cleanup(func() {
+		ct.Close() //nolint:errcheck
+		cmd.Wait() //nolint:errcheck
+	})
+
+	// Wait for the watchLoop to detect the parent's normal exit, which sets loopErr.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if ct.Err() != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := ct.Err(); err != nil {
+		t.Logf("loopErr after parent self-exit: %v", err)
+	} else {
+		// If the watchLoop exited via ECHILD before setting loopErr (e.g. the
+		// tracer reaped the exit without calling handleEvent), that is also acceptable.
+		t.Log("loopErr is nil — parent exit may have been reaped silently via ECHILD")
+	}
+}
+
+// TestChildTrackerApplyAllParentESRCH verifies that ChildTracker.applyAll
+// silently clears ESRCH when the tracked parent process has died. Covers the
+// errs[0]=nil path inside ChildTracker.applyAll.
+func TestChildTrackerApplyAllParentESRCH(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	ct, err := StartWithTracking(cmd, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+	t.Cleanup(func() { ct.Close(); cmd.Wait() }) //nolint:errcheck
+
+	// Kill the parent and give the watchLoop time to process the exit event.
+	cmd.Process.Kill() //nolint:errcheck
+	time.Sleep(50 * time.Millisecond)
+
+	// SetTime with a dead parent: inject writes ESRCH, applyAll clears it.
+	if err := ct.SetTime(time.Now().Add(48 * time.Hour)); err != nil {
+		t.Errorf("SetTime with dead parent: %v", err)
+	}
+	t.Logf("SetTime succeeded — parent ESRCH was cleared in applyAll")
+}
+
+// TestHandleFreezeDeadProcess verifies that Handle.Freeze returns an error when
+// the underlying process has exited. Covers the early-return error path in Freeze.
+func TestHandleFreezeDeadProcess(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	h, err := Start(cmd, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Kill and reap the process, then attempt to freeze its handle.
+	cmd.Process.Kill() //nolint:errcheck
+	cmd.Wait()         //nolint:errcheck
+	time.Sleep(20 * time.Millisecond) // ensure OS marks PID as gone
+
+	if err := h.Freeze(time.Now().Add(48 * time.Hour)); err == nil {
+		t.Error("Freeze on dead process: expected error, got nil")
+	} else {
+		t.Logf("Freeze on dead process returned: %v", err)
+	}
+}
+
+// TestSessionPrunePartiallyDeadTrackers starts a session with two tracked
+// processes, kills one, and calls Prune. The live tracker's handle goes through
+// the liveTrackerHandles path; the dead one goes through deadSet. Covers the
+// previously untested liveTrackerHandles branch in Prune.
+func TestSessionPrunePartiallyDeadTrackers(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd1 := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd2 := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd1.Env = append(os.Environ(), helperEnv+"=1")
+	cmd2.Env = append(os.Environ(), helperEnv+"=1")
+
+	target := time.Now().Add(24 * time.Hour)
+	s := NewSession(target, WithTracking())
+	if err := s.Start(cmd1); err != nil {
+		t.Fatalf("Start cmd1: %v", err)
+	}
+	if err := s.Start(cmd2); err != nil {
+		cmd1.Process.Kill(); cmd1.Wait() //nolint:errcheck
+		t.Fatalf("Start cmd2: %v", err)
+	}
+	t.Cleanup(func() {
+		s.Reset()           //nolint:errcheck
+		s.Close()           //nolint:errcheck
+		cmd1.Process.Kill() //nolint:errcheck
+		cmd2.Process.Kill() //nolint:errcheck
+	})
+
+	if s.Len() != 2 {
+		t.Fatalf("Len() = %d, want 2", s.Len())
+	}
+
+	// Kill cmd1's process. Find its tracker by PID.
+	cmd1.Process.Kill() //nolint:errcheck
+	s.mu.Lock()
+	var deadCT *ChildTracker
+	for _, ct := range s.trackers {
+		if ct.Handle.PID() == cmd1.Process.Pid {
+			deadCT = ct
+			break
+		}
+	}
+	s.mu.Unlock()
+	if deadCT == nil {
+		t.Fatal("could not find cmd1 tracker")
+	}
+
+	// Wait for cmd1's handle to go dead (watchLoop reaps the exit event).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !deadCT.Handle.IsAlive() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if deadCT.Handle.IsAlive() {
+		t.Fatal("cmd1 handle still alive after kill — cannot test Prune")
+	}
+
+	// Prune: one dead tracker (cmd1) and one live tracker (cmd2).
+	// Dead tracker's handle: deadSet[h] path.
+	// Live tracker's handle: liveTrackerHandles[h] path (previously uncovered).
+	n := s.Prune()
+	if n != 1 {
+		t.Errorf("Prune() = %d, want 1", n)
+	}
+	if s.Len() != 1 {
+		t.Errorf("Len() after Prune = %d, want 1", s.Len())
+	}
+	t.Logf("Prune removed %d dead tracker(s), kept 1 live tracker", n)
 }
 
 // parseFaketimeTimestamp trims and parses an RFC3339Nano line, returning

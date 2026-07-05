@@ -1464,5 +1464,258 @@ func TestNewIDUniqueness(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Handler input-validation (uncovered handler branches)
+// ---------------------------------------------------------------------------
 
+func TestHTTPCreateTimeshiftMissingSelector(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace: "default",
+		Time:      time.Now().Add(time.Hour).Format(time.RFC3339),
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing selector: got %d want 400", w.Code)
+	}
+}
+
+func TestHTTPCreateTimeshiftInvalidTime(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace:     "default",
+		LabelSelector: "app=web-1",
+		Time:          "not-a-time",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("invalid time: got %d want 400", w.Code)
+	}
+}
+
+func TestHTTPCreateTimeshiftNoMatchingPodsHTTP(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace:     "default",
+		LabelSelector: "app=ghost",
+		Time:          time.Now().Add(time.Hour).Format(time.RFC3339),
+	})
+	if w.Code != http.StatusNotFound {
+		t.Errorf("no matching pods: got %d want 404", w.Code)
+	}
+}
+
+// TestHTTPCreateTimeshiftInjectAllFail verifies that when Inject fails for every
+// container, createTimeshift returns 500 ("no running containers found").
+func TestHTTPCreateTimeshiftInjectAllFail(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, pool := newTestController(t, pod)
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time, _ bool) (string, error) {
+		return "", fmt.Errorf("injection failed")
+	}
+	w := doRequest(t, ctrl.routes(), http.MethodPost, "/timeshifts", api.CreateTimeshiftRequest{
+		Namespace:     "default",
+		LabelSelector: "app=web-1",
+		Time:          time.Now().Add(time.Hour).Format(time.RFC3339),
+	})
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("all-inject-fail: got %d want 500", w.Code)
+	}
+}
+
+func TestHTTPUpdateTimeshiftBadJSON(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	r := httptest.NewRequest(http.MethodPatch, "/timeshifts/any", bytes.NewBufferString("not-json"))
+	w := httptest.NewRecorder()
+	ctrl.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("bad JSON: got %d want 400", w.Code)
+	}
+}
+
+func TestHTTPUpdateTimeshiftNoFields(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodPatch, "/timeshifts/any", api.UpdateTimeshiftRequest{})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("no fields: got %d want 400", w.Code)
+	}
+}
+
+func TestHTTPUpdateTimeshiftInvalidDuration(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodPatch, "/timeshifts/any", api.UpdateTimeshiftRequest{
+		Duration: "not-a-duration",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("invalid duration: got %d want 400", w.Code)
+	}
+}
+
+func TestHTTPUpdateTimeshiftInvalidTime(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodPatch, "/timeshifts/any", api.UpdateTimeshiftRequest{
+		Time: "not-a-time",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("invalid time: got %d want 400", w.Code)
+	}
+}
+
+func TestHTTPUpdateTimeshiftNotFound(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodPatch, "/timeshifts/does-not-exist", api.UpdateTimeshiftRequest{
+		Time: time.Now().Add(time.Hour).Format(time.RFC3339),
+	})
+	if w.Code != http.StatusNotFound {
+		t.Errorf("not found: got %d want 404", w.Code)
+	}
+}
+
+func TestHTTPDeleteTimeshiftNotFoundHTTP(t *testing.T) {
+	ctrl, _ := newTestController(t)
+	w := doRequest(t, ctrl.routes(), http.MethodDelete, "/timeshifts/does-not-exist", nil)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("not found: got %d want 404", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Controller-logic coverage tests
+// ---------------------------------------------------------------------------
+
+// TestResetHandlesAgentNotFound verifies that a NOT_FOUND Reset response is
+// treated as a successful reset — the handle is already gone after agent restart.
+func TestResetHandlesAgentNotFound(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, pool := newTestController(t, pod)
+
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), 0, false)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+
+	resetCalled := 0
+	pool.resetFn = func(_ context.Context, _, _ string) error {
+		resetCalled++
+		return grpcstatus.Error(codes.NotFound, "handle not found")
+	}
+
+	if err := ctrl.deleteTimeshift(context.Background(), s.id); err != nil {
+		t.Fatalf("deleteTimeshift: %v (should succeed even when Reset returns NOT_FOUND)", err)
+	}
+	if resetCalled != len(s.handles) {
+		t.Errorf("Reset called %d times, want %d", resetCalled, len(s.handles))
+	}
+}
+
+// TestAdvanceTimeshiftFrozen verifies that advancing a frozen timeshift moves
+// the frozen point by delta rather than touching the advancing offset.
+func TestAdvanceTimeshiftFrozen(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, _ := newTestController(t, pod)
+
+	frozenAt := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", frozenAt, 0, true)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+	if got := s.effectiveTime(); got.Sub(frozenAt).Abs() > time.Second {
+		t.Fatalf("initial frozen time: got %v want ~%v", got, frozenAt)
+	}
+
+	delta := 48 * time.Hour
+	s2, err := ctrl.advanceTimeshift(context.Background(), s.id, delta, true)
+	if err != nil {
+		t.Fatalf("advanceTimeshift: %v", err)
+	}
+	want := frozenAt.Add(delta)
+	if got := s2.effectiveTime(); got.Sub(want).Abs() > time.Second {
+		t.Errorf("after advance: got %v want ~%v", got, want)
+	}
+}
+
+// TestUpdateTimeshiftSetTimeError verifies that a transient (non-NOT_FOUND)
+// SetTime error is logged and skipped — the timeshift still records the new target.
+func TestUpdateTimeshiftSetTimeError(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, pool := newTestController(t, pod)
+
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), 0, false)
+	if err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+
+	pool.setTimeFn = func(_ context.Context, _, _ string, _ time.Time, _ bool) error {
+		return fmt.Errorf("transient agent error")
+	}
+
+	newTarget := time.Now().Add(48 * time.Hour)
+	s2, err := ctrl.updateTimeshift(context.Background(), s.id, newTarget, false)
+	if err != nil {
+		t.Fatalf("updateTimeshift: %v (expected success despite SetTime error)", err)
+	}
+	if got := s2.effectiveTime(); got.Sub(newTarget).Abs() > time.Second {
+		t.Errorf("effectiveTime not updated: got %v want ~%v", got, newTarget)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pod-watcher coverage tests
+// ---------------------------------------------------------------------------
+
+// TestHandlePodEventNonRunning verifies that handlePodEvent returns immediately
+// for pods that are not in Running phase.
+func TestHandlePodEventNonRunning(t *testing.T) {
+	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
+	ctrl, pool := newTestController(t, pod)
+
+	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), 0, false); err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+
+	injectCalled := 0
+	pool.injectFn = func(_ context.Context, _, _ string, _ time.Time, _ bool) (string, error) {
+		injectCalled++
+		return "handle-extra", nil
+	}
+
+	pending := makePod("web-1", "default", "10.0.0.2", "containerd://ddeeff445566")
+	pending.Status.Phase = corev1.PodPending
+	ctrl.handlePodEvent(context.Background(), &pending)
+
+	if injectCalled != 0 {
+		t.Errorf("Inject called %d times for non-Running pod, want 0", injectCalled)
+	}
+}
+
+// TestHandlePodEventFrozenMode verifies that a pod restart under a frozen
+// timeshift re-injects with freeze=true and the original frozen target time.
+func TestHandlePodEventFrozenMode(t *testing.T) {
+	oldCID := "containerd://aabbcc112233"
+	pod := makePod("web-1", "default", "10.0.0.1", oldCID)
+	pod.Status.Phase = corev1.PodRunning
+	ctrl, pool := newTestController(t, pod)
+
+	frozenAt := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	if _, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", frozenAt, 0, true); err != nil {
+		t.Fatalf("createTimeshift: %v", err)
+	}
+
+	var injectedAt time.Time
+	var injectedFreeze bool
+	pool.injectFn = func(_ context.Context, _, _ string, target time.Time, freeze bool) (string, error) {
+		injectedAt = target
+		injectedFreeze = freeze
+		return "handle-new", nil
+	}
+
+	restarted := makePod("web-1", "default", "10.0.0.1", "containerd://ddeeff445566")
+	restarted.Status.Phase = corev1.PodRunning
+	ctrl.handlePodEvent(context.Background(), &restarted)
+
+	if injectedAt.Sub(frozenAt).Abs() > time.Second {
+		t.Errorf("re-injected at %v, want ~%v (frozen time)", injectedAt, frozenAt)
+	}
+	if !injectedFreeze {
+		t.Error("expected freeze=true on re-injection of frozen timeshift")
+	}
+}
 
