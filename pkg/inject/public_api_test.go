@@ -30,6 +30,9 @@ func spawnHelperFresh(t *testing.T) int {
 }
 
 func TestInjectAtTimeFollowChild(t *testing.T) {
+	if os.Getenv("EPOCHD_INJECT_E2E") == "" {
+		t.Skip("set EPOCHD_INJECT_E2E=1 to run (Go runtime can consume ptrace exec-stop in CI)")
+	}
 	pid := spawnHelperFresh(t)
 	target := time.Now().Add(24 * time.Hour)
 
@@ -62,6 +65,9 @@ func TestInjectAtTimeFollowChild(t *testing.T) {
 }
 
 func TestInjectFrozenFollowChild(t *testing.T) {
+	if os.Getenv("EPOCHD_INJECT_E2E") == "" {
+		t.Skip("set EPOCHD_INJECT_E2E=1 to run (Go runtime can consume ptrace exec-stop in CI)")
+	}
 	pid := spawnHelperFresh(t)
 	target := time.Now().Add(24 * time.Hour)
 
@@ -83,6 +89,9 @@ func TestInjectFrozenFollowChild(t *testing.T) {
 }
 
 func TestInjectAtTimeFollowChildKeepTracer(t *testing.T) {
+	if os.Getenv("EPOCHD_INJECT_E2E") == "" {
+		t.Skip("set EPOCHD_INJECT_E2E=1 to run (Go runtime can consume ptrace exec-stop in CI)")
+	}
 	pid := spawnHelperFresh(t)
 	target := time.Now().Add(24 * time.Hour)
 
@@ -110,6 +119,9 @@ func TestInjectAtTimeFollowChildKeepTracer(t *testing.T) {
 }
 
 func TestInjectFrozenFollowChildKeepTracer(t *testing.T) {
+	if os.Getenv("EPOCHD_INJECT_E2E") == "" {
+		t.Skip("set EPOCHD_INJECT_E2E=1 to run (Go runtime can consume ptrace exec-stop in CI)")
+	}
 	pid := spawnHelperFresh(t)
 	target := time.Now().Add(24 * time.Hour)
 
