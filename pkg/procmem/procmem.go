@@ -303,11 +303,14 @@ func (t *Tracer) InterruptDetach() error {
 
 // DetachAll interrupts and detaches from each PID in the list on the pinned
 // OS thread. Errors for processes that no longer exist are silently ignored.
+// Uses the same PTRACE_INTERRUPT → SIGSTOP fallback as InterruptDetach.
 func (t *Tracer) DetachAll(pids []int) error {
 	var err error
 	t.run(func() {
 		for _, pid := range pids {
-			unix.PtraceInterrupt(pid) //nolint:errcheck
+			if e := unix.PtraceInterrupt(pid); e != nil {
+				unix.Kill(pid, unix.SIGSTOP) //nolint:errcheck
+			}
 			var ws unix.WaitStatus
 			unix.Wait4(pid, &ws, 0, nil) //nolint:errcheck
 			if e := unix.PtraceDetach(pid); e != nil && !isNoProcess(e) {

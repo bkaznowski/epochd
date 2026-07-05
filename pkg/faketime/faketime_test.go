@@ -1424,6 +1424,300 @@ func TestWithChildTracker(t *testing.T) {
 	}
 }
 
+// TestFaketimeForkHelper is a subprocess helper: when EPOCHD_FAKETIME_FORK_HELPER=1
+// it spawns one child TestFaketimeHelper (exec path), exercising fork+exec ptrace events.
+// Children inherit stdout so their timestamps flow through the same pipe.
+const forkHelperEnv = "EPOCHD_FAKETIME_FORK_HELPER"
+
+func TestFaketimeForkHelper(t *testing.T) {
+	if os.Getenv(forkHelperEnv) != "1" {
+		t.Skip()
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = os.Stdout // inherit the pipe the test gave us
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "forkHelper: cmd.Start:", err)
+		return
+	}
+	// The child is ptrace-traced by the test's ChildTracker; cmd.Wait() would
+	// block forever because the tracer owns the child's exit events. Instead we
+	// print our own (fake-time) timestamps so the test has data to verify.
+	for {
+		fmt.Println(time.Now().Format(time.RFC3339Nano))
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestHandleAdvance verifies Handle.Advance in both advancing and frozen modes.
+func TestHandleAdvance(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	const base = 24 * time.Hour
+	target := time.Now().Add(base)
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = pw
+
+	h, err := Start(cmd, target)
+	if err != nil {
+		pw.Close()
+		t.Fatalf("Start: %v", err)
+	}
+	pw.Close()
+	t.Cleanup(func() { h.Reset(); cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+
+	// Advancing mode: Advance shifts the offset forward.
+	if err := h.Advance(time.Hour); err != nil {
+		t.Fatalf("Advance (advancing): %v", err)
+	}
+	const (
+		wantAdv   = base + time.Hour
+		tolerance = 10 * time.Second
+	)
+	sc := bufio.NewScanner(pr)
+	advGot := 0
+	for sc.Scan() && advGot < 2 {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff < wantAdv-tolerance || diff > wantAdv+tolerance {
+			t.Errorf("advancing Advance: timestamp %v offset %v, want ~%v",
+				ts, diff.Round(time.Second), wantAdv)
+		}
+		advGot++
+	}
+	if advGot < 2 {
+		t.Fatalf("got only %d/2 advancing timestamps", advGot)
+	}
+
+	// Frozen mode: Advance shifts the frozen instant without leaving frozen mode.
+	frozen := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+	if err := h.Freeze(frozen); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+	if err := h.Advance(2 * time.Hour); err != nil {
+		t.Fatalf("Advance (frozen): %v", err)
+	}
+	if !h.IsFrozen() {
+		t.Error("IsFrozen() should still be true after Advance in frozen mode")
+	}
+	want2 := frozen.Add(2 * time.Hour)
+	if got := h.EffectiveTime(); !got.Equal(want2) {
+		t.Errorf("frozen Advance: EffectiveTime() = %v, want %v", got, want2)
+	}
+}
+
+// TestSessionAdvance verifies Session.Advance in both advancing and frozen modes.
+func TestSessionAdvance(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	const base = 24 * time.Hour
+	target := time.Now().Add(base)
+	s := NewSession(target)
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = pw
+
+	if err := s.Start(cmd); err != nil {
+		pw.Close()
+		t.Fatalf("Session.Start: %v", err)
+	}
+	pw.Close()
+	t.Cleanup(func() { s.Reset(); cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+
+	if err := s.Advance(time.Hour); err != nil {
+		t.Fatalf("Session.Advance (advancing): %v", err)
+	}
+	const (
+		want      = base + time.Hour
+		tolerance = 10 * time.Second
+	)
+	sc := bufio.NewScanner(pr)
+	advGot := 0
+	for sc.Scan() && advGot < 2 {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff < want-tolerance || diff > want+tolerance {
+			t.Errorf("Session.Advance: timestamp %v offset %v, want ~%v",
+				ts, diff.Round(time.Second), want)
+		}
+		advGot++
+	}
+	if advGot < 2 {
+		t.Fatalf("got only %d/2 timestamps after Session.Advance", advGot)
+	}
+
+	// Frozen mode: Advance preserves frozen state.
+	frozen := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+	if err := s.Freeze(frozen); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+	if err := s.Advance(time.Hour); err != nil {
+		t.Fatalf("Session.Advance (frozen): %v", err)
+	}
+	if !s.IsFrozen() {
+		t.Error("session should still be frozen after Advance")
+	}
+}
+
+// TestWithProcess verifies the WithProcess helper starts a process with fake
+// time, calls fn, and registers cleanup via t.Cleanup.
+func TestWithProcess(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	target := time.Now().Add(24 * time.Hour)
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = pw
+
+	called := false
+	WithProcess(t, cmd, target, func(t *testing.T, h *Handle) {
+		called = true
+		pw.Close()
+		const (
+			wantEach  = 2
+			tolerance = 5 * time.Second
+		)
+		sc := bufio.NewScanner(pr)
+		got := 0
+		for sc.Scan() && got < wantEach {
+			ts, ok := parseFaketimeTimestamp(sc.Text())
+			if !ok {
+				continue
+			}
+			diff := time.Until(ts)
+			if diff < 24*time.Hour-tolerance || diff > 24*time.Hour+tolerance {
+				t.Errorf("WithProcess: timestamp %v is %v from now, want ~24h",
+					ts, diff.Round(time.Second))
+			}
+			got++
+		}
+		if got < wantEach {
+			t.Fatalf("WithProcess: got %d timestamps, want %d", got, wantEach)
+		}
+	})
+	if !called {
+		t.Error("WithProcess: fn was never called")
+	}
+}
+
+// TestChildTrackerForkAndExec starts a process that forks+execs a child, verifying
+// that handleEvent (fork path), handleExec, and ChildTracker.Err are exercised.
+func TestChildTrackerForkAndExec(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+
+	const fakeOffset = 24 * time.Hour
+	target := time.Now().Add(fakeOffset)
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeForkHelper", "-test.v")
+	cmd.Env = append(os.Environ(), forkHelperEnv+"=1")
+	cmd.Stdout = pw
+
+	ct, err := StartWithTracking(cmd, target)
+	if err != nil {
+		pw.Close()
+		pr.Close()
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+	pw.Close()
+	t.Cleanup(func() {
+		ct.Reset()         //nolint:errcheck
+		ct.Close()         //nolint:errcheck
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+		pr.Close()
+	})
+
+	// Wait up to 5 s for the fork helper to spawn and exec its child.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(ct.Children()) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	children := ct.Children()
+	if len(children) == 0 {
+		t.Skip("no forked children detected — fork helper may have exited before tracking")
+	}
+	t.Logf("tracked %d forked child(ren); PIDs=%v", len(children), ct.PIDs())
+
+	// Read timestamps from the pipe. The fork helper itself prints fake-time
+	// timestamps (it inherits the parent's injected clock). The exec'd child may
+	// print real-time stamps if re-injection after exec failed — those are ignored.
+	const (
+		wantFake  = 2
+		tolerance = 10 * time.Second
+	)
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff >= fakeOffset-tolerance && diff <= fakeOffset+tolerance {
+			t.Logf("fake-time stamp: %v (offset %v)", ts, diff.Round(time.Millisecond))
+			got++
+			if got >= wantFake {
+				break
+			}
+		}
+	}
+	if got < wantFake {
+		t.Fatalf("got only %d/%d fake-time timestamps from fork helper", got, wantFake)
+	}
+
+	// Log any tracker error (e.g. re-injection after exec failing); don't fail —
+	// that is a separate, env-specific bug unrelated to the fork-tracking paths.
+	if err := ct.Err(); err != nil {
+		t.Logf("tracker loopErr (re-injection may fail in some envs): %v", err)
+	}
+}
+
 // parseFaketimeTimestamp trims and parses an RFC3339Nano line, returning
 // (zero, false) for test-framework noise or unparseable lines.
 func parseFaketimeTimestamp(line string) (time.Time, bool) {

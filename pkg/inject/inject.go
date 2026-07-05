@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+
 // Handle represents an active time-offset injection in a target process.
 // Obtain one via InjectAtTime or InjectFrozen; update with SetTime or Freeze.
 type Handle struct {
@@ -444,6 +445,12 @@ func parseHexAddr(s string) uintptr {
 // fixedAddr is used as the target address; the kernel will return EEXIST if
 // that page is already mapped.  Pass fixedAddr=0 to let the kernel choose freely
 // (used by tests that don't need proximity to the vDSO).
+// mmapAttempt describes one mmap variant to try inside remoteMmap.
+type mmapAttempt struct {
+	flags uint64
+	addr  uint64
+}
+
 func remoteMmap(tr *procmem.Tracer, pid int, patchAddr, fixedAddr uintptr) (uintptr, error) {
 	origRegs, err := tr.GetRegs()
 	if err != nil {
@@ -467,52 +474,72 @@ func remoteMmap(tr *procmem.Tracer, pid int, patchAddr, fixedAddr uintptr) (uint
 		return 0, fmt.Errorf("remoteMmap: poke trampoline: %w", err)
 	}
 
-	flags := uint64(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS)
-	addr := uint64(0)
+	// Build the list of flag/addr combinations to try. When fixedAddr is set we
+	// prefer MAP_FIXED_NOREPLACE (detects races), but fall back to MAP_FIXED on
+	// EBADF — observed on WSL2 for exec-stopped processes, likely a mandatory
+	// seccomp restriction that blocks the non-replace variant. MAP_FIXED is safe
+	// here because findNearbyGap already confirmed the address is free and the
+	// process is ptrace-stopped so the address space is stable.
+	base := uint64(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS)
+	var attempts []mmapAttempt
 	if fixedAddr != 0 {
-		flags |= unix.MAP_FIXED_NOREPLACE
-		addr = uint64(fixedAddr)
+		attempts = []mmapAttempt{
+			{base | uint64(unix.MAP_FIXED_NOREPLACE), uint64(fixedAddr)},
+			{base | uint64(unix.MAP_FIXED), uint64(fixedAddr)},
+		}
+	} else {
+		attempts = []mmapAttempt{{base, 0}}
 	}
 
-	regs := *origRegs
-	regs.Rip = uint64(patchAddr)
-	regs.Rax = uint64(syscall.SYS_MMAP)
-	regs.Rdi = addr
-	regs.Rsi = 4096
-	regs.Rdx = uint64(unix.PROT_READ | unix.PROT_WRITE | unix.PROT_EXEC)
-	regs.R10 = flags
-	regs.R8 = ^uint64(0) // fd = -1
-	regs.R9 = 0
-	if err := tr.SetRegs(&regs); err != nil {
-		return 0, fmt.Errorf("remoteMmap: SetRegs: %w", err)
-	}
+	// The syscall+int3 trampoline is already patched at patchAddr; each attempt
+	// just re-sets registers and re-executes without re-patching.
+	for i, att := range attempts {
+		regs := *origRegs
+		regs.Rip = uint64(patchAddr)
+		regs.Rax = uint64(syscall.SYS_MMAP)
+		regs.Rdi = att.addr
+		regs.Rsi = 4096
+		regs.Rdx = uint64(unix.PROT_READ | unix.PROT_WRITE | unix.PROT_EXEC)
+		regs.R10 = att.flags
+		regs.R8 = ^uint64(0) // fd = -1 (ignored when MAP_ANONYMOUS is set)
+		regs.R9 = 0
+		if err := tr.SetRegs(&regs); err != nil {
+			return 0, fmt.Errorf("remoteMmap: SetRegs (attempt %d): %w", i, err)
+		}
+		if err := tr.Cont(0); err != nil {
+			return 0, fmt.Errorf("remoteMmap: Cont (attempt %d): %w", i, err)
+		}
+		ws, err := tr.Wait()
+		if err != nil {
+			return 0, fmt.Errorf("remoteMmap: Wait (attempt %d): %w", i, err)
+		}
+		if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
+			return 0, fmt.Errorf("remoteMmap: expected SIGTRAP, got 0x%08x (attempt %d)", uint32(ws), i)
+		}
 
-	if err := tr.Cont(0); err != nil {
-		return 0, fmt.Errorf("remoteMmap: Cont: %w", err)
-	}
-	ws, err := tr.Wait()
-	if err != nil {
-		return 0, fmt.Errorf("remoteMmap: Wait: %w", err)
-	}
-	if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
-		return 0, fmt.Errorf("remoteMmap: expected SIGTRAP, got 0x%08x", uint32(ws))
-	}
+		postRegs, err := tr.GetRegs()
+		if err != nil {
+			return 0, fmt.Errorf("remoteMmap: GetRegs post (attempt %d): %w", i, err)
+		}
+		result := uintptr(postRegs.Rax)
+		if int64(result) >= 0 {
+			if err := tr.PokeText(patchAddr, origBytes); err != nil {
+				return 0, fmt.Errorf("remoteMmap: restore bytes: %w", err)
+			}
+			if err := tr.SetRegs(origRegs); err != nil {
+				return 0, fmt.Errorf("remoteMmap: restore regs: %w", err)
+			}
+			restored = true
+			return result, nil
+		}
 
-	postRegs, err := tr.GetRegs()
-	if err != nil {
-		return 0, fmt.Errorf("remoteMmap: GetRegs (post): %w", err)
+		mmapErr := syscall.Errno(-int64(result))
+		// Retry on EBADF (WSL2 blocks MAP_FIXED_NOREPLACE for exec-stopped processes)
+		// or EEXIST (address is occupied despite findNearbyGap; try MAP_FIXED instead).
+		if i < len(attempts)-1 && (mmapErr == syscall.EBADF || mmapErr == syscall.EEXIST) {
+			continue
+		}
+		return 0, fmt.Errorf("remoteMmap: mmap failed: %w", mmapErr)
 	}
-	result := uintptr(postRegs.Rax)
-	if int64(result) < 0 {
-		return 0, fmt.Errorf("remoteMmap: mmap failed: %w", syscall.Errno(-int64(result)))
-	}
-
-	if err := tr.PokeText(patchAddr, origBytes); err != nil {
-		return 0, fmt.Errorf("remoteMmap: restore bytes: %w", err)
-	}
-	if err := tr.SetRegs(origRegs); err != nil {
-		return 0, fmt.Errorf("remoteMmap: restore regs: %w", err)
-	}
-	restored = true
-	return result, nil
+	return 0, fmt.Errorf("remoteMmap: all mmap attempts exhausted")
 }
