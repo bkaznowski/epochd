@@ -46,17 +46,21 @@ func WithPID(t *testing.T, pid int, target time.Time, fn func(*testing.T, *Handl
 }
 
 // WithSession calls setup to add processes to a new session targeting target,
-// then calls fn. t.Cleanup resets all handles and waits on any commands added
-// via session.Start.
-func WithSession(t *testing.T, target time.Time, setup func(*Session) error, fn func(*testing.T, *Session)) {
+// then calls fn. t.Cleanup resets all handles, closes any active trackers, and
+// waits on any commands added via session.Start. Pass WithTracking() in opts to
+// enable automatic child-process injection.
+func WithSession(t *testing.T, target time.Time, setup func(*Session) error, fn func(*testing.T, *Session), opts ...SessionOption) {
 	t.Helper()
-	s := NewSession(target)
+	s := NewSession(target, opts...)
 	if err := setup(s); err != nil {
 		t.Fatalf("faketime.WithSession: setup: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := s.Reset(); err != nil {
 			t.Logf("faketime.WithSession: cleanup Reset: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Logf("faketime.WithSession: cleanup Close: %v", err)
 		}
 		s.mu.Lock()
 		cmds := make([]*exec.Cmd, len(s.cmds))

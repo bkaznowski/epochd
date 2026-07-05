@@ -582,6 +582,13 @@ handle.SetTime(advancingTarget) // switches back to advancing mode
 session := faketime.NewSession(target)
 session.Freeze(target)
 session.Start(cmd) // new processes joined after Freeze() are also frozen
+
+// Session with fork/exec tracking — children and exec'd processes are
+// automatically injected. Close() shuts the watcher down.
+session := faketime.NewSession(target, faketime.WithTracking())
+defer session.Reset()
+defer session.Close()
+session.Start(cmd) // parent + all descendants see fake time
 ```
 
 ---
@@ -704,7 +711,7 @@ err = session.Advance(24 * time.Hour)
 | 35 | Advance-by-duration (`PATCH duration`, `advance --by`, `AdvanceTimeshift`, `Handle.Advance`) | ✅ |
 | 36 | Offset-based timeshift storage (live `time` in GET responses) | ✅ |
 | 37 | proto `freeze` field on `InjectRequest` / `SetTimeRequest` | ✅ |
-| 38 | `pkg/faketime`: `Handle.EffectiveTime()`, `Handle.PID()`, `Session.Close()`, `Handle.IsAlive()` | 🔲 |
+| 38 | `pkg/faketime`: `Session.Close()` ✅ · `Handle.EffectiveTime()`, `Handle.PID()`, `Handle.IsAlive()` 🔲 | 🔲 |
 | 39 | `pkg/faketime`: `StartWithTracking` / `ChildTracker` — auto-inject into forked child processes via `PTRACE_O_TRACEFORK` | ✅ |
 | 40 | `pkg/faketime`: exec-survivor injection — re-inject after `exec()` via `PTRACE_O_TRACEEXEC` so processes that self-exec (e.g. PEX bootstrap) or fork+exec retain fake time | ✅ |
 

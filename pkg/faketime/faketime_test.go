@@ -268,6 +268,114 @@ func TestWithSession(t *testing.T) {
 	}
 }
 
+// TestSessionWithTracking verifies that a session created with WithTracking
+// tracks the child process and that Session.Close shuts down cleanly.
+func TestSessionWithTracking(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	const fakeOffset = 24 * time.Hour
+	target := time.Now().Add(fakeOffset)
+
+	s := NewSession(target, WithTracking())
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = pw
+
+	if err := s.Start(cmd); err != nil {
+		pw.Close()
+		t.Fatalf("Session.Start: %v", err)
+	}
+	pw.Close()
+
+	if s.Len() != 1 {
+		t.Errorf("Len() = %d, want 1", s.Len())
+	}
+
+	// Read a few timestamps to confirm the fake offset is active.
+	const (
+		wantEach  = 2
+		tolerance = 5 * time.Second
+	)
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff < fakeOffset-tolerance || diff > fakeOffset+tolerance {
+			t.Errorf("timestamp %v is %v from now, want ~%v",
+				ts, diff.Round(time.Millisecond), fakeOffset)
+		}
+		t.Logf("tracked: %v  (offset %v)", ts, diff.Round(time.Millisecond))
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("received only %d/%d timestamps", got, wantEach)
+	}
+
+	// Advance the session clock; children are updated via applyAll.
+	const newOffset = 48 * time.Hour
+	if err := s.SetTime(time.Now().Add(newOffset)); err != nil {
+		t.Fatalf("Session.SetTime: %v", err)
+	}
+
+	// Close should stop the tracker goroutine without error.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Session.Close: %v", err)
+	}
+
+	cmd.Process.Kill() //nolint:errcheck
+	cmd.Wait()         //nolint:errcheck
+}
+
+// TestWithSessionTracking verifies the WithSession helper with the WithTracking option.
+func TestWithSessionTracking(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	target := time.Now().Add(24 * time.Hour)
+
+	WithSession(t, target,
+		func(s *Session) error {
+			pr, pw, err := os.Pipe()
+			if err != nil {
+				return err
+			}
+			cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+			cmd.Env = append(os.Environ(), helperEnv+"=1")
+			cmd.Stdout = pw
+			if err := s.Start(cmd); err != nil {
+				pw.Close()
+				pr.Close()
+				return err
+			}
+			pw.Close()
+			pr.Close()
+			return nil
+		},
+		func(t *testing.T, s *Session) {
+			if s.Len() != 1 {
+				t.Fatalf("Len() = %d, want 1", s.Len())
+			}
+		},
+		WithTracking(),
+	)
+}
+
 // parseFaketimeTimestamp trims and parses an RFC3339Nano line, returning
 // (zero, false) for test-framework noise or unparseable lines.
 func parseFaketimeTimestamp(line string) (time.Time, bool) {

@@ -1165,13 +1165,15 @@ if err := s.Reset(); err != nil { ... }</code></pre>
 <table>
   <thead><tr><th>Method</th><th>Description</th></tr></thead>
   <tbody>
-    <tr><td><code>NewSession(target time.Time) *Session</code></td><td>Creates an empty session in advancing mode with the given initial target.</td></tr>
+    <tr><td><code>NewSession(target time.Time, opts ...SessionOption) *Session</code></td><td>Creates an empty session in advancing mode with the given initial target. Pass <code>WithTracking()</code> to enable automatic child-process injection.</td></tr>
+    <tr><td><code>WithTracking() SessionOption</code></td><td>Session option that enables fork/exec tracking. Each process added via <code>s.Start</code> gets a <code>ChildTracker</code>; <code>SetTime</code>/<code>Freeze</code>/<code>Advance</code> also update all tracked descendants. Call <code>s.Close()</code> to stop the watcher goroutines.</td></tr>
     <tr><td><code>s.Start(cmd *exec.Cmd) error</code></td><td>Starts the command and adds its handle to the session. Respects the session's current mode (advancing or frozen).</td></tr>
     <tr><td><code>s.Attach(pid int) error</code></td><td>Attaches to a running process and adds it to the session. Respects the session's current mode.</td></tr>
-    <tr><td><code>s.SetTime(target time.Time) error</code></td><td>Switches all handles to advancing mode and updates the time concurrently. Errors from individual handles are joined.</td></tr>
+    <tr><td><code>s.SetTime(target time.Time) error</code></td><td>Switches all handles to advancing mode and updates the time concurrently. Also propagates to any children tracked via <code>WithTracking()</code>.</td></tr>
     <tr><td><code>s.Freeze(target time.Time) error</code></td><td>Switches all handles to frozen mode at <code>target</code> concurrently.</td></tr>
     <tr><td><code>s.Advance(d time.Duration) error</code></td><td>Shifts all handles by <code>d</code> concurrently, preserving the current mode.</td></tr>
     <tr><td><code>s.Reset() error</code></td><td>Resets all processes to real time.</td></tr>
+    <tr><td><code>s.Close() error</code></td><td>Stops all <code>ChildTracker</code> watch goroutines started by <code>WithTracking()</code>. No-op if tracking was not enabled. Always call this (or rely on <code>WithSession</code> cleanup) when using <code>WithTracking()</code>.</td></tr>
     <tr><td><code>s.Len() int</code></td><td>Returns the number of handles in the session.</td></tr>
   </tbody>
 </table>
@@ -1193,8 +1195,8 @@ if err := s.Reset(); err != nil { ... }</code></pre>
       <td>Attaches to <code>pid</code>, calls <code>fn(t, *Handle)</code>, then resets the clock. Requires <code>CAP_SYS_PTRACE</code>.</td>
     </tr>
     <tr>
-      <td><code>WithSession(t, target, setup, fn)</code></td>
-      <td>Creates a session, calls <code>setup(s)</code> to populate it, calls <code>fn(t, *Session)</code>, then resets and cleans up.</td>
+      <td><code>WithSession(t, target, setup, fn, opts...)</code></td>
+      <td>Creates a session, calls <code>setup(s)</code> to populate it, calls <code>fn(t, *Session)</code>, then resets, closes any trackers, and cleans up. Pass <code>WithTracking()</code> as a trailing option to enable child tracking.</td>
     </tr>
   </tbody>
 </table>
@@ -1216,6 +1218,28 @@ if err := s.Reset(); err != nil { ... }</code></pre>
             // s.SetTime(...) updates both simultaneously.
         },
     )
+}</code></pre>
+
+<h4>WithTracking example — session-level child tracking</h4>
+<p>Pass <code>WithTracking()</code> to <code>NewSession</code> (or as a trailing argument to <code>WithSession</code>) to have every process added via <code>s.Start</code> automatically track its descendants. <code>s.SetTime</code> and friends propagate to the full process tree. Always call <code>s.Close()</code> (or let <code>WithSession</code> do it) to stop the background watcher goroutines.</p>
+<pre><code class="language-go">func TestForkingService(t *testing.T) {
+    target := time.Now().Add(365 * 24 * time.Hour)
+
+    faketime.WithSession(t, target,
+        func(s *faketime.Session) error {
+            // postmaster forks a backend per connection — all backends
+            // inherit the fake clock automatically.
+            return s.Start(exec.Command("./postmaster"))
+        },
+        func(t *testing.T, s *faketime.Session) {
+            // Advance the clock; the postmaster and all its backends move together.
+            if err := s.Advance(30 * 24 * time.Hour); err != nil {
+                t.Fatal(err)
+            }
+        },
+        faketime.WithTracking(), // enable fork/exec tracking
+    )
+    // WithSession calls s.Close() automatically on cleanup.
 }</code></pre>
 
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->

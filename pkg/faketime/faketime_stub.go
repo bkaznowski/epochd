@@ -19,6 +19,13 @@ type Handle struct{}
 // Session manages fake time for a group of processes. On non-Linux platforms all operations return errors.
 type Session struct{}
 
+// SessionOption configures a Session.
+type SessionOption func(*Session)
+
+// WithTracking returns a SessionOption that enables child-process tracking.
+// On non-Linux platforms it is accepted but has no effect.
+func WithTracking() SessionOption { return func(*Session) {} }
+
 func Start(_ *exec.Cmd, _ time.Time) (*Handle, error)       { return nil, errNotSupported }
 func StartFrozen(_ *exec.Cmd, _ time.Time) (*Handle, error) { return nil, errNotSupported }
 func Attach(_ int, _ time.Time) (*Handle, error)            { return nil, errNotSupported }
@@ -27,13 +34,14 @@ func (h *Handle) SetTime(_ time.Time) error                 { return errNotSuppo
 func (h *Handle) Freeze(_ time.Time) error                  { return errNotSupported }
 func (h *Handle) Reset() error                              { return errNotSupported }
 
-func NewSession(_ time.Time) *Session        { return &Session{} }
-func (s *Session) Start(_ *exec.Cmd) error   { return errNotSupported }
-func (s *Session) Attach(_ int) error        { return errNotSupported }
-func (s *Session) SetTime(_ time.Time) error { return errNotSupported }
-func (s *Session) Freeze(_ time.Time) error  { return errNotSupported }
-func (s *Session) Reset() error              { return errNotSupported }
-func (s *Session) Len() int                  { return 0 }
+func NewSession(_ time.Time, _ ...SessionOption) *Session { return &Session{} }
+func (s *Session) Start(_ *exec.Cmd) error                { return errNotSupported }
+func (s *Session) Attach(_ int) error                     { return errNotSupported }
+func (s *Session) SetTime(_ time.Time) error              { return errNotSupported }
+func (s *Session) Freeze(_ time.Time) error               { return errNotSupported }
+func (s *Session) Reset() error                           { return errNotSupported }
+func (s *Session) Close() error                           { return errNotSupported }
+func (s *Session) Len() int                               { return 0 }
 
 // WithProcess skips the test on non-Linux platforms.
 func WithProcess(t *testing.T, _ *exec.Cmd, _ time.Time, _ func(*testing.T, *Handle)) {

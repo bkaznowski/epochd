@@ -154,6 +154,22 @@ func (h *Handle) Reset() error {
 }
 
 // ---------------------------------------------------------------------------
+// Session options
+// ---------------------------------------------------------------------------
+
+// SessionOption configures a Session.
+type SessionOption func(*Session)
+
+// WithTracking enables automatic fake-time injection into any processes spawned
+// via fork, vfork, or exec while the session is active. When this option is
+// used, Session.Start internally calls StartWithTracking and Session.Close must
+// be called when the session is no longer needed to stop the watch goroutine
+// and detach ptrace.
+func WithTracking() SessionOption {
+	return func(s *Session) { s.tracking = true }
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -169,11 +185,18 @@ type Session struct {
 	offset   time.Duration
 	frozenAt time.Time
 	frozen   bool
+	tracking bool
+	trackers []*ChildTracker
 }
 
 // NewSession creates an empty session with the given initial target time.
-func NewSession(target time.Time) *Session {
-	return &Session{offset: time.Until(target)}
+// Pass WithTracking() to enable automatic injection into forked/exec'd children.
+func NewSession(target time.Time, opts ...SessionOption) *Session {
+	s := &Session{offset: time.Until(target)}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // effectiveTarget returns the current effective fake time for new injections.
@@ -185,11 +208,33 @@ func (s *Session) effectiveTarget() time.Time {
 }
 
 // Start starts cmd with fake time and adds the resulting handle to the session.
+// When the session was created with WithTracking, fork and exec events are
+// automatically tracked and injected.
 func (s *Session) Start(cmd *exec.Cmd) error {
 	s.mu.Lock()
 	target := s.effectiveTarget()
 	frozen := s.frozen
+	tracking := s.tracking
 	s.mu.Unlock()
+
+	if tracking {
+		var ct *ChildTracker
+		var err error
+		if frozen {
+			ct, err = StartFrozenWithTracking(cmd, target)
+		} else {
+			ct, err = StartWithTracking(cmd, target)
+		}
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.handles = append(s.handles, ct.Handle)
+		s.trackers = append(s.trackers, ct)
+		s.cmds = append(s.cmds, cmd)
+		s.mu.Unlock()
+		return nil
+	}
 
 	var h *Handle
 	var err error
@@ -276,6 +321,33 @@ func (s *Session) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.handles)
+}
+
+// Close stops all child tracker goroutines, resets tracked children to the
+// real clock, and detaches ptrace from every tracked process. It is only
+// required when the session was created with WithTracking; for non-tracking
+// sessions it is a no-op. The parent processes continue running after Close —
+// call Reset before Close if you want to snap them back to the real clock.
+func (s *Session) Close() error {
+	s.mu.Lock()
+	trackers := make([]*ChildTracker, len(s.trackers))
+	copy(trackers, s.trackers)
+	s.mu.Unlock()
+
+	if len(trackers) == 0 {
+		return nil
+	}
+	errs := make([]error, len(trackers))
+	var wg sync.WaitGroup
+	for i, ct := range trackers {
+		wg.Add(1)
+		go func(i int, ct *ChildTracker) {
+			defer wg.Done()
+			errs[i] = ct.Close()
+		}(i, ct)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +665,9 @@ func (s *Session) applyAll(fn func(*Handle) error, updateState func()) error {
 	s.mu.Lock()
 	handles := make([]*Handle, len(s.handles))
 	copy(handles, s.handles)
+	for _, ct := range s.trackers {
+		handles = append(handles, ct.Children()...)
+	}
 	s.mu.Unlock()
 
 	errs := make([]error, len(handles))

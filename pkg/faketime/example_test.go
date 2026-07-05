@@ -176,6 +176,31 @@ func ExampleStartWithTracking() {
 	}
 }
 
+// NewSession_withTracking shows how to create a session that automatically
+// injects fake time into any process spawned by fork, vfork, or exec.
+// Session.Close must be called to stop the watch goroutine; the idiomatic
+// place is a deferred call or t.Cleanup (the latter is handled automatically
+// by WithSession when WithTracking is passed as an option).
+func ExampleNewSession_withTracking() {
+	target := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := faketime.NewSession(target, faketime.WithTracking())
+	defer s.Reset()   //nolint:errcheck
+	defer s.Close()   //nolint:errcheck
+
+	// The process and every child it forks or execs see the same fake clock.
+	cmd := exec.Command("./postmaster")
+	if err := s.Start(cmd); err != nil {
+		panic(err)
+	}
+	defer cmd.Process.Kill()
+	defer cmd.Wait() //nolint:errcheck
+
+	// Advance the clock for all tracked processes at once.
+	if err := s.Advance(24 * time.Hour); err != nil {
+		panic(err)
+	}
+}
+
 // WithSession is the idiomatic way to run a multi-process test with a shared
 // fake clock.
 // In a real test t comes from the testing framework; the nil here is for
