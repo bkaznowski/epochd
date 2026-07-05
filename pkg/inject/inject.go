@@ -81,6 +81,54 @@ func InjectFrozenFollowChildKeepTracer(pid int, target time.Time) (*Handle, *pro
 	return injectFollowChildKeepTracer(pid, sec, nsec, trampoline.MaskFrozen)
 }
 
+// InjectAtTimeKeepTracer attaches to an already-running process, injects the
+// trampoline in advancing mode, sets PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK|
+// PTRACE_O_TRACEEXEC, and resumes it. The caller owns the Tracer and must drive
+// the event loop, calling tr.InterruptDetach() when done.
+// Requires CAP_SYS_PTRACE and ptrace_scope <= 1.
+func InjectAtTimeKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer, error) {
+	sec, nsec := diffSecNsec(target, time.Now())
+	return injectCoreKeepTracer(pid, sec, nsec, trampoline.MaskEnabled)
+}
+
+// InjectFrozenKeepTracer is like InjectAtTimeKeepTracer but starts the clock
+// in freeze mode.
+func InjectFrozenKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer, error) {
+	sec := target.Unix()
+	nsec := int64(target.Nanosecond())
+	return injectCoreKeepTracer(pid, sec, nsec, trampoline.MaskFrozen)
+}
+
+// injectCoreKeepTracer attaches to pid via PTRACE_ATTACH, injects the
+// trampoline, enables fork/exec tracing options, and resumes the process
+// without detaching. The returned Tracer is ready to drive the event loop.
+func injectCoreKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle, *procmem.Tracer, error) {
+	tr := procmem.NewTracer()
+	if err := tr.Attach(pid); err != nil {
+		return nil, nil, fmt.Errorf("inject: Attach pid %d: %w", pid, err)
+	}
+	// Read maps while the process is ptrace-stopped — address space is stable.
+	info, err := vdso.Locate(pid)
+	if err != nil {
+		tr.Detach() //nolint:errcheck
+		return nil, nil, fmt.Errorf("inject: vdso.Locate: %w", err)
+	}
+	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
+	if err != nil {
+		tr.Detach() //nolint:errcheck
+		return nil, nil, err
+	}
+	if err := tr.SetOptions(unix.PTRACE_O_TRACEFORK | unix.PTRACE_O_TRACEVFORK | unix.PTRACE_O_TRACEEXEC); err != nil {
+		tr.Detach() //nolint:errcheck
+		return nil, nil, fmt.Errorf("inject: SetOptions: %w", err)
+	}
+	if err := tr.Cont(0); err != nil {
+		tr.Detach() //nolint:errcheck
+		return nil, nil, fmt.Errorf("inject: Cont parent: %w", err)
+	}
+	return h, tr, nil
+}
+
 func injectFollowChildKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle, *procmem.Tracer, error) {
 	tr := procmem.NewTracer()
 	if err := tr.FollowChild(pid); err != nil {

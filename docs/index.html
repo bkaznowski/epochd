@@ -1279,6 +1279,14 @@ if err := s.Reset(); err != nil { ... }</code></pre>
       <td>Same as <code>StartWithTracking</code> but starts with the clock frozen at <code>target</code>.</td>
     </tr>
     <tr>
+      <td><code>AttachWithTracking(pid int, target) (*ChildTracker, error)</code></td>
+      <td>Attaches to an already-running process in advancing mode and tracks all descendants. Requires <code>CAP_SYS_PTRACE</code> and <code>ptrace_scope ≤ 1</code>.</td>
+    </tr>
+    <tr>
+      <td><code>AttachFrozenWithTracking(pid int, target) (*ChildTracker, error)</code></td>
+      <td>Same as <code>AttachWithTracking</code> but starts with the clock frozen at <code>target</code>.</td>
+    </tr>
+    <tr>
       <td><code>ct.Handle</code></td>
       <td>The parent process's fake-time <code>Handle</code>. Call <code>SetTime</code>, <code>Freeze</code>, or <code>Advance</code> on it to update the parent's clock.</td>
     </tr>

@@ -271,11 +271,33 @@ func (s *Session) Start(cmd *exec.Cmd) error {
 }
 
 // Attach attaches to an already-running process and adds it to the session.
+// When the session was created with WithTracking, fork and exec events from the
+// attached process are automatically tracked and injected.
+// Requires CAP_SYS_PTRACE and ptrace_scope <= 1 when WithTracking is active.
 func (s *Session) Attach(pid int) error {
 	s.mu.Lock()
 	target := s.effectiveTarget()
 	frozen := s.frozen
+	tracking := s.tracking
 	s.mu.Unlock()
+
+	if tracking {
+		var ct *ChildTracker
+		var err error
+		if frozen {
+			ct, err = AttachFrozenWithTracking(pid, target)
+		} else {
+			ct, err = AttachWithTracking(pid, target)
+		}
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.handles = append(s.handles, ct.Handle)
+		s.trackers = append(s.trackers, ct)
+		s.mu.Unlock()
+		return nil
+	}
 
 	var h *Handle
 	var err error
@@ -377,7 +399,8 @@ func (s *Session) Close() error {
 // vDSO patch; no new injection is needed — only a Handle pointing to the
 // child's copy of the state struct is created.
 //
-// Obtain a ChildTracker via StartWithTracking or StartFrozenWithTracking.
+// Obtain a ChildTracker via StartWithTracking, StartFrozenWithTracking,
+// AttachWithTracking, or AttachFrozenWithTracking.
 type ChildTracker struct {
 	// Handle is the parent process's fake-time handle.
 	Handle *Handle
@@ -420,6 +443,29 @@ func (c *ChildTracker) Close() error {
 	err := c.loopErr
 	c.mu.Unlock()
 	return err
+}
+
+// AttachWithTracking attaches to an already-running process with advancing fake
+// time and returns a ChildTracker that automatically injects fake time into any
+// processes the target spawns via fork or vfork.
+// Requires CAP_SYS_PTRACE and ptrace_scope <= 1.
+func AttachWithTracking(pid int, target time.Time) (*ChildTracker, error) {
+	ih, tr, err := inject.InjectAtTimeKeepTracer(pid, target)
+	if err != nil {
+		return nil, fmt.Errorf("faketime: AttachWithTracking pid %d: %w", pid, err)
+	}
+	return newChildTracker(newAdvancingHandle(ih, target), tr, pid), nil
+}
+
+// AttachFrozenWithTracking attaches to an already-running process with the
+// clock frozen at target and returns a ChildTracker for its descendants.
+// Requires CAP_SYS_PTRACE and ptrace_scope <= 1.
+func AttachFrozenWithTracking(pid int, target time.Time) (*ChildTracker, error) {
+	ih, tr, err := inject.InjectFrozenKeepTracer(pid, target)
+	if err != nil {
+		return nil, fmt.Errorf("faketime: AttachFrozenWithTracking pid %d: %w", pid, err)
+	}
+	return newChildTracker(newFrozenHandle(ih, target), tr, pid), nil
 }
 
 // StartWithTracking starts cmd with advancing fake time and returns a

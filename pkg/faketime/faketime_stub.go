@@ -74,6 +74,12 @@ func StartWithTracking(_ *exec.Cmd, _ time.Time) (*ChildTracker, error) {
 func StartFrozenWithTracking(_ *exec.Cmd, _ time.Time) (*ChildTracker, error) {
 	return nil, errNotSupported
 }
+func AttachWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
+	return nil, errNotSupported
+}
+func AttachFrozenWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
+	return nil, errNotSupported
+}
 func (c *ChildTracker) Children() []*Handle { return nil }
 func (c *ChildTracker) Err() error          { return errNotSupported }
 func (c *ChildTracker) Close() error        { return errNotSupported }

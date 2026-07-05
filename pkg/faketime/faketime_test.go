@@ -703,6 +703,149 @@ func TestSessionAttach(t *testing.T) {
 	}
 }
 
+// TestAttachWithTracking verifies AttachWithTracking attaches to a running
+// process, injects fake time, and that Close shuts down cleanly.
+func TestAttachWithTracking(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	const fakeOffset = 24 * time.Hour
+	target := time.Now().Add(fakeOffset)
+
+	ct, err := AttachWithTracking(cmd.Process.Pid, target)
+	if err != nil {
+		t.Fatalf("AttachWithTracking: %v", err)
+	}
+
+	if ct.Handle.PID() != cmd.Process.Pid {
+		t.Errorf("Handle.PID() = %d, want %d", ct.Handle.PID(), cmd.Process.Pid)
+	}
+
+	const (
+		wantEach  = 2
+		tolerance = 5 * time.Second
+	)
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff < fakeOffset-tolerance || diff > fakeOffset+tolerance {
+			t.Errorf("timestamp %v is %v from now, want ~%v",
+				ts, diff.Round(time.Millisecond), fakeOffset)
+		}
+		t.Logf("tracked: %v  (offset %v)", ts, diff.Round(time.Millisecond))
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("received only %d/%d timestamps", got, wantEach)
+	}
+
+	if err := ct.Close(); err != nil {
+		t.Fatalf("ChildTracker.Close: %v", err)
+	}
+}
+
+// TestAttachFrozenWithTracking verifies AttachFrozenWithTracking pins the clock
+// and that Close detaches cleanly.
+func TestAttachFrozenWithTracking(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	ct, err := AttachFrozenWithTracking(cmd.Process.Pid, frozen)
+	if err != nil {
+		t.Fatalf("AttachFrozenWithTracking: %v", err)
+	}
+
+	if got := ct.Handle.EffectiveTime(); !got.Equal(frozen) {
+		t.Errorf("EffectiveTime() = %v, want %v", got, frozen)
+	}
+
+	const wantEach = 2
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		if !ts.Equal(frozen) {
+			t.Errorf("frozen timestamp %v != %v", ts, frozen)
+		}
+		t.Logf("frozen: %v", ts)
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("received only %d/%d frozen timestamps", got, wantEach)
+	}
+
+	if err := ct.Close(); err != nil {
+		t.Fatalf("ChildTracker.Close: %v", err)
+	}
+}
+
+// TestSessionAttachWithTracking verifies that Session.Attach on a WithTracking
+// session uses AttachWithTracking (returns a ChildTracker), and that Close is
+// called on cleanup.
+func TestSessionAttachWithTracking(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	const fakeOffset = 24 * time.Hour
+	target := time.Now().Add(fakeOffset)
+	s := NewSession(target, WithTracking())
+	t.Cleanup(func() {
+		s.Reset() //nolint:errcheck
+		s.Close() //nolint:errcheck
+	})
+
+	if err := s.Attach(cmd.Process.Pid); err != nil {
+		t.Fatalf("Session.Attach (WithTracking): %v", err)
+	}
+	if s.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1", s.Len())
+	}
+
+	const (
+		wantEach  = 2
+		tolerance = 5 * time.Second
+	)
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff < fakeOffset-tolerance || diff > fakeOffset+tolerance {
+			t.Errorf("timestamp %v is %v from now, want ~%v",
+				ts, diff.Round(time.Millisecond), fakeOffset)
+		}
+		t.Logf("session+tracking: %v  (offset %v)", ts, diff.Round(time.Millisecond))
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("received only %d/%d timestamps", got, wantEach)
+	}
+}
+
 // TestSessionAttachFrozen verifies that Session.Attach correctly uses
 // AttachFrozen when the session is in frozen mode.
 func TestSessionAttachFrozen(t *testing.T) {
