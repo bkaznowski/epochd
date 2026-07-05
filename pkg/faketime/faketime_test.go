@@ -437,6 +437,312 @@ func TestHandleMethods(t *testing.T) {
 	})
 }
 
+// ptraceScopeAllows returns true if PTRACE_ATTACH is permitted (ptrace_scope <= 1).
+func ptraceScopeAllows(t *testing.T) bool {
+	t.Helper()
+	data, err := os.ReadFile("/proc/sys/kernel/yama/ptrace_scope")
+	if err != nil {
+		// No Yama — PTRACE_ATTACH is unrestricted.
+		return true
+	}
+	scope := strings.TrimSpace(string(data))
+	return scope == "0" || scope == "1"
+}
+
+// startHelper starts the clock-printing helper process without ptrace so that
+// Attach / AttachFrozen can PTRACE_ATTACH to it from the outside.
+func startHelper(t *testing.T) (*exec.Cmd, *os.File) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	cmd.Stdout = pw
+	if err := cmd.Start(); err != nil {
+		pw.Close(); pr.Close()
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	pw.Close()
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+	return cmd, pr
+}
+
+// TestAttach verifies Attach injects a fake time offset into a running process
+// and that Reset restores real time. Skipped when ptrace_scope > 1.
+func TestAttach(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	const fakeOffset = 24 * time.Hour
+	target := time.Now().Add(fakeOffset)
+
+	h, err := Attach(cmd.Process.Pid, target)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	const (
+		wantEach  = 3
+		tolerance = 5 * time.Second
+	)
+	sc := bufio.NewScanner(pr)
+
+	t.Log("phase A: verifying +24h offset after Attach")
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff < fakeOffset-tolerance || diff > fakeOffset+tolerance {
+			t.Errorf("phase A: timestamp %v is %v from now, want ~%v",
+				ts, diff.Round(time.Millisecond), fakeOffset)
+		}
+		t.Logf("phase A: %v  (offset %v)", ts, diff.Round(time.Millisecond))
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("phase A: received only %d/%d timestamps", got, wantEach)
+	}
+
+	t.Log("phase B: calling Reset and verifying real-time return")
+	if err := h.Reset(); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	got = 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		if time.Until(ts).Abs() > fakeOffset/2 {
+			t.Logf("phase B: discarding pre-reset timestamp %v", ts)
+			continue
+		}
+		diff := time.Until(ts).Abs()
+		if diff > tolerance {
+			t.Errorf("phase B: timestamp %v is %v from real now, want <%v",
+				ts, diff.Round(time.Millisecond), tolerance)
+		}
+		t.Logf("phase B: %v  (Δ %v from real)", ts, diff.Round(time.Millisecond))
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("phase B: received only %d/%d real-time timestamps after Reset", got, wantEach)
+	}
+}
+
+// TestAttachFrozen verifies AttachFrozen pins the clock at a fixed instant and
+// that the clock stays frozen across multiple reads.
+func TestAttachFrozen(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	h, err := AttachFrozen(cmd.Process.Pid, frozen)
+	if err != nil {
+		t.Fatalf("AttachFrozen: %v", err)
+	}
+
+	if got := h.EffectiveTime(); !got.Equal(frozen) {
+		t.Errorf("EffectiveTime() = %v, want %v", got, frozen)
+	}
+
+	const wantEach = 3
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		if !ts.Equal(frozen) {
+			t.Errorf("frozen timestamp %v != %v", ts, frozen)
+		}
+		t.Logf("frozen: %v", ts)
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("received only %d/%d frozen timestamps", got, wantEach)
+	}
+}
+
+// TestWithPID verifies the WithPID helper attaches, calls fn, and resets on cleanup.
+// Skipped when ptrace_scope > 1.
+func TestWithPID(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	const fakeOffset = 24 * time.Hour
+	target := time.Now().Add(fakeOffset)
+	called := false
+
+	WithPID(t, cmd.Process.Pid, target, func(t *testing.T, h *Handle) {
+		called = true
+		if h.PID() != cmd.Process.Pid {
+			t.Errorf("PID() = %d, want %d", h.PID(), cmd.Process.Pid)
+		}
+		const (
+			wantEach  = 2
+			tolerance = 5 * time.Second
+		)
+		sc := bufio.NewScanner(pr)
+		got := 0
+		for sc.Scan() && got < wantEach {
+			ts, ok := parseFaketimeTimestamp(sc.Text())
+			if !ok {
+				continue
+			}
+			diff := time.Until(ts)
+			if diff < fakeOffset-tolerance || diff > fakeOffset+tolerance {
+				t.Errorf("timestamp %v is %v from now, want ~%v",
+					ts, diff.Round(time.Millisecond), fakeOffset)
+			}
+			got++
+		}
+		if got < wantEach {
+			t.Fatalf("received only %d/%d timestamps", got, wantEach)
+		}
+	})
+
+	if !called {
+		t.Error("WithPID: fn was never called")
+	}
+}
+
+// TestSessionAttach verifies that Session.Attach adds a running process to the
+// session and that SetTime propagates to it. Skipped when ptrace_scope > 1.
+func TestSessionAttach(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	const fakeOffset = 24 * time.Hour
+	target := time.Now().Add(fakeOffset)
+	s := NewSession(target)
+	t.Cleanup(func() { s.Reset() }) //nolint:errcheck
+
+	if err := s.Attach(cmd.Process.Pid); err != nil {
+		t.Fatalf("Session.Attach: %v", err)
+	}
+	if s.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1", s.Len())
+	}
+
+	const (
+		wantEach  = 2
+		tolerance = 5 * time.Second
+	)
+	sc := bufio.NewScanner(pr)
+
+	// Verify initial offset.
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff < fakeOffset-tolerance || diff > fakeOffset+tolerance {
+			t.Errorf("initial: timestamp %v is %v from now, want ~%v",
+				ts, diff.Round(time.Millisecond), fakeOffset)
+		}
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("initial: received only %d/%d timestamps", got, wantEach)
+	}
+
+	// Advance to +48h via Session.SetTime.
+	const newOffset = 48 * time.Hour
+	if err := s.SetTime(time.Now().Add(newOffset)); err != nil {
+		t.Fatalf("Session.SetTime: %v", err)
+	}
+	got = 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		diff := time.Until(ts)
+		if diff < fakeOffset && diff < newOffset-tolerance {
+			t.Logf("discarding pre-update timestamp %v", ts)
+			continue
+		}
+		if diff < newOffset-tolerance || diff > newOffset+tolerance {
+			t.Errorf("after SetTime: timestamp %v is %v from now, want ~%v",
+				ts, diff.Round(time.Millisecond), newOffset)
+		}
+		t.Logf("after SetTime: %v  (offset %v)", ts, diff.Round(time.Millisecond))
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("after SetTime: received only %d/%d timestamps", got, wantEach)
+	}
+}
+
+// TestSessionAttachFrozen verifies that Session.Attach correctly uses
+// AttachFrozen when the session is in frozen mode.
+func TestSessionAttachFrozen(t *testing.T) {
+	if !ptraceScopeAllows(t) {
+		t.Skip("ptrace_scope > 1: PTRACE_ATTACH not permitted")
+	}
+
+	cmd, pr := startHelper(t)
+	defer pr.Close()
+
+	frozen := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	s := NewSession(frozen)
+	if err := s.Freeze(frozen); err != nil {
+		t.Fatalf("Session.Freeze: %v", err)
+	}
+	t.Cleanup(func() { s.Reset() }) //nolint:errcheck
+
+	if err := s.Attach(cmd.Process.Pid); err != nil {
+		t.Fatalf("Session.Attach (frozen session): %v", err)
+	}
+
+	const wantEach = 2
+	sc := bufio.NewScanner(pr)
+	got := 0
+	for sc.Scan() && got < wantEach {
+		ts, ok := parseFaketimeTimestamp(sc.Text())
+		if !ok {
+			continue
+		}
+		if !ts.Equal(frozen) {
+			t.Errorf("frozen timestamp %v != %v", ts, frozen)
+		}
+		t.Logf("frozen: %v", ts)
+		got++
+	}
+	if got < wantEach {
+		t.Fatalf("received only %d/%d frozen timestamps", got, wantEach)
+	}
+}
+
 // parseFaketimeTimestamp trims and parses an RFC3339Nano line, returning
 // (zero, false) for test-framework noise or unparseable lines.
 func parseFaketimeTimestamp(line string) (time.Time, bool) {
