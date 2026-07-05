@@ -242,16 +242,18 @@ func injectFollowChild(pid int, sec, nsec int64, mask uint64) (*Handle, error) {
 
 // injectCore attaches to pid, writes the trampoline with the given state values,
 // patches the vDSO, and detaches. InjectAtTime and InjectFrozen are the preferred callers.
+// vDSO maps are read after SEIZE+INTERRUPT (process stopped) to avoid a race where
+// the process is still mid-execve and the [vdso] mapping is not yet visible.
 func injectCore(pid int, sec, nsec int64, mask uint64) (*Handle, error) {
+	tr := procmem.NewTracer()
+	if err := tr.Seize(pid); err != nil {
+		return nil, fmt.Errorf("inject: Seize pid %d: %w", pid, err)
+	}
+	defer tr.Detach() //nolint:errcheck
 	info, err := vdso.Locate(pid)
 	if err != nil {
 		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
 	}
-	tr := procmem.NewTracer()
-	if err := tr.Attach(pid); err != nil {
-		return nil, fmt.Errorf("inject: Attach pid %d: %w", pid, err)
-	}
-	defer tr.Detach() //nolint:errcheck
 	return injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
 }
 
