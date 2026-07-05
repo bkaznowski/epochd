@@ -32,7 +32,8 @@ jobs:
           # Each entry is a path substring matched against the coverage profile lines.
           # ---------------------------------------------------------------------------
           exclude_patterns=(
-            '/agentpb/'   # protoc-generated gRPC stubs (agent.pb.go, agent_grpc.pb.go)
+            '/agentpb/'        # protoc-generated gRPC stubs (agent.pb.go, agent_grpc.pb.go)
+            '/test/targets/'   # integration-test helper binaries — no unit tests by design
           )
           # Build grep -e flags from the list and filter the raw profile.
           grep_args=()
