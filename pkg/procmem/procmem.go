@@ -85,6 +85,35 @@ func (t *Tracer) Attach(pid int) error {
 	return err
 }
 
+// Seize attaches to pid via PTRACE_SEIZE and immediately stops it with
+// PTRACE_INTERRUPT. Unlike Attach (PTRACE_ATTACH), SEIZE does not deliver
+// SIGSTOP to the tracee's thread group, avoiding group-stop races during
+// subsequent ptrace operations. PTRACE_INTERRUPT works reliably on
+// SEIZE-attached processes, which makes InterruptDetach safe to call even
+// while the tracee is running.
+func (t *Tracer) Seize(pid int) error {
+	var err error
+	t.run(func() {
+		if e := unix.PtraceSeize(pid); e != nil {
+			err = fmt.Errorf("procmem: PTRACE_SEIZE pid %d: %w", pid, e)
+			return
+		}
+		if e := unix.PtraceInterrupt(pid); e != nil {
+			unix.PtraceDetach(pid) //nolint:errcheck
+			err = fmt.Errorf("procmem: PTRACE_INTERRUPT after SEIZE pid %d: %w", pid, e)
+			return
+		}
+		var ws unix.WaitStatus
+		if _, e := unix.Wait4(pid, &ws, 0, nil); e != nil {
+			unix.PtraceDetach(pid) //nolint:errcheck
+			err = fmt.Errorf("procmem: wait after SEIZE+INTERRUPT pid %d: %w", pid, e)
+			return
+		}
+		t.pid = pid
+	})
+	return err
+}
+
 // Detach calls PTRACE_DETACH, allowing the tracee to resume.
 func (t *Tracer) Detach() error {
 	var err error
@@ -251,12 +280,17 @@ func (t *Tracer) ContPID(pid, sig int) error {
 	return err
 }
 
-// InterruptDetach stops the current tracee via PTRACE_INTERRUPT and detaches.
-// Safe to call when the tracee is running (not already stopped).
+// InterruptDetach stops the current tracee and detaches. For PTRACE_SEIZE-based
+// tracees PTRACE_INTERRUPT is used; for PTRACE_ATTACH or PTRACE_TRACEME tracees
+// (where PTRACE_INTERRUPT returns EIO) we fall back to SIGSTOP.
 func (t *Tracer) InterruptDetach() error {
 	var err error
 	t.run(func() {
-		unix.PtraceInterrupt(t.pid) //nolint:errcheck // may already be stopped/dead
+		if e := unix.PtraceInterrupt(t.pid); e != nil {
+			// PTRACE_INTERRUPT only works for PTRACE_SEIZE-attached tracees.
+			// Fall back to SIGSTOP for PTRACE_ATTACH / PTRACE_TRACEME.
+			unix.Kill(t.pid, unix.SIGSTOP) //nolint:errcheck
+		}
 		var ws unix.WaitStatus
 		unix.Wait4(t.pid, &ws, 0, nil) //nolint:errcheck
 		if e := unix.PtraceDetach(t.pid); e != nil && !isNoProcess(e) {

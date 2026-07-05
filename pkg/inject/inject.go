@@ -99,13 +99,17 @@ func InjectFrozenKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer
 	return injectCoreKeepTracer(pid, sec, nsec, trampoline.MaskFrozen)
 }
 
-// injectCoreKeepTracer attaches to pid via PTRACE_ATTACH, injects the
-// trampoline, enables fork/exec tracing options, and resumes the process
-// without detaching. The returned Tracer is ready to drive the event loop.
+// injectCoreKeepTracer attaches to pid via PTRACE_SEIZE+PTRACE_INTERRUPT,
+// injects the trampoline, enables fork/exec tracing options, and resumes the
+// process without detaching. The returned Tracer is ready to drive the event
+// loop. SEIZE is used instead of PTRACE_ATTACH so that:
+//   - no SIGSTOP is delivered to the thread group (avoids group-stop races in
+//     remoteMmap that would cause it to see SIGSTOP instead of SIGTRAP), and
+//   - PTRACE_INTERRUPT works reliably in InterruptDetach when closing the tracker.
 func injectCoreKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle, *procmem.Tracer, error) {
 	tr := procmem.NewTracer()
-	if err := tr.Attach(pid); err != nil {
-		return nil, nil, fmt.Errorf("inject: Attach pid %d: %w", pid, err)
+	if err := tr.Seize(pid); err != nil {
+		return nil, nil, fmt.Errorf("inject: Seize pid %d: %w", pid, err)
 	}
 	// Read maps while the process is ptrace-stopped — address space is stable.
 	info, err := vdso.Locate(pid)
