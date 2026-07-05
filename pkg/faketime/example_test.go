@@ -3,6 +3,7 @@
 package faketime_test
 
 import (
+	"fmt"
 	"os/exec"
 	"testing"
 	"time"
@@ -158,22 +159,77 @@ func ExampleStartWithTracking() {
 	target := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// Start the parent (e.g. a Postgres postmaster) with fake time.
-	tracker, err := faketime.StartWithTracking(exec.Command("./postmaster"), target)
+	ct, err := faketime.StartWithTracking(exec.Command("./postmaster"), target)
 	if err != nil {
 		panic(err)
 	}
-	defer tracker.Close() //nolint:errcheck
+	defer ct.Reset() //nolint:errcheck
+	defer ct.Close() //nolint:errcheck
 
-	// tracker.Handle controls the parent's clock.
-	if err := tracker.Handle.Advance(24 * time.Hour); err != nil {
+	// Advance the clock for the parent and all forked children in one call.
+	if err := ct.Advance(24 * time.Hour); err != nil {
 		panic(err)
 	}
 
-	// Any process forked after StartWithTracking (e.g. Postgres backends) is
-	// automatically injected and appears in tracker.Children().
-	for _, child := range tracker.Children() {
-		_ = child // same Handle API: SetTime, Freeze, Advance, Reset
+	// Inspect what the tracker is currently doing.
+	fmt.Println("frozen:", ct.IsFrozen())
+	fmt.Println("tracked PIDs:", ct.PIDs())
+	fmt.Println("fake time:", ct.Handle.EffectiveTime().Format(time.RFC3339))
+}
+
+// Handle_IsFrozen shows how to use IsFrozen and EffectiveTime for assertions
+// in tests — e.g. to verify the service under test is receiving the expected
+// clock value before an operation that depends on it.
+func ExampleHandle_IsFrozen() {
+	target := time.Date(2030, 6, 30, 23, 59, 59, 0, time.UTC)
+	cmd := exec.Command("./my-service")
+	h, err := faketime.StartFrozen(cmd, target)
+	if err != nil {
+		panic(err)
 	}
+	defer h.Reset()
+	defer cmd.Process.Kill()
+	defer cmd.Wait() //nolint:errcheck
+
+	fmt.Println("frozen:", h.IsFrozen())           // true
+	fmt.Println("at:", h.EffectiveTime().Unix())    // exactly target
+
+	// Switch to advancing mode and verify.
+	if err := h.SetTime(target); err != nil {
+		panic(err)
+	}
+	fmt.Println("frozen after SetTime:", h.IsFrozen()) // false
+}
+
+// Session_Prune shows how to use Prune when processes are expected to exit
+// during a test — for example, Postgres backends that close when a connection
+// ends. Without Prune (or without the automatic ESRCH handling), a dead handle
+// would cause SetTime to return an error.
+func ExampleSession_Prune() {
+	target := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := faketime.NewSession(target)
+
+	// Start several short-lived workers.
+	for i := 0; i < 3; i++ {
+		cmd := exec.Command("./worker", fmt.Sprintf("--id=%d", i))
+		if err := s.Start(cmd); err != nil {
+			panic(err)
+		}
+	}
+
+	// ... run some work, workers may exit naturally ...
+
+	// Explicitly remove dead handles before advancing the clock.
+	removed := s.Prune()
+	fmt.Println("pruned:", removed)
+
+	// SetTime also silently drops any handles that return ESRCH,
+	// so Prune is optional — use it when you want to know the count.
+	if err := s.Advance(24 * time.Hour); err != nil {
+		panic(err)
+	}
+	fmt.Println("remaining:", s.Len())
+	fmt.Println("live PIDs:", s.PIDs())
 }
 
 // NewSession_withTracking shows how to create a session that automatically

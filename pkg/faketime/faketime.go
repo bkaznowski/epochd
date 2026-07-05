@@ -362,6 +362,13 @@ func (s *Session) Reset() error {
 	return s.SetTime(time.Now())
 }
 
+// IsFrozen reports whether the session is currently in frozen mode.
+func (s *Session) IsFrozen() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.frozen
+}
+
 // Len returns the number of handles currently in the session.
 func (s *Session) Len() int {
 	s.mu.Lock()
@@ -421,6 +428,11 @@ type ChildTracker struct {
 	wg          sync.WaitGroup
 	loopErr     error
 }
+
+// IsFrozen reports whether the tracker is currently in frozen mode.
+// It delegates to the parent handle, which is the source of truth for the
+// current injection mode shared across the tracked process tree.
+func (c *ChildTracker) IsFrozen() bool { return c.Handle.IsFrozen() }
 
 // PIDs returns the process IDs of the parent and all currently tracked
 // children. The parent PID is always first.

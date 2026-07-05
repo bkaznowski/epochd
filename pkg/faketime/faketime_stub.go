@@ -47,6 +47,7 @@ func (s *Session) Freeze(_ time.Time) error               { return errNotSupport
 func (s *Session) Reset() error                           { return errNotSupported }
 func (s *Session) Close() error                           { return errNotSupported }
 func (s *Session) Prune() int                             { return 0 }
+func (s *Session) IsFrozen() bool                         { return false }
 func (s *Session) PIDs() []int                            { return nil }
 func (s *Session) Len() int                               { return 0 }
 
@@ -107,6 +108,7 @@ func AttachWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
 func AttachFrozenWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
 	return nil, errNotSupported
 }
+func (c *ChildTracker) IsFrozen() bool            { return false }
 func (c *ChildTracker) PIDs() []int               { return nil }
 func (c *ChildTracker) Children() []*Handle       { return nil }
 func (c *ChildTracker) SetTime(_ time.Time) error  { return errNotSupported }

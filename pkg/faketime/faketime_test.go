@@ -376,6 +376,56 @@ func TestWithSessionTracking(t *testing.T) {
 	)
 }
 
+// TestSessionIsFrozen verifies Session.IsFrozen reflects Freeze/SetTime transitions.
+func TestSessionIsFrozen(t *testing.T) {
+	target := time.Now().Add(24 * time.Hour)
+	s := NewSession(target)
+
+	if s.IsFrozen() {
+		t.Error("IsFrozen() = true after NewSession (advancing mode)")
+	}
+	if err := s.Freeze(target); err != nil {
+		// No handles yet — Freeze only updates internal state, should not error.
+		t.Fatalf("Freeze: %v", err)
+	}
+	if !s.IsFrozen() {
+		t.Error("IsFrozen() = false after Freeze")
+	}
+	if err := s.SetTime(target); err != nil {
+		t.Fatalf("SetTime: %v", err)
+	}
+	if s.IsFrozen() {
+		t.Error("IsFrozen() = true after SetTime")
+	}
+}
+
+// TestChildTrackerIsFrozen verifies ChildTracker.IsFrozen delegates to the parent handle.
+func TestChildTrackerIsFrozen(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	target := time.Now().Add(24 * time.Hour)
+
+	ct, err := StartWithTracking(cmd, target)
+	if err != nil {
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+	t.Cleanup(func() { ct.Close(); cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+
+	if ct.IsFrozen() {
+		t.Error("IsFrozen() = true after StartWithTracking (advancing mode)")
+	}
+	if err := ct.Freeze(target); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+	if !ct.IsFrozen() {
+		t.Error("IsFrozen() = false after Freeze")
+	}
+}
+
 // TestHandleIsFrozen verifies IsFrozen reflects mode transitions.
 func TestHandleIsFrozen(t *testing.T) {
 	exe, err := os.Executable()
