@@ -1,11 +1,10 @@
-# epochd — implementation context (current phase: 40)
+# epochd — implementation context (current phase: 42)
 
 This file is a dense reference for an agent or developer continuing the project. It
-captures the state of the codebase after phases 0–40, the exact APIs that exist, every
-non-obvious decision that was made and why, and discovered gotchas. Phase 38
-(`Handle.EffectiveTime`, `Handle.PID`, `Session.Close`, `Handle.IsAlive`) is planned but
-not yet implemented. Phases 39–40 are complete. See `FUTURE.md` for longer-horizon
-improvements.
+captures the state of the codebase after phases 0–29 and 33–42 (phases 30–32 are not yet
+implemented — see the status table in `README.md`), the exact APIs that exist, every
+non-obvious decision that was made and why, and discovered gotchas. See `FUTURE.md` for
+longer-horizon improvements.
 
 ---
 
@@ -35,6 +34,8 @@ improvements.
 type VDSOInfo struct {
     Start, End       uintptr
     ClockGettimeAddr uintptr  // absolute address in target process
+    GettimeofdayAddr uintptr  // absolute address in target process
+    TimeAddr         uintptr  // absolute address in target process
 }
 
 func Locate(pid int) (*VDSOInfo, error)
@@ -42,8 +43,12 @@ func Locate(pid int) (*VDSOInfo, error)
 
 **What it does**: parses `/proc/<pid>/maps` for `[vdso]`, reads those bytes via
 `/proc/<pid>/mem` (requires ptrace relationship or same process), parses with
-`debug/elf.NewFile`, resolves `clock_gettime` (falling back to `__vdso_clock_gettime`),
-sanity-checks the resolved address falls within `[Start, End)`.
+`debug/elf.NewFile`, resolves `clock_gettime`, `gettimeofday`, and `time` (each falling
+back to its `__vdso_`-prefixed alias via the shared `resolveSymbol` helper), sanity-checks
+each resolved address falls within `[Start, End)`. These are three independent functions at
+three independent vDSO addresses, not aliases of each other — `clock_getres`, `getcpu`, and
+`__vdso_sgx_enter_enclave` are the only other vDSO exports on x86-64, and none of them
+return current time, so there is nothing else worth resolving here.
 
 **Caller must**: be ptrace-attached to `pid` before calling (or be reading their own
 process). `inject.inject` calls `vdso.Locate` before `Attach`, which works because
@@ -139,48 +144,78 @@ can be set or overridden via seccomp.
 
 **Files**: `pkg/trampoline/trampoline.go`, `trampoline.asm`, `trampoline.bin`
 
+The payload holds **three** independent hook stubs — one per hooked vDSO function
+(`clock_gettime`, `gettimeofday`, `time`) — followed by one shared state struct.
+`clock_gettime`, `gettimeofday`, and `time` are three separate functions at three
+different vDSO addresses (confirmed via `readelf -sD` on a dumped vDSO); they are not
+aliases of each other. An earlier version of this package patched only `clock_gettime`,
+which silently missed anything reading wall-clock time via `gettimeofday` or `time` —
+notably PostgreSQL's `GetCurrentTimestamp()` and glibc/bash's own wall-clock reads
+(`$EPOCHREALTIME`), both `gettimeofday`-based.
+
 ```go
 //go:embed trampoline.bin
-var Payload []byte          // 118 bytes total
+var Payload []byte          // 468 bytes total
 
-const StateOffset = 86      // byte offset of state struct within Payload
+const StateOffset = 436     // byte offset of state struct within Payload
+
+// Entry offsets of each hook stub within Payload:
+const ClockGettimeEntryOffset = 0
+const GettimeofdayEntryOffset = 141
+const TimeEntryOffset         = 306
+
 const StateSize   = 32      // 8+8+8+4+4
 
 // Field offsets (absolute, from Payload[0]):
-const FieldOffsetSec  = 86   // int64
-const FieldOffsetNsec = 94   // int64
-const FieldEnabledMask = 102 // uint64, bit 0 = CLOCK_REALTIME
-const FieldGeneration  = 110 // uint32
+const FieldOffsetSec  = 436   // int64
+const FieldOffsetNsec = 444   // int64
+const FieldEnabledMask = 452  // uint64, bit 0 = interception enabled, bit 1 = freeze
+const FieldGeneration  = 460  // uint32
 
 func EncodeState(offsetSec, offsetNsec int64, mask uint64, generation uint32) []byte
 func DecodeState(b []byte) (offsetSec, offsetNsec int64, mask uint64, generation uint32, err error)
 ```
 
-**State struct layout** (at `Payload[StateOffset:]` and at `h.StateAddr` in the target):
+**State struct layout** (at `Payload[StateOffset:]` and at `h.StateAddr` in the target;
+shared by all three stubs):
 ```
-+0   int64  offsetSec     — added to tp->tv_sec
-+8   int64  offsetNsec    — added to tp->tv_nsec (normalised to [0,1e9) by trampoline)
-+16  uint64 enabledMask   — bit 0 = CLOCK_REALTIME enabled
++0   int64  offsetSec     — added to the real seconds
++8   int64  offsetNsec    — added to the real nanoseconds (normalised to [0,1e9) by each stub)
++16  uint64 enabledMask   — bit 0 = interception enabled, bit 1 = freeze mode
 +24  uint32 generation    — bumped on each SetTime call, for observability
 +28  uint32 _pad
 ```
 
-**Trampoline behaviour**: on every `clock_gettime` call — (1) pushes rdi/rsi, issues raw
-`syscall 228` to get the real time, restores rdi/rsi, (2) if `clk_id != CLOCK_REALTIME`
-returns immediately, (3) loads `offsetSec`/`offsetNsec` via `lea r11, [rel state]`
-(RIP-relative, position-independent), (4) adds them to `tp->tv_sec`/`tp->tv_nsec`, (5)
-normalises `tv_nsec` into `[0, 1e9)` with a single add or sub, (6) returns 0.
+**Trampoline behaviour, per stub**:
+- `clock_gettime_entry` — intercepts `clk_id ∈ {CLOCK_REALTIME (0), CLOCK_REALTIME_COARSE
+  (5)}`; other clock IDs (`CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, ...) pass straight through to
+  the real syscall. Pushes rdi/rsi, issues raw `syscall 228` to get the real time, restores
+  rdi/rsi, loads `offsetSec`/`offsetNsec` via `lea r11, [rel state]` (RIP-relative,
+  position-independent), adds them to `tp->tv_sec`/`tp->tv_nsec`, normalises `tv_nsec` into
+  `[0, 1e9)` with a single add or sub, returns 0.
+- `gettimeofday_entry` — same shape, `struct timeval` (`tv_sec`/`tv_usec`) instead of
+  `timespec`; `offsetNsec` is divided by 1000 (`cqo` + `idiv`) to get the microsecond offset,
+  then normalised into `[0, 1e6)`. Returns 0.
+- `time_entry` — deliberately does **not** use the `time()` syscall (`SYS_time`) for its
+  real-time read: that syscall only ever returns whole seconds, discarding the real
+  fractional second before the trampoline would ever see it, so a nonzero `offsetNsec`
+  could silently carry/borrow across a second boundary this stub had no way to detect —
+  disagreeing with `clock_gettime`/`gettimeofday` about the current second by up to 1s for
+  the same instant. Instead it calls the real `clock_gettime(CLOCK_REALTIME)` internally on
+  a scratch stack buffer, applies the same carry-normalised add, and returns only the
+  resulting `tv_sec` (also stores it to `*tloc` if non-NULL) — the return value itself
+  is the seconds count, so unlike the other two stubs it does **not** zero `rax` before
+  `ret`.
 
-**Only `CLOCK_REALTIME` (id=0) is intercepted.** All other clock IDs pass through the
-real syscall result untouched. Go's `time.Now()` uses `CLOCK_REALTIME`.
-
-**`StateOffset = 86` is a hardcoded constant.** `TestStateOffsetRegression` asserts
-`StateOffset == len(Payload) - StateSize` and will fail loudly if the assembly is edited
-and the binary changes size without updating the constant. Check this test first if you
-ever touch the assembly.
+**`StateOffset`/`*EntryOffset` are hardcoded constants.** `TestStateOffsetRegression`
+asserts `StateOffset == len(Payload) - StateSize`; `TestEntryOffsetRegression` checks the
+assembled bytes at each `*EntryOffset` against the expected first instruction of that stub.
+Both fail loudly if the assembly is edited and the binary changes without updating the
+constants. Check these tests first if you ever touch the assembly.
 
 **To reassemble**: `nasm -f bin pkg/trampoline/trampoline.asm -o pkg/trampoline/trampoline.bin`
-Then update `StateOffset` if `wc -c trampoline.bin` changed.
+Then update `StateOffset`/`*EntryOffset` if the binary size or stub layout changed (use
+`nasm -l trampoline.lst` to read exact label addresses off the listing).
 
 ---
 
@@ -194,7 +229,8 @@ Then update `StateOffset` if `wc -c trampoline.bin` changed.
 type Handle struct {
     PID       int
     StateAddr uintptr  // address of state struct in target process
-    // unexported: origBytes [5]byte, gen uint32
+    // unexported: patched [3]patchedHook (clock_gettime/gettimeofday/time
+    // original vDSO bytes, one per hooked function, for a future uninstall), gen uint32
 }
 
 // PTRACE_ATTACH path (requires CAP_SYS_PTRACE + ptrace_scope ≤ 1):
@@ -233,8 +269,10 @@ Clock modes:
 #### Internal functions (used in tests)
 
 ```go
-// Core injection — tr must already be attached.
-func injectWithTracer(tr *procmem.Tracer, pid int, cgtAddr uintptr, sec, nsec int64, mask uint64) (*Handle, error)
+// Core injection — tr must already be attached. info carries all three
+// resolved vDSO addresses (clock_gettime, gettimeofday, time); cgtAddr alone
+// is still used as the findNearbyGap/remoteMmap anchor and scratch location.
+func injectWithTracer(tr *procmem.Tracer, pid int, info *vdso.VDSOInfo, sec, nsec int64, mask uint64) (*Handle, error)
 
 // Writes state struct with process_vm_writev, increments h.gen.
 func (h *Handle) writeState(sec, nsec int64, mask uint64) error
@@ -252,14 +290,22 @@ func remoteMmap(tr *procmem.Tracer, pid int, patchAddr, fixedAddr uintptr) (uint
 
 #### Injection sequence (what `injectWithTracer` does)
 
-1. `findNearbyGap(pid, cgtAddr)` — find a free page within ±2 GB of vDSO entry
-2. `remoteMmap(tr, pid, cgtAddr, fixedAddr)` — make target call `mmap` with `MAP_FIXED_NOREPLACE`
-3. Build payload: copy `trampoline.Payload`, overwrite state struct with encoded initial offsets
+1. `findNearbyGap(pid, info.ClockGettimeAddr)` — find a free page within ±2 GB of the vDSO
+   (all three hooked functions live in the same few-KB vDSO mapping, so proximity to
+   `clock_gettime` guarantees proximity to `gettimeofday` and `time` too)
+2. `remoteMmap(tr, pid, info.ClockGettimeAddr, fixedAddr)` — make target call `mmap` with
+   `MAP_FIXED_NOREPLACE` (`clock_gettime`'s address is used only as the scratch location for
+   this one-time mmap call; `gettimeofday`/`time` aren't touched here)
+3. Build payload: copy `trampoline.Payload` (all three stubs + shared state), overwrite
+   state struct with encoded initial offsets
 4. `procmem.WriteMem(pid, newPage, payload)` — write trampoline (new page is rwx, no ptrace needed)
-5. Compute `disp = int64(newPage) - int64(cgtAddr+5)`, assert fits in int32
-6. `procmem.ReadMem(pid, cgtAddr, orig[:5])` — save for future uninstall
-7. `tr.PokeText(cgtAddr, [0xE9, disp_le32])` — patch vDSO entry with JMP rel32
-8. Return `Handle{PID: pid, StateAddr: newPage + StateOffset, origBytes: orig}`
+5. For each of `{clock_gettime: ClockGettimeEntryOffset, gettimeofday:
+   GettimeofdayEntryOffset, time: TimeEntryOffset}`:
+   a. Compute `disp = int64(newPage+entryOffset) - int64(vdsoAddr+5)`, assert fits in int32
+   b. `procmem.ReadMem(pid, vdsoAddr, orig[:5])` — save for future uninstall
+   c. `tr.PokeText(vdsoAddr, [0xE9, disp_le32])` — patch that vDSO entry with JMP rel32
+6. Return `Handle{PID: pid, StateAddr: newPage + StateOffset, patched: [3]patchedHook{...}}`
+   (one `{addr, orig}` pair per hooked function)
 
 #### `findNearbyGap` — the critical fix for Docker
 
@@ -753,10 +799,12 @@ self-contained.
 
 ## Known limitations and future work
 
-1. **No `Uninstall`**: `Handle.origBytes` stores the 5 original vDSO bytes but there is
-   no `Uninstall()` method that uses them. The `SetTime(time.Now())` approach is sufficient
-   for testing. A future `Uninstall()` would PokeText those bytes back and optionally
-   `munmap` the trampoline page via the same `remoteMmap` mechanism (but with `SYS_MUNMAP`).
+1. **No `Uninstall`**: `Handle.patched` stores the 5 original vDSO bytes for each of the
+   three hooked functions (`clock_gettime`, `gettimeofday`, `time`) but there is no
+   `Uninstall()` method that uses them. The `SetTime(time.Now())` approach is sufficient
+   for testing. A future `Uninstall()` would PokeText those bytes back for all three and
+   optionally `munmap` the trampoline page via the same `remoteMmap` mechanism (but with
+   `SYS_MUNMAP`).
 
 2. **Single process per injection**: Each `Handle` targets one PID. Containers with
    multiple processes (e.g. sidecars) each need their own `InjectAtTime` call. The
@@ -778,15 +826,18 @@ self-contained.
    offset, ~128 MB reach). Alternative: patch with `LDR x16, [pc+8]; BR x16; .quad addr`
    (12 bytes, reach = full 64-bit space) — requires saving 12 bytes instead of 5.
 
-6. **`CLOCK_REALTIME` only**: `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` are not intercepted.
-   Adding them requires checking `clk_id` against a bitmask (the `enabledMask` field in
-   the state struct already provides this — bit 0 = `CLOCK_REALTIME`, bit 1 could be
-   `CLOCK_MONOTONIC = 1`, etc.) and the trampoline normalisation logic would need to run
-   for each enabled clock.
+6. **Wall clock only**: `clock_gettime` (`CLOCK_REALTIME` + `CLOCK_REALTIME_COARSE`),
+   `gettimeofday`, and `time` are all intercepted (see the `pkg/trampoline` section above —
+   this used to be `clock_gettime` only, which silently missed `gettimeofday`-based readers
+   like PostgreSQL). `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, etc. still pass straight through —
+   deliberately, so a target's internal timeout/latency logic keeps seeing real elapsed
+   time. Adding monotonic interception would need a new bit in `enabledMask` (bits 0 and 1
+   are taken: interception-enabled and freeze-mode; bit 2 would work) and a new branch in
+   `clock_gettime_entry` — see `FUTURE.md`.
 
 ---
 
-## File tree as of phase 40
+## File tree as of phase 42
 
 ```
 epochd/
@@ -830,10 +881,10 @@ epochd/
 │   │   ├── procmem.go                         # ✅ Tracer, ReadMem, WriteMem, PokeText, FollowChild; SetTracee, SetOptions, SetOptionsPID, WaitAnyNonBlocking, GetEventMsgPID, ContPID, InterruptDetach, DetachAll
 │   │   └── procmem_test.go                    # ✅ TestTracerBasic
 │   ├── trampoline/
-│   │   ├── trampoline.asm                     # ✅ NASM source (118 bytes); MaskEnabled=1, MaskFrozen=3
+│   │   ├── trampoline.asm                     # ✅ NASM source (468 bytes; 3 stubs: clock_gettime/gettimeofday/time); MaskEnabled=1, MaskFrozen=3
 │   │   ├── trampoline.bin                     # ✅ assembled binary (committed)
-│   │   ├── trampoline.go                      # ✅ Payload, StateOffset=86, EncodeState, DecodeState, MaskEnabled, MaskFrozen
-│   │   └── trampoline_test.go                 # ✅ regression + round-trip tests
+│   │   ├── trampoline.go                      # ✅ Payload, StateOffset=436, *EntryOffset consts, EncodeState, DecodeState, MaskEnabled, MaskFrozen
+│   │   └── trampoline_test.go                 # ✅ regression (state + entry offsets) + round-trip tests
 │   ├── inject/
 │   │   ├── inject.go                          # ✅ InjectAtTime, InjectFrozen, InjectAtTimeFollowChild, InjectFrozenFollowChild; InjectAtTimeFollowChildKeepTracer, InjectFrozenFollowChildKeepTracer, ChildHandle, ReInjectAtTimeAfterExec, ReInjectFrozenAfterExec
 │   │   ├── inject_test.go                     # ✅ TestRemoteMmap, TestInjectMechanics (uses writeState + MaskEnabled), TestInjectObserved*

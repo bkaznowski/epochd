@@ -1914,3 +1914,83 @@ h, err := faketime.Start(cmd, target, faketime.KeepTracer()) // tracer kept for 
 - `pkg/faketime/faketime.go` — `HandleOption` type, `KeepTracer()`, optional `tracer` field on `Handle`, `Handle.Detach()`
 - `pkg/faketime/faketime_stub.go` — `HandleOption`, `KeepTracer()`, `Handle.Detach()`
 - `pkg/faketime/testing.go` — no changes needed (helpers call `Reset`, not `Detach`)
+
+---
+
+## Phase 42 — `gettimeofday`/`time` vDSO interception; `CLOCK_REALTIME_COARSE`; `time()` precision fix
+
+### Motivation
+
+A consumer building a Go test that wraps a real PostgreSQL server in
+`faketime.WithChildTracker` found that `SELECT now()` kept returning real wall-clock time —
+even on the very first query, before any `Advance()` call. Isolating the cause (via
+`ltrace -f` against a live backend, and a `readelf -sD` dump of the vDSO's dynamic symbol
+table) showed that `clock_gettime`, `gettimeofday`, and `time` are three **independent**
+compiled functions at three different vDSO addresses (`0xa40`, `0x7a0`, `0xa10` respectively
+in one observed build) — not aliases of one shared implementation. `injectWithTracer`
+resolved and patched only `clock_gettime`. PostgreSQL's `GetCurrentTimestamp()` calls
+`gettimeofday` directly, so it was never touched. The same gap affected glibc/bash's own
+wall-clock reads (`$EPOCHREALTIME`, also `gettimeofday`-based) and any other C program that
+happens to prefer `gettimeofday` or `time` over `clock_gettime`. Go's own `time.Now()` always
+calls `clock_gettime`, which is why every existing test in the suite (all Go-target
+processes) had passed and never surfaced the gap.
+
+A full untruncated symbol dump of the x86-64 vDSO confirmed there is nothing else worth
+patching: `clock_getres`, `getcpu`, and `__vdso_sgx_enter_enclave` are the only other
+exports, and none of them return current time.
+
+### What changed
+
+**`pkg/trampoline/trampoline.asm`** — restructured into three independent entry-point
+stubs (`clock_gettime_entry`, `gettimeofday_entry`, `time_entry`) sharing one state struct
+at the tail of the payload (payload grew from 118 to 468 bytes; `StateOffset` from 86 to
+436). Each stub matches its own function's calling convention:
+
+- `clock_gettime_entry` — unchanged shape, but now intercepts `clk_id ∈ {CLOCK_REALTIME (0),
+  CLOCK_REALTIME_COARSE (5)}` instead of just `CLOCK_REALTIME`. Everything else
+  (`CLOCK_MONOTONIC` and friends) still passes straight through.
+- `gettimeofday_entry` — `struct timeval` (`tv_sec`/`tv_usec`) instead of `timespec`;
+  `offsetNsec` is divided by 1000 (signed `idiv`) to get the microsecond delta, then
+  normalised into `[0, 1e6)` the same way `clock_gettime_entry` normalises `tv_nsec`.
+- `time_entry` — deliberately does **not** call the `time()` syscall (`SYS_time`) for its
+  real-time read. That syscall only returns whole seconds, discarding the real fractional
+  second before the trampoline would ever see it — so a nonzero `offsetNsec` could silently
+  carry/borrow across a second boundary this stub had no way to detect, making `time()`
+  disagree with `clock_gettime`/`gettimeofday` about the current second by up to 1s for the
+  same instant. Instead it calls the real `clock_gettime(CLOCK_REALTIME)` on a scratch stack
+  buffer, applies the same carry-normalised add, and returns only the resulting `tv_sec`.
+
+New `ClockGettimeEntryOffset`/`GettimeofdayEntryOffset`/`TimeEntryOffset` constants in
+`trampoline.go`, pinned by a new `TestEntryOffsetRegression` (checks the assembled bytes at
+each offset against the expected first instruction of that stub — the same drift-detection
+role `TestStateOffsetRegression` already played for the state struct).
+
+**`pkg/vdso/vdso.go`** — `VDSOInfo` gained `GettimeofdayAddr`/`TimeAddr` alongside
+`ClockGettimeAddr`; `resolveCGTSymbol` generalized into `resolveSymbol(syms, preferred,
+fallback)`, called once per function. `locate_test.go` extended to independently
+cross-check all three resolved addresses, not just `clock_gettime`'s.
+
+**`pkg/inject/inject.go`** — `injectWithTracer` now takes the full `*vdso.VDSOInfo` instead
+of a single `cgtAddr uintptr`, and JMP-patches all three vDSO entries (each to its own stub
+offset in the one trampoline page) instead of just one. `Handle.origBytes [5]byte` became
+`Handle.patched [3]patchedHook` (`{addr uintptr; orig [5]byte}` per hooked function) so a
+future `Uninstall` (Phase 41-adjacent) can restore all three, not just one. `ChildHandle`
+copies all three.
+
+### Verification
+
+- Every pre-existing test in `pkg/trampoline`, `pkg/vdso`, `pkg/inject`, and `pkg/faketime`
+  still passes, including the `EPOCHD_INJECT_E2E=1`-gated ones.
+- A small C helper sampling `time()`, `gettimeofday()`, `clock_gettime(CLOCK_REALTIME)`, and
+  `clock_gettime(CLOCK_REALTIME_COARSE)` together, run under `faketime.Start` with a
+  deliberately fractional (950ms) offset for several seconds, showed all four values
+  transitioning across real second boundaries in lockstep on every sample — no 1s skew
+  anywhere, and `COARSE` now faked like the others.
+- A real PostgreSQL cluster's `SELECT now()` (started via `faketime.WithChildTracker`) now
+  tracks the faked/advanced clock, confirmed both before and after an `Advance()` call.
+
+### Files changed
+
+- `pkg/trampoline/trampoline.asm`, `trampoline.bin`, `trampoline.go`, `trampoline_test.go`
+- `pkg/vdso/vdso.go`, `locate_test.go`
+- `pkg/inject/inject.go`, `inject_test.go`, `roundtrip_test.go`

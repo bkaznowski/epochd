@@ -22,6 +22,8 @@ func TestLocateSelf(t *testing.T) {
 	//   objdump -T /tmp/vdso.so | grep clock_gettime                  → confirms offset
 	t.Logf("vDSO range:         [0x%x, 0x%x)  (%d bytes)", info.Start, info.End, info.End-info.Start)
 	t.Logf("clock_gettime addr: 0x%x  (offset 0x%x)", info.ClockGettimeAddr, info.ClockGettimeAddr-info.Start)
+	t.Logf("gettimeofday addr:  0x%x  (offset 0x%x)", info.GettimeofdayAddr, info.GettimeofdayAddr-info.Start)
+	t.Logf("time addr:          0x%x  (offset 0x%x)", info.TimeAddr, info.TimeAddr-info.Start)
 
 	// Re-read the raw vDSO bytes and re-parse ELF independently so the
 	// assertions below don't just echo back what Locate already computed.
@@ -41,10 +43,28 @@ func TestLocateSelf(t *testing.T) {
 		t.Fatalf("DynamicSymbols: %v", err)
 	}
 
+	for _, tc := range []struct {
+		names []string
+		got   uintptr
+	}{
+		{[]string{"clock_gettime", "__vdso_clock_gettime"}, info.ClockGettimeAddr},
+		{[]string{"gettimeofday", "__vdso_gettimeofday"}, info.GettimeofdayAddr},
+		{[]string{"time", "__vdso_time"}, info.TimeAddr},
+	} {
+		checkResolvedSymbol(t, ef, syms, data, info.Start, tc.names, tc.got)
+	}
+}
+
+// checkResolvedSymbol independently re-resolves one of names in syms and
+// verifies got (what Locate computed) against it, so the assertions don't
+// just echo back what Locate already computed.
+func checkResolvedSymbol(t *testing.T, ef *elf.File, syms []elf.Symbol, data []byte, vdsoStart uintptr, names []string, got uintptr) {
+	t.Helper()
+
 	var symVal uint64
 	var symFound bool
 	for _, sym := range syms {
-		if sym.Name != "clock_gettime" && sym.Name != "__vdso_clock_gettime" {
+		if sym.Name != names[0] && sym.Name != names[1] {
 			continue
 		}
 
@@ -63,13 +83,13 @@ func TestLocateSelf(t *testing.T) {
 		break
 	}
 	if !symFound {
-		t.Fatal("clock_gettime / __vdso_clock_gettime not found in dynamic symbol table")
+		t.Fatalf("%s / %s not found in dynamic symbol table", names[0], names[1])
 	}
 
-	// ClockGettimeAddr must be exactly Start + sym.Value, not merely "within range".
-	wantAddr := info.Start + uintptr(symVal)
-	if info.ClockGettimeAddr != wantAddr {
-		t.Errorf("ClockGettimeAddr = 0x%x, want 0x%x (Start + sym.Value)", info.ClockGettimeAddr, wantAddr)
+	// got must be exactly Start + sym.Value, not merely "within range".
+	wantAddr := vdsoStart + uintptr(symVal)
+	if got != wantAddr {
+		t.Errorf("%s: addr = 0x%x, want 0x%x (Start + sym.Value)", names[0], got, wantAddr)
 	}
 
 	// The offset must fall inside an executable PT_LOAD segment.
@@ -84,15 +104,15 @@ func TestLocateSelf(t *testing.T) {
 		}
 	}
 	if !inExecSeg {
-		t.Errorf("clock_gettime offset 0x%x is not inside any executable PT_LOAD segment", symVal)
+		t.Errorf("%s offset 0x%x is not inside any executable PT_LOAD segment", names[0], symVal)
 	}
 
 	// Bytes at the resolved offset must not be all zeros — a function has real code.
 	offset := uintptr(symVal)
 	if int(offset)+8 > len(data) {
-		t.Fatalf("symbol offset 0x%x + 8 exceeds vDSO size %d", offset, len(data))
+		t.Fatalf("%s offset 0x%x + 8 exceeds vDSO size %d", names[0], offset, len(data))
 	}
 	if bytes.Equal(data[offset:offset+8], make([]byte, 8)) {
-		t.Errorf("8 bytes at clock_gettime offset 0x%x are all zeros — address is likely wrong", offset)
+		t.Errorf("8 bytes at %s offset 0x%x are all zeros — address is likely wrong", names[0], offset)
 	}
 }

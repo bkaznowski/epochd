@@ -138,23 +138,29 @@ replica B returns 404.
 with `CLOCK_MONOTONIC` — timeouts, rate limiters, cache TTLs, and anything
 that uses `time.Since` in Go (which uses `CLOCK_MONOTONIC` internally).
 
-**The problem**: the current trampoline only intercepts `CLOCK_REALTIME`
-(clk_id == 0). `CLOCK_MONOTONIC` (clk_id == 1) passes through unchanged, so
-its value is inconsistent with `CLOCK_REALTIME` after injection.
+**The problem**: `clock_gettime_entry` only intercepts wall-clock reads —
+`CLOCK_REALTIME` (clk_id == 0) and `CLOCK_REALTIME_COARSE` (clk_id == 5).
+`CLOCK_MONOTONIC` (clk_id == 1), `CLOCK_MONOTONIC_RAW`, `CLOCK_BOOTTIME`, etc.
+pass through unchanged, so their value is inconsistent with the faked wall
+clock after injection. (`gettimeofday` and `time` have no monotonic
+equivalent — this only applies to `clock_gettime`.)
 
 **What's needed**:
 
-- Extend the trampoline to handle `clk_id == 1` with the same offset — add a
-  second `cmp edi, 1 / je .apply_offset` branch before `.done`. The offset
-  applied to `CLOCK_MONOTONIC` should be the same seconds/nanoseconds value so
-  both clocks are shifted consistently.
+- Extend `clock_gettime_entry` to handle `clk_id == 1` (and optionally other
+  monotonic variants) with the same offset — add a branch alongside the
+  existing `CLOCK_REALTIME`/`CLOCK_REALTIME_COARSE` check. The offset applied
+  to `CLOCK_MONOTONIC` should be the same seconds/nanoseconds value so both
+  clocks are shifted consistently.
 
-- Extend the `enabledMask` field in the state struct to use bit 1 for
-  `CLOCK_MONOTONIC` (currently unused), so callers can choose to shift only
+- Extend the `enabledMask` field in the state struct to use bit 2 for
+  `CLOCK_MONOTONIC` (bits 0 and 1 are already taken — bit 0 = interception
+  enabled, bit 1 = freeze mode), so callers can choose to shift only
   `CLOCK_REALTIME`, only `CLOCK_MONOTONIC`, or both.
 
-- Update `TestStateOffsetRegression` and any trampoline layout tests if the
-  binary size changes after editing the assembly.
+- Update `TestStateOffsetRegression`, `TestEntryOffsetRegression`, and any
+  other trampoline layout tests if the binary size or stub offsets change
+  after editing the assembly.
 
 **Caveat**: shifting `CLOCK_MONOTONIC` is semantically surprising — the whole
 point of the monotonic clock is that it only moves forward and never jumps.

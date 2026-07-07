@@ -36,13 +36,22 @@ times per second. That's unusable.
 ### The vDSO shortcut
 
 Modern Linux maps a small shared library called the **vDSO** ("virtual dynamic shared
-object") into every process's address space. Glibc's `clock_gettime` implementation doesn't
-issue a syscall at all — it calls the `clock_gettime` symbol in the vDSO, which reads the
-kernel's timekeeping data from a shared memory page directly. This is why `clock_gettime`
-is typically ~20 ns instead of ~200 ns.
+object") into every process's address space. Glibc's wall-clock functions don't issue a
+syscall at all — they call symbols in the vDSO, which reads the kernel's timekeeping data
+from a shared memory page directly. This is why `clock_gettime` is typically ~20 ns instead
+of ~200 ns.
 
 Because the vDSO is a normal mapped region, its code is writable under `PTRACE_POKETEXT`
 (which can write read-only-but-executable pages, exactly as debuggers write breakpoints).
+
+**Three independent functions need patching, not one.** `clock_gettime`, `gettimeofday`, and
+`time` are three separate compiled functions at three different addresses in the vDSO — they
+are not aliases of each other, even though they all report the same wall clock. Patching only
+`clock_gettime` (an earlier version of this tool did) silently misses anything that calls the
+other two — notably PostgreSQL's `GetCurrentTimestamp()` and glibc/bash's own wall-clock reads
+(`$EPOCHREALTIME`), both of which call `gettimeofday`. All three are patched today, each with
+its own small stub, sharing one state struct so a single `SetTime`/`Freeze` call updates all of
+them consistently.
 
 ### The injection sequence
 
@@ -50,24 +59,24 @@ Because the vDSO is a normal mapped region, its code is writable under `PTRACE_P
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  Target process address space                                           │
 │                                                                         │
-│  [vdso]   0x7fff........  ← clock_gettime entry point                   │
-│    │                                                                    │
-│    │  Before: original vDSO clock_gettime code                          │
-│    │  After:  E9 xx xx xx xx  ← JMP rel32 to trampoline page            │
-│    │                                                │                   │
-│    └────────────────────────────────────────────────▼                   │
+│  [vdso]   0x7fff....a40  ← clock_gettime entry point   ─┐                │
+│  [vdso]   0x7fff....7a0  ← gettimeofday entry point    ─┼─┐              │
+│  [vdso]   0x7fff....a10  ← time entry point            ─┼─┼─┐            │
+│    │  Before: original vDSO code                        │ │ │           │
+│    │  After:  E9 xx xx xx xx  ← JMP rel32, one per entry│ │ │           │
+│    └───────────────────────────────────────────────────▼─▼─▼            │
 │                                                                         │
 │  [anon rwx page, allocated by the target itself via mmap]               │
-│    ├─ trampoline code (86 bytes)                                        │
-│    │    1. push rdi/rsi                                                 │
-│    │    2. syscall SYS_clock_gettime  ← real time, always               │
-│    │    3. pop rsi/rdi                                                  │
-│    │    4. if clk_id != CLOCK_REALTIME: ret                             │
-│    │    5. load offsetSec/offsetNsec from state struct below            │
-│    │    6. add to tp->tv_sec / tp->tv_nsec                              │
-│    │    7. normalise tv_nsec into [0, 1e9)                              │
-│    │    8. xor eax, eax; ret                                            │
-│    └─ state struct (32 bytes, at StateOffset = 86)                      │
+│    ├─ clock_gettime stub  (offset 0)                                    │
+│    │    intercepts clk_id ∈ {CLOCK_REALTIME, CLOCK_REALTIME_COARSE};     │
+│    │    real syscall → add offsetSec/offsetNsec → normalise tv_nsec     │
+│    ├─ gettimeofday stub   (offset 141)                                  │
+│    │    same shape, tv_usec instead of tv_nsec (offsetNsec / 1000)      │
+│    ├─ time stub           (offset 306)                                 │
+│    │    real clock_gettime(CLOCK_REALTIME) internally (not the time()   │
+│    │    syscall, which discards the real fractional second before this │
+│    │    stub would ever see it) → same normalised add → return tv_sec  │
+│    └─ shared state struct (32 bytes, at StateOffset = 436)              │
 │         +0   int64  offsetSec                                           │
 │         +8   int64  offsetNsec                                          │
 │         +16  uint64 enabledMask  (1=advancing, 3=frozen)                │
@@ -76,36 +85,45 @@ Because the vDSO is a normal mapped region, its code is writable under `PTRACE_P
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+All three stubs live in one allocated page and share one state struct, so a single
+`SetTime`/`Freeze`/`Advance` call updates the fake time for all three functions at once —
+`clock_gettime`, `gettimeofday`, and `time` in a target process always agree with each other
+to the second.
+
 **Step by step** (see `pkg/inject/inject.go`):
 
 1. **vDSO discovery** — parse `/proc/<pid>/maps` for `[vdso]`, read those bytes via
-   `/proc/<pid>/mem`, parse with `debug/elf`, resolve `clock_gettime` symbol →
-   absolute address.
+   `/proc/<pid>/mem`, parse with `debug/elf`, resolve the `clock_gettime`, `gettimeofday`,
+   and `time` symbols → three absolute addresses (`pkg/vdso.VDSOInfo`).
 
 2. **Remote mmap** — while the target is ptrace-stopped, temporarily overwrite three
-   bytes at the `clock_gettime` entry with `0F 05 CC` (`syscall; int3`), set registers
-   for `mmap(hint, 4096, PROT_RWX, MAP_PRIVATE|MAP_ANON|MAP_FIXED_NOREPLACE, -1, 0)`,
+   bytes at the `clock_gettime` entry (used as a scratch location; it isn't touched again
+   until step 4) with `0F 05 CC` (`syscall; int3`), set registers for
+   `mmap(hint, 4096, PROT_RWX, MAP_PRIVATE|MAP_ANON|MAP_FIXED_NOREPLACE, -1, 0)`,
    resume, wait for the `int3` SIGTRAP, read `RAX` for the new page address, restore
    original bytes and registers. The hint is chosen by scanning `/proc/<pid>/maps` for
-   the nearest free page within ±2 GB of the vDSO entry (required for `JMP rel32` reach).
+   the nearest free page within ±2 GB of the vDSO entry (required for `JMP rel32` reach) —
+   all three hooked functions live in the same few-KB vDSO mapping, so one page is in reach
+   of all three.
 
-3. **Write trampoline** — copy the embedded binary payload into the new page with
-   `offsetSec`/`offsetNsec` already set. Use `process_vm_writev` (no ptrace stop needed
-   for writeable pages).
+3. **Write trampoline** — copy the embedded binary payload (all three stubs + shared
+   state) into the new page with `offsetSec`/`offsetNsec` already set. Use
+   `process_vm_writev` (no ptrace stop needed for writeable pages).
 
-4. **Patch vDSO** — write `E9 <disp32>` over the first 5 bytes of `clock_gettime` using
-   `PTRACE_POKETEXT` (the only way to write a read-only mapped page).
+4. **Patch vDSO** — for each of the three functions, write `E9 <disp32>` over its first 5
+   bytes using `PTRACE_POKETEXT` (the only way to write a read-only mapped page), targeting
+   that function's own stub offset in the trampoline page.
 
-5. **Detach** — the target resumes. Every subsequent `clock_gettime(CLOCK_REALTIME, ...)`
-   call now goes through the trampoline.
+5. **Detach** — the target resumes. Every subsequent `clock_gettime`, `gettimeofday`, or
+   `time` call now goes through the corresponding trampoline stub.
 
 6. **Update time** — `SetTime` / `Freeze` writes a new state struct (32 bytes) into the
    trampoline page using `process_vm_writev`. No ptrace needed. The `enabledMask` field
-   controls behaviour: `MaskEnabled = 1` (bit 0 set) means advancing mode — the trampoline
-   adds `(offsetSec, offsetNsec)` to the real time. `MaskFrozen = 3` (bits 0+1 set) means
-   freeze mode — the offsets encode an absolute timestamp; the trampoline ignores the real
-   time and returns that value directly. The trampoline reads the state with plain loads;
-   a concurrent update and `clock_gettime` call can race — the worst outcome is one call
+   controls behaviour: `MaskEnabled = 1` (bit 0 set) means advancing mode — each stub adds
+   `(offsetSec, offsetNsec)` to the real time. `MaskFrozen = 3` (bits 0+1 set) means
+   freeze mode — the offsets encode an absolute timestamp; each stub ignores the real
+   time and returns that value directly. The stubs read the state with plain loads;
+   a concurrent update and a clock read can race — the worst outcome is one call
    returning a time between the old and new values, which is acceptable for testing.
 
 ---
@@ -213,9 +231,10 @@ go test ./pkg/inject/ -v
 
 | Test | Package | What it checks |
 |------|---------|----------------|
-| `TestLocate` | `pkg/vdso` | Resolves `clock_gettime` in the test process's own vDSO |
+| `TestLocateSelf` | `pkg/vdso` | Resolves `clock_gettime`, `gettimeofday`, and `time` in the test process's own vDSO |
 | `TestTracerBasic` | `pkg/procmem` | Attach, ReadMem, WriteMem, PokeText, Detach |
 | `TestStateOffsetRegression` | `pkg/trampoline` | `StateOffset` constant matches actual binary layout |
+| `TestEntryOffsetRegression` | `pkg/trampoline` | Each hook stub's offset matches the assembled bytes at that address |
 | `TestEncodeDecodeRoundTrip` | `pkg/trampoline` | `EncodeState` / `DecodeState` are inverses |
 | `TestRemoteMmap` | `pkg/inject` | Remote mmap allocates a new rwx page in target |
 | `TestInjectMechanics` | `pkg/inject` | State struct fields, JMP displacement, setOffset, child survives Detach |
@@ -364,10 +383,28 @@ echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
 ### Source: `pkg/trampoline/trampoline.asm`
 
 The payload is hand-written NASM with the `.asm` extension (not `.s`) to prevent Go's
-plan9 assembler from touching it.
+plan9 assembler from touching it. It contains three independent entry points — one per
+hooked vDSO function — followed by one shared state struct. `inject.go` JMP-patches each
+vDSO function's real entry point to the corresponding label.
+
+The `clock_gettime` stub (see the full file for `gettimeofday_entry` and `time_entry`,
+which follow the same shape with their own calling convention):
 
 ```nasm
 ; entry: rdi = clk_id, rsi = struct timespec *
+clock_gettime_entry:
+cmp  edi, 0            ; CLOCK_REALTIME == 0; edi saves a REX prefix vs rdi
+je   .maybe_intercept
+cmp  edi, 5            ; CLOCK_REALTIME_COARSE == 5 -- same wall clock, coarser resolution
+jne  .real_syscall
+
+.maybe_intercept:
+lea  r11, [rel state]  ; RIP-relative — works wherever this page lands
+test byte [r11 + 16], 1 ; bit 0: interception enabled?
+jz   .real_syscall
+test byte [r11 + 16], 2 ; bit 1: freeze mode?
+jnz  .freeze
+
 push rdi
 push rsi
 mov  eax, 228          ; SYS_clock_gettime — shorter than mov rax (no REX prefix)
@@ -375,10 +412,7 @@ syscall                ; get real time first, always
 pop  rsi
 pop  rdi
 
-cmp  edi, 0            ; CLOCK_REALTIME == 0; edi saves a REX prefix vs rdi
-jne  .done
-
-lea  r11, [rel state]  ; RIP-relative — works wherever this page lands
+lea  r11, [rel state]  ; reload -- syscall clobbers r11
 mov  r8,  [r11]        ; offsetSec
 mov  r9,  [r11 + 8]    ; offsetNsec
 add  [rsi],     r8     ; tp->tv_sec  += offsetSec
@@ -399,30 +433,60 @@ jge  .done
 add  rax, 1000000000
 mov  [rsi + 8], rax
 dec  qword [rsi]
+jmp  .done
+
+.freeze:
+mov  r8,  [r11]
+mov  r9,  [r11 + 8]
+mov  [rsi],     r8
+mov  [rsi + 8], r9
+jmp  .done
+
+.real_syscall:
+push rdi
+push rsi
+mov  eax, 228
+syscall
+pop  rsi
+pop  rdi
 
 .done:
 xor  eax, eax          ; return 0; xor eax shorter than xor rax
 ret
 
+; ... gettimeofday_entry, time_entry (same shape, own ABI/precision) ...
+
 state:
     dq 0   ; offsetSec    (+0)
     dq 0   ; offsetNsec   (+8)
-    dq 1   ; enabledMask  (+16) — CLOCK_REALTIME on by default
+    dq 1   ; enabledMask  (+16) — CLOCK_REALTIME/COARSE on by default
     dd 0   ; generation   (+24)
     dd 0   ; _pad         (+28)
 ```
 
 Key design choices:
-- **No call back into original vDSO code** — the trampoline issues a raw `syscall` to get
+- **No call back into original vDSO code** — each stub issues a raw `syscall` to get
   the real time. This avoids the need to save, relocate, and re-execute the original
   instruction bytes (the fiddly part of classic inline hooks).
 - **Position-independent** — `lea r11, [rel state]` is RIP-relative. The payload can be
   placed anywhere in the address space.
-- **Only `CLOCK_REALTIME` is intercepted** — `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, etc.
-  pass through unchanged.
+- **`clock_gettime` intercepts `CLOCK_REALTIME` and `CLOCK_REALTIME_COARSE`** (same wall
+  clock, the latter is just a faster/coarser read of it). `CLOCK_MONOTONIC`,
+  `CLOCK_BOOTTIME`, etc. deliberately pass through unchanged, so internal
+  timeout/latency logic in the target process (e.g. PostgreSQL's `statement_timeout`,
+  lock waits) keeps seeing real elapsed time.
+- **`gettimeofday` and `time` are also intercepted**, not just `clock_gettime` — they are
+  independent functions at independent vDSO addresses, not aliases, and PostgreSQL's
+  `GetCurrentTimestamp()` calls `gettimeofday`, not `clock_gettime`.
+- **`time_entry` calls the real `clock_gettime(CLOCK_REALTIME)` internally, not the
+  `time()` syscall** — `SYS_time` only ever returns whole seconds, discarding the real
+  fractional second before the trampoline would ever see it, which could make `time()`
+  disagree with `clock_gettime`/`gettimeofday` about the current second by up to 1s
+  whenever `offsetNsec` was nonzero. Calling the finer-grained syscall and applying the
+  same carry-normalised add keeps all three in agreement to the second.
 - **REX-prefix micro-optimisations** — `mov eax` (3 bytes) instead of `mov rax` (4 bytes),
-  `cmp edi` instead of `cmp rdi`, `xor eax, eax` instead of `xor rax, rax`. Saves 3 bytes
-  in a payload where every byte shifts the `state:` label offset.
+  `cmp edi` instead of `cmp rdi`, `xor eax, eax` instead of `xor rax, rax`. Saves bytes
+  in a payload where every byte shifts later stubs and the `state:` label offset.
 
 ### Assembling
 
@@ -430,20 +494,24 @@ Key design choices:
 nasm -f bin pkg/trampoline/trampoline.asm -o pkg/trampoline/trampoline.bin
 ```
 
-After reassembling, verify the binary and update `StateOffset` if the code size changed:
+After reassembling, verify the binary and update the offset constants if the code size
+changed:
 
 ```bash
 # Disassemble to confirm layout
 objdump -D -b binary -m i386:x86-64 pkg/trampoline/trampoline.bin
 
-# StateOffset should equal (total binary size - 32).
-# The regression test TestStateOffsetRegression will fail loudly if they diverge.
-wc -c pkg/trampoline/trampoline.bin   # currently 118 bytes → StateOffset = 86
+# StateOffset should equal (total binary size - 32); ClockGettimeEntryOffset /
+# GettimeofdayEntryOffset / TimeEntryOffset are each stub's starting offset.
+# TestStateOffsetRegression and TestEntryOffsetRegression fail loudly if they diverge.
+wc -c pkg/trampoline/trampoline.bin   # currently 468 bytes → StateOffset = 436
 ```
 
-The constant `StateOffset = 86` in `pkg/trampoline/trampoline.go` must match. The test
-`TestStateOffsetRegression` asserts `StateOffset == len(Payload) - StateSize` and will
-catch any drift at CI time.
+The constants in `pkg/trampoline/trampoline.go` (`StateOffset = 436`,
+`ClockGettimeEntryOffset = 0`, `GettimeofdayEntryOffset = 141`, `TimeEntryOffset = 306`)
+must match. `TestStateOffsetRegression` asserts `StateOffset == len(Payload) - StateSize`;
+`TestEntryOffsetRegression` checks the assembled bytes at each `*EntryOffset` against the
+expected first instruction of that stub. Both catch any drift at CI time.
 
 ### Embedding
 
@@ -482,9 +550,10 @@ space. The sequence:
 5. Read the result from `RAX`.
 6. Restore the original bytes and registers.
 
-The vDSO entry is used as the scratch location because it is already known to be executable
-and reachable. The final `JMP rel32` patch happens later, after the trampoline has been
-written.
+The `clock_gettime` vDSO entry is used as the scratch location for this one-time mmap call
+because it is already known to be executable and reachable — `gettimeofday` and `time`
+aren't touched here. The final `JMP rel32` patches happen later, once per hooked function
+(`clock_gettime`, `gettimeofday`, `time`), after the trampoline has been written.
 
 ### `writeState` / `SetTime` / `Freeze` — live updates with no ptrace
 
@@ -538,8 +607,8 @@ as closures over a channel and executed on that pinned thread.
 When a timeshift is created or updated with `--freeze` / `freeze: true`, the trampoline
 enters **frozen mode**: the `enabledMask` field is set to `MaskFrozen = 3` (bits 0 and 1),
 and the offset fields store the absolute target timestamp rather than a delta. Every
-`clock_gettime(CLOCK_REALTIME, ...)` call in the target returns exactly that timestamp,
-regardless of how much real time passes.
+`clock_gettime` (`CLOCK_REALTIME` or `CLOCK_REALTIME_COARSE`), `gettimeofday`, and `time`
+call in the target returns exactly that timestamp, regardless of how much real time passes.
 
 Freeze mode is useful for:
 - Reproducing time-sensitive bugs that only trigger at a specific instant.
@@ -647,8 +716,13 @@ err = session.Advance(24 * time.Hour)
   different payload and a different JMP patch strategy (AArch64 `B` has only a 26-bit
   offset; you'd need an indirect branch via a scratch register instead).
 
-- **`CLOCK_REALTIME` only.** `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` are not intercepted.
-  Go's `time.Now()` uses `CLOCK_REALTIME`, so this is sufficient for most test scenarios.
+- **Wall clock only — `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` are not intercepted.**
+  `clock_gettime`, `gettimeofday`, and `time` (all wall-clock reads) are all patched, and
+  `clock_gettime` additionally covers `CLOCK_REALTIME_COARSE`. Monotonic/boottime clock IDs
+  deliberately pass through unchanged, so internal timeout/latency logic in the target
+  process (e.g. PostgreSQL's `statement_timeout`, lock waits) keeps seeing real elapsed
+  time — shifting them would be surprising (see `FUTURE.md` for a design sketch if you want
+  this as an opt-in).
 
 - **No teardown in v1.** There is no `Uninstall` that restores the original vDSO bytes.
   Calling `SetTime(time.Now())` effectively resets the clock to real time, which is
@@ -714,6 +788,7 @@ err = session.Advance(24 * time.Hour)
 | 38 | `pkg/faketime`: `Handle.EffectiveTime()`, `Handle.PID()`, `Handle.IsAlive()`, `Session.Close()` | ✅ |
 | 39 | `pkg/faketime`: `StartWithTracking` / `ChildTracker` — auto-inject into forked child processes via `PTRACE_O_TRACEFORK` | ✅ |
 | 40 | `pkg/faketime`: exec-survivor injection — re-inject after `exec()` via `PTRACE_O_TRACEEXEC` so processes that self-exec (e.g. PEX bootstrap) or fork+exec retain fake time | ✅ |
+| 42 | `gettimeofday`/`time` vDSO interception (previously only `clock_gettime` was patched, silently missing e.g. PostgreSQL's `GetCurrentTimestamp()`); `CLOCK_REALTIME_COARSE` support; `time()` precision fix (was up to 1s off vs. the other two) | ✅ |
 
 See `plan.md` for the detailed specification of all phases.
 See `FUTURE.md` for longer-horizon improvements (auth, multi-arch, Helm, HA).

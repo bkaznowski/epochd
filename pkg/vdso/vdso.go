@@ -12,16 +12,24 @@ import (
 	"strings"
 )
 
-// VDSOInfo holds the vDSO mapping range and the resolved address of clock_gettime
-// within the target process's address space.
+// VDSOInfo holds the vDSO mapping range and the resolved addresses of the
+// three wall-clock-reading functions within the target process's address
+// space. clock_gettime, gettimeofday, and time are independent functions at
+// independent addresses in the vDSO (they are not aliases of one another),
+// so callers that only patch clock_gettime miss any code that reads the
+// clock via one of the other two -- notably PostgreSQL's GetCurrentTimestamp
+// and glibc/bash's own wall-clock reads, both of which call gettimeofday.
 type VDSOInfo struct {
 	Start, End       uintptr
 	ClockGettimeAddr uintptr
+	GettimeofdayAddr uintptr
+	TimeAddr         uintptr
 }
 
 // Locate finds the vDSO mapping in the given process and resolves the absolute
-// address of clock_gettime. The caller must already hold ptrace attachment (or be
-// reading their own process) since /proc/<pid>/mem requires ptrace permission.
+// addresses of clock_gettime, gettimeofday, and time. The caller must already
+// hold ptrace attachment (or be reading their own process) since
+// /proc/<pid>/mem requires ptrace permission.
 func Locate(pid int) (*VDSOInfo, error) {
 	start, end, err := findVDSORange(pid)
 	if err != nil {
@@ -39,40 +47,54 @@ func Locate(pid int) (*VDSOInfo, error) {
 	}
 	defer ef.Close()
 
-	symVal, err := resolveCGTSymbol(ef)
+	syms, err := ef.DynamicSymbols()
+	if err != nil {
+		return nil, fmt.Errorf("vdso: reading dynamic symbols: %w", err)
+	}
+
+	cgtVal, err := resolveSymbol(syms, "clock_gettime", "__vdso_clock_gettime")
+	if err != nil {
+		return nil, err
+	}
+	gtodVal, err := resolveSymbol(syms, "gettimeofday", "__vdso_gettimeofday")
+	if err != nil {
+		return nil, err
+	}
+	timeVal, err := resolveSymbol(syms, "time", "__vdso_time")
 	if err != nil {
 		return nil, err
 	}
 
-	addr := start + uintptr(symVal)
-	if addr < start || addr >= end {
-		return nil, fmt.Errorf("vdso: clock_gettime symbol value 0x%x produces address 0x%x outside vDSO [0x%x, 0x%x)", symVal, addr, start, end)
+	cgtAddr := start + uintptr(cgtVal)
+	gtodAddr := start + uintptr(gtodVal)
+	timeAddr := start + uintptr(timeVal)
+	for name, addr := range map[string]uintptr{"clock_gettime": cgtAddr, "gettimeofday": gtodAddr, "time": timeAddr} {
+		if addr < start || addr >= end {
+			return nil, fmt.Errorf("vdso: %s symbol produces address 0x%x outside vDSO [0x%x, 0x%x)", name, addr, start, end)
+		}
 	}
 
 	return &VDSOInfo{
 		Start:            start,
 		End:              end,
-		ClockGettimeAddr: addr,
+		ClockGettimeAddr: cgtAddr,
+		GettimeofdayAddr: gtodAddr,
+		TimeAddr:         timeAddr,
 	}, nil
 }
 
-// resolveCGTSymbol looks up clock_gettime (preferred) or __vdso_clock_gettime
-// (fallback) in the ELF dynamic symbol table and returns the symbol's value
-// (relative offset from vDSO base).
-func resolveCGTSymbol(ef *elf.File) (uint64, error) {
-	syms, err := ef.DynamicSymbols()
-	if err != nil {
-		return 0, fmt.Errorf("vdso: reading dynamic symbols: %w", err)
-	}
-
+// resolveSymbol looks up preferred (e.g. "clock_gettime") or fallback (e.g.
+// "__vdso_clock_gettime") in the ELF dynamic symbol table and returns the
+// symbol's value (relative offset from vDSO base).
+func resolveSymbol(syms []elf.Symbol, preferredName, fallbackName string) (uint64, error) {
 	var preferred, fallback uint64
 	var hasPreferred, hasFallback bool
 	for _, sym := range syms {
 		switch sym.Name {
-		case "clock_gettime":
+		case preferredName:
 			preferred = sym.Value
 			hasPreferred = true
-		case "__vdso_clock_gettime":
+		case fallbackName:
 			fallback = sym.Value
 			hasFallback = true
 		}
@@ -84,7 +106,7 @@ func resolveCGTSymbol(ef *elf.File) (uint64, error) {
 	if hasFallback {
 		return fallback, nil
 	}
-	return 0, fmt.Errorf("vdso: neither clock_gettime nor __vdso_clock_gettime found in dynamic symbol table")
+	return 0, fmt.Errorf("vdso: neither %s nor %s found in dynamic symbol table", preferredName, fallbackName)
 }
 
 // findVDSORange parses /proc/<pid>/maps and returns the start and end addresses

@@ -65,14 +65,14 @@ func TestInjectRoundTrip(t *testing.T) {
 	const fakeOffset = 24 * time.Hour
 	target := time.Now().Add(fakeOffset)
 	wantSec, wantNsec := diffSecNsec(target, time.Now())
-	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, wantSec, wantNsec, trampoline.MaskEnabled)
+	h, err := injectWithTracer(tr, pid, info, wantSec, wantNsec, trampoline.MaskEnabled)
 	if err != nil {
 		t.Fatalf("injectWithTracer: %v", err)
 	}
 	tr.Detach()
 
 	const (
-		wantEach  = 3             // timestamps to verify in each phase
+		wantEach  = 3 // timestamps to verify in each phase
 		tolerance = 5 * time.Second
 	)
 	sc := bufio.NewScanner(pr)

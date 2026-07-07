@@ -20,6 +20,38 @@ func TestStateOffsetRegression(t *testing.T) {
 	}
 }
 
+// TestEntryOffsetRegression pins each hook stub's entry offset to a
+// distinguishing prefix of its first assembled instruction. If a future edit
+// to trampoline.asm reorders or resizes a stub without updating the
+// corresponding *EntryOffset constant, the bytes at that offset will no
+// longer match and this fails loudly instead of silently patching a vDSO
+// function with a JMP into the middle of some other stub's code.
+func TestEntryOffsetRegression(t *testing.T) {
+	cases := []struct {
+		name   string
+		offset int
+		want   []byte // first bytes of the instruction at this label
+	}{
+		{"ClockGettimeEntryOffset", ClockGettimeEntryOffset, []byte{0x83, 0xFF, 0x00}}, // cmp edi, 0
+		{"GettimeofdayEntryOffset", GettimeofdayEntryOffset, []byte{0x4C, 0x8D, 0x1D}}, // lea r11, [rel state]
+		{"TimeEntryOffset", TimeEntryOffset, []byte{0x4C, 0x8D, 0x1D}},                 // lea r11, [rel state]
+	}
+	for _, c := range cases {
+		if c.offset+len(c.want) > len(Payload) {
+			t.Fatalf("%s = %d is out of range for Payload of length %d", c.name, c.offset, len(Payload))
+		}
+		got := Payload[c.offset : c.offset+len(c.want)]
+		for i, b := range c.want {
+			if got[i] != b {
+				t.Errorf("%s = %d: Payload bytes = % x, want prefix % x; "+
+					"update the offset constant after re-assembling trampoline.asm",
+					c.name, c.offset, got, c.want)
+				break
+			}
+		}
+	}
+}
+
 // TestPayloadDefaultState checks that the embedded binary has the expected
 // at-rest field values: both offsets zero, enabledMask=1, generation=0.
 func TestPayloadDefaultState(t *testing.T) {

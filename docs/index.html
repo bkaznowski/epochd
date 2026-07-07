@@ -428,41 +428,43 @@ tr:last-child td { border-bottom: none; }
 </table>
 </div>
 
-<p>epochd solves this by patching the vDSO's <code>clock_gettime</code> entry with a JMP to a small trampoline page that adds a fixed offset to the real time. The patch is invisible to the process, survives <code>fork</code>, and can be updated at any time without stopping the target.</p>
+<p>epochd solves this by patching the vDSO's <code>clock_gettime</code>, <code>gettimeofday</code>, and <code>time</code> entries with a JMP to a small shared trampoline page that adds a fixed offset to the real time. All three are independent functions at independent vDSO addresses — patching only <code>clock_gettime</code> (an earlier version of this tool did) silently misses anything that reads wall-clock time via the other two, notably PostgreSQL's <code>GetCurrentTimestamp()</code>. The patch is invisible to the process, survives <code>fork</code>, and can be updated at any time without stopping the target.</p>
 </section>
 
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <section id="how-it-works">
 <h2>How it works</h2>
 
-<p>Modern Linux maps a shared library called the <strong>vDSO</strong> ("virtual dynamic shared object") into every process's address space. Glibc's <code>clock_gettime</code> doesn't issue a syscall — it calls a symbol in the vDSO which reads timekeeping data from a shared kernel memory page. This is why <code>clock_gettime</code> takes ~20 ns instead of ~200 ns.</p>
+<p>Modern Linux maps a shared library called the <strong>vDSO</strong> ("virtual dynamic shared object") into every process's address space. Glibc's wall-clock functions don't issue a syscall — they call symbols in the vDSO which read timekeeping data from a shared kernel memory page. This is why <code>clock_gettime</code> takes ~20 ns instead of ~200 ns.</p>
 
-<p>epochd exploits this by overwriting the first 5 bytes of the vDSO's <code>clock_gettime</code> entry with a <code>JMP rel32</code> instruction pointing to a small trampoline page. The trampoline:</p>
+<p><code>clock_gettime</code>, <code>gettimeofday</code>, and <code>time</code> are three separate compiled functions at three different vDSO addresses — not aliases of each other, even though all three report the same wall clock. epochd exploits the same trick against all three: overwriting the first 5 bytes of each vDSO entry with a <code>JMP rel32</code> instruction pointing to its own stub in one shared trampoline page. Each stub:</p>
 
 <ol>
-  <li>Issues a real <code>syscall</code> to get the actual current time.</li>
-  <li>Reads an offset from a small state struct embedded in the same page.</li>
-  <li>Adds the offset to the returned <code>timespec</code>.</li>
+  <li>Issues a real <code>syscall</code> to get the actual current time (in its own calling convention).</li>
+  <li>Reads an offset from the state struct shared by all three stubs.</li>
+  <li>Adds the offset, normalising any carry/borrow.</li>
   <li>Returns. The calling code never sees the trampoline.</li>
 </ol>
 
 <div class="arch">  [vdso region]
   clock_gettime entry:  E9 xx xx xx xx   ← JMP rel32 (patched by epochd)
+  gettimeofday entry:   E9 xx xx xx xx   ← JMP rel32 (patched by epochd)
+  time entry:           E9 xx xx xx xx   ← JMP rel32 (patched by epochd)
                               │
                               ▼
   [anon rwx page, allocated by the target itself via mmap]
-  ├─ trampoline code (86 bytes)
-  │    issue real syscall → get real time
-  │    load offsetSec / offsetNsec from state struct
-  │    add offset to timespec
-  │    return 0
-  └─ state struct (32 bytes, at byte offset 86)
+  ├─ clock_gettime stub  (offset 0)   — CLOCK_REALTIME / CLOCK_REALTIME_COARSE
+  ├─ gettimeofday stub   (offset 141) — tv_usec instead of tv_nsec
+  ├─ time stub           (offset 306) — calls clock_gettime internally, not
+  │                                     the time() syscall, so it always
+  │                                     agrees with the other two to the second
+  └─ shared state struct (32 bytes, at byte offset 436)
        offsetSec    int64  ← in advancing mode: offset from real time
        offsetNsec   int64     in frozen mode: absolute frozen timestamp
        enabledMask  uint64 (1 = advancing, 3 = frozen)
        generation   uint32 (bumped on each update)</div>
 
-<p>Updating the fake time requires writing 32 bytes into the state struct using <code>process_vm_writev</code>. No ptrace stop. No signal. The target process continues running.</p>
+<p>Updating the fake time requires writing 32 bytes into the shared state struct using <code>process_vm_writev</code>. No ptrace stop. No signal. The target process continues running, and all three functions pick up the new time on their next call.</p>
 
 <p>Two clock modes are controlled via <code>enabledMask</code>:</p>
 <ul>
@@ -473,9 +475,9 @@ tr:last-child td { border-bottom: none; }
 <h3>The injection sequence</h3>
 <p>The one-time setup (on first <code>InjectAtTime</code> or <code>Start</code> call) involves three brief ptrace stops:</p>
 <ol>
-  <li><strong>vDSO discovery</strong> — parse <code>/proc/&lt;pid&gt;/maps</code> for <code>[vdso]</code>, resolve the <code>clock_gettime</code> symbol via ELF.</li>
-  <li><strong>Remote mmap</strong> — while the target is ptrace-stopped, make it call <code>mmap</code> on its own behalf. The new page is allocated as close as possible to the vDSO entry (within the ±2 GB reach of <code>JMP rel32</code>).</li>
-  <li><strong>Patch and detach</strong> — write the trampoline payload, patch the 5-byte vDSO entry, then detach. The target resumes immediately.</li>
+  <li><strong>vDSO discovery</strong> — parse <code>/proc/&lt;pid&gt;/maps</code> for <code>[vdso]</code>, resolve the <code>clock_gettime</code>, <code>gettimeofday</code>, and <code>time</code> symbols via ELF.</li>
+  <li><strong>Remote mmap</strong> — while the target is ptrace-stopped, make it call <code>mmap</code> on its own behalf. The new page is allocated as close as possible to the vDSO entries (within the ±2 GB reach of <code>JMP rel32</code>) — all three live in the same few-KB vDSO mapping, so one page is in reach of all of them.</li>
+  <li><strong>Patch and detach</strong> — write the trampoline payload (all three stubs), patch each of the three 5-byte vDSO entries, then detach. The target resumes immediately.</li>
 </ol>
 </section>
 
@@ -649,7 +651,7 @@ ts, err = client.UpdateTimeshift(ctx, ts.ID, time.Now().Add(3*365*24*time.Hour))
 _ = client.DeleteTimeshift(ctx, ts.ID)</code></pre>
 
 <h3>Freeze mode</h3>
-<p>In freeze mode the clock is pinned to a specific instant. Every <code>clock_gettime</code> call in the target returns exactly that time, regardless of how much real time passes.</p>
+<p>In freeze mode the clock is pinned to a specific instant. Every <code>clock_gettime</code>, <code>gettimeofday</code>, and <code>time</code> call in the target returns exactly that time, regardless of how much real time passes.</p>
 <pre><code class="language-go">frozenAt := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // Create a frozen timeshift — clock never advances.
@@ -875,7 +877,7 @@ for _, c := range status.Containers {
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <h2 id="freeze-mode">Freeze mode</h2>
 
-<p>In <strong>freeze mode</strong> the target's clock is pinned to a specific instant. Every call to <code>clock_gettime(CLOCK_REALTIME, ...)</code> returns exactly that timestamp regardless of how much real time passes. The trampoline uses <code>enabledMask = 3</code> (<code>MaskFrozen</code>) and stores the absolute frozen timestamp in the offset fields.</p>
+<p>In <strong>freeze mode</strong> the target's clock is pinned to a specific instant. Every call to <code>clock_gettime</code> (<code>CLOCK_REALTIME</code> or <code>CLOCK_REALTIME_COARSE</code>), <code>gettimeofday</code>, or <code>time</code> returns exactly that timestamp regardless of how much real time passes. Each stub uses <code>enabledMask = 3</code> (<code>MaskFrozen</code>) and reads the absolute frozen timestamp from the shared offset fields.</p>
 
 <p>Freeze mode is useful for:</p>
 <ul>
@@ -1113,7 +1115,7 @@ s.Advance(24 * time.Hour)</code></pre>
     </tr>
     <tr>
       <td><code>StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error)</code></td>
-      <td>Starts <code>cmd</code> with its clock frozen at <code>target</code>. Every <code>clock_gettime</code> call in the child returns exactly <code>target</code> until <code>SetTime</code> or <code>Freeze</code> is called.</td>
+      <td>Starts <code>cmd</code> with its clock frozen at <code>target</code>. Every <code>clock_gettime</code>, <code>gettimeofday</code>, or <code>time</code> call in the child returns exactly <code>target</code> until <code>SetTime</code> or <code>Freeze</code> is called.</td>
     </tr>
     <tr>
       <td><code>Attach(pid int, target time.Time) (*Handle, error)</code></td>
@@ -1628,9 +1630,9 @@ faketimectl run --time=2030-01-01T00:00:00Z --track -- postgres -D /tmp/pgdata
       <td>The trampoline is hand-assembled for <code>x86_64</code>. ARM64 support is on the roadmap. Tests can be cross-compiled on macOS/Windows and run in Docker or CI.</td>
     </tr>
     <tr>
-      <td><strong>CLOCK_REALTIME only</strong></td>
+      <td><strong>Wall clock only</strong></td>
       <td><code>CLOCK_MONOTONIC</code> and <code>CLOCK_BOOTTIME</code> are not intercepted. Go's <code>time.Since</code> / timer internals use monotonic time.</td>
-      <td>Go's <code>time.Now()</code> uses <code>CLOCK_REALTIME</code>, so most <code>time.Now()</code>-based tests work fine. Timeouts and rate limiters that use <code>CLOCK_MONOTONIC</code> are not affected by the injection. A future release will optionally intercept <code>CLOCK_MONOTONIC</code>.</td>
+      <td><code>clock_gettime</code> (<code>CLOCK_REALTIME</code> and <code>CLOCK_REALTIME_COARSE</code>), <code>gettimeofday</code>, and <code>time</code> are all patched, so both Go's <code>time.Now()</code> and non-Go readers like PostgreSQL's <code>GetCurrentTimestamp()</code> (which calls <code>gettimeofday</code>) see the fake clock. Monotonic/boottime clock IDs deliberately pass through unchanged — internal timeout/latency logic in the target process (e.g. lock waits, <code>statement_timeout</code>) keeps seeing real elapsed time. A future release may make monotonic interception opt-in.</td>
     </tr>
     <tr>
       <td><strong>No clock uninstall</strong></td>
@@ -1748,6 +1750,9 @@ faketimectl run --time=2030-01-01T00:00:00Z --track -- postgres -D /tmp/pgdata
 <h3>Does this work with Go's <code>time.Now()</code>?</h3>
 <p>Yes. Go's <code>time.Now()</code> calls <code>clock_gettime(CLOCK_REALTIME, ...)</code> via the vDSO. epochd patches exactly that entry point, so <code>time.Now()</code> returns the fake time after injection.</p>
 
+<h3>Does this work with non-Go processes, like PostgreSQL?</h3>
+<p>Yes. <code>clock_gettime</code>, <code>gettimeofday</code>, and <code>time</code> are three independent functions at three different vDSO addresses — not aliases of each other — and epochd patches all three. This matters because Go's runtime always calls <code>clock_gettime</code>, but plenty of C code doesn't: PostgreSQL's <code>GetCurrentTimestamp()</code> (what backs <code>SELECT now()</code>) and glibc/bash's own wall-clock reads both call <code>gettimeofday</code> instead. Patching only <code>clock_gettime</code> would silently miss them.</p>
+
 <h3>Will <code>time.Since</code> / <code>time.Until</code> work correctly?</h3>
 <p>Yes and no. <code>time.Since(t)</code> and <code>time.Until(t)</code> in Go are computed from the monotonic component of the time (which is stored when <code>time.Now()</code> is called). If both the reference time <em>and</em> the current time are read after injection, the difference will be correct. If one was read before injection and the other after, the result may be surprising. For most test patterns (read a reference time, advance the clock, check relative to the reference) this works correctly.</p>
 
@@ -1758,7 +1763,7 @@ faketimectl run --time=2030-01-01T00:00:00Z --track -- postgres -D /tmp/pgdata
 <p>For local process injection: only via the Go <code>pkg/faketime</code> API or the <code>faketimectl</code> CLI.</p>
 
 <h3>What happens if the target process calls <code>fork</code>?</h3>
-<p>Forked children inherit the parent's vDSO mapping, which includes the patched <code>JMP</code> and the trampoline page. Children see the same fake time as the parent. This is usually the desired behaviour when testing a multi-process server.</p>
+<p>Forked children inherit the parent's vDSO mapping, which includes all three patched <code>JMP</code> entries and the shared trampoline page. Children see the same fake time as the parent — across <code>clock_gettime</code>, <code>gettimeofday</code>, and <code>time</code> alike. This is usually the desired behaviour when testing a multi-process server (e.g. PostgreSQL's per-connection backend processes).</p>
 <p>If you need a <code>Handle</code> for each child (to update clocks independently, or to track when children exit), use <code>faketime.StartWithTracking</code> instead of <code>faketime.Start</code>. It runs a background goroutine that watches for <code>PTRACE_EVENT_FORK</code> notifications and registers a <code>Handle</code> for each child as it is created.</p>
 
 <h3>What happens if the target process calls <code>exec</code>?</h3>

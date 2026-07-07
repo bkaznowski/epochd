@@ -155,7 +155,7 @@ func TestInjectMechanics(t *testing.T) {
 	target := time.Now().Add(24 * time.Hour)
 	wantSec, wantNsec := diffSecNsec(target, time.Now())
 
-	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, wantSec, wantNsec, trampoline.MaskEnabled)
+	h, err := injectWithTracer(tr, pid, info, wantSec, wantNsec, trampoline.MaskEnabled)
 	if err != nil {
 		t.Fatalf("injectWithTracer: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestInjectObserved(t *testing.T) {
 	offset := 24 * time.Hour
 	target := time.Now().Add(offset)
 	wantSec, wantNsec := diffSecNsec(target, time.Now())
-	if _, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, wantSec, wantNsec, trampoline.MaskEnabled); err != nil {
+	if _, err := injectWithTracer(tr, pid, info, wantSec, wantNsec, trampoline.MaskEnabled); err != nil {
 		t.Fatalf("injectWithTracer: %v", err)
 	}
 	tr.Detach()

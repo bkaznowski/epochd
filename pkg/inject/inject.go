@@ -20,14 +20,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-
 // Handle represents an active time-offset injection in a target process.
 // Obtain one via InjectAtTime or InjectFrozen; update with SetTime or Freeze.
 type Handle struct {
 	PID       int
-	StateAddr uintptr // address of the trampoline's mutable state struct in the target
-	origBytes [5]byte // original vDSO clock_gettime bytes before our JMP patch
-	gen       uint32  // monotonically incremented on every SetOffset/SetTime/Freeze call
+	StateAddr uintptr        // address of the trampoline's mutable state struct in the target
+	patched   [3]patchedHook // clock_gettime, gettimeofday, time -- original vDSO bytes before our JMP patch
+	gen       uint32         // monotonically incremented on every SetOffset/SetTime/Freeze call
+}
+
+// patchedHook records a single vDSO entry point we overwrote with a JMP, so a
+// future uninstall can restore it.
+type patchedHook struct {
+	addr uintptr
+	orig [5]byte
 }
 
 // InjectAtTime injects the trampoline into pid and sets its clock to target,
@@ -118,7 +124,7 @@ func injectCoreKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle, *proc
 		tr.Detach() //nolint:errcheck
 		return nil, nil, fmt.Errorf("inject: vdso.Locate: %w", err)
 	}
-	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
+	h, err := injectWithTracer(tr, pid, info, sec, nsec, mask)
 	if err != nil {
 		tr.Detach() //nolint:errcheck
 		return nil, nil, err
@@ -144,7 +150,7 @@ func injectFollowChildKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle
 		tr.Detach() //nolint:errcheck
 		return nil, nil, fmt.Errorf("inject: vdso.Locate: %w", err)
 	}
-	h, err := injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
+	h, err := injectWithTracer(tr, pid, info, sec, nsec, mask)
 	if err != nil {
 		tr.Detach() //nolint:errcheck
 		return nil, nil, err
@@ -186,7 +192,7 @@ func reInjectAfterExec(tr *procmem.Tracer, parentPID, pid int, sec, nsec int64, 
 	if err != nil {
 		return nil, fmt.Errorf("inject: vdso.Locate after exec pid %d: %w", pid, err)
 	}
-	return injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
+	return injectWithTracer(tr, pid, info, sec, nsec, mask)
 }
 
 // ChildHandle returns a Handle for a process that forked from parent's target.
@@ -197,7 +203,7 @@ func ChildHandle(parent *Handle, childPID int) *Handle {
 	return &Handle{
 		PID:       childPID,
 		StateAddr: parent.StateAddr,
-		origBytes: parent.origBytes,
+		patched:   parent.patched,
 	}
 }
 
@@ -238,7 +244,7 @@ func injectFollowChild(pid int, sec, nsec int64, mask uint64) (*Handle, error) {
 		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
 	}
 	defer tr.Detach() //nolint:errcheck
-	return injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
+	return injectWithTracer(tr, pid, info, sec, nsec, mask)
 }
 
 // injectCore attaches to pid, writes the trampoline with the given state values,
@@ -255,23 +261,31 @@ func injectCore(pid int, sec, nsec int64, mask uint64) (*Handle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
 	}
-	return injectWithTracer(tr, pid, info.ClockGettimeAddr, sec, nsec, mask)
+	return injectWithTracer(tr, pid, info, sec, nsec, mask)
 }
 
 // injectWithTracer is the core injection sequence. tr must already be attached to pid.
-// mask selects advancing (MaskEnabled) or freeze (MaskFrozen) mode.
+// mask selects advancing (MaskEnabled) or freeze (MaskFrozen) mode. It patches
+// all three wall-clock vDSO entry points -- clock_gettime, gettimeofday, and
+// time -- to jump into the corresponding stub in one shared trampoline page,
+// so every wall-clock read in the target process observes the same fake
+// time regardless of which of the three functions it calls. (PostgreSQL's
+// GetCurrentTimestamp and glibc/bash's own wall-clock reads call
+// gettimeofday, not clock_gettime.)
 // Separated from injectCore so tests can supply a FollowChild-based tracer instead of
 // one that required PTRACE_ATTACH.
-func injectWithTracer(tr *procmem.Tracer, pid int, cgtAddr uintptr, sec, nsec int64, mask uint64) (*Handle, error) {
+func injectWithTracer(tr *procmem.Tracer, pid int, info *vdso.VDSOInfo, sec, nsec int64, mask uint64) (*Handle, error) {
 	// Find a free page in the target's address space within ±2 GB of the vDSO
-	// entry point.  The process is ptrace-stopped so /proc/<pid>/maps is stable.
-	// We then use MAP_FIXED_NOREPLACE to guarantee the allocation lands there.
-	fixedAddr, err := findNearbyGap(pid, cgtAddr)
+	// entry points. All three hooked functions live within the same few-KB vDSO
+	// mapping, so proximity to one guarantees proximity to all. The process is
+	// ptrace-stopped so /proc/<pid>/maps is stable. We then use
+	// MAP_FIXED_NOREPLACE to guarantee the allocation lands there.
+	fixedAddr, err := findNearbyGap(pid, info.ClockGettimeAddr)
 	if err != nil {
 		return nil, fmt.Errorf("inject: findNearbyGap: %w", err)
 	}
 
-	newPage, err := remoteMmap(tr, pid, cgtAddr, fixedAddr)
+	newPage, err := remoteMmap(tr, pid, info.ClockGettimeAddr, fixedAddr)
 	if err != nil {
 		return nil, fmt.Errorf("inject: remoteMmap: %w", err)
 	}
@@ -286,32 +300,50 @@ func injectWithTracer(tr *procmem.Tracer, pid int, cgtAddr uintptr, sec, nsec in
 		return nil, fmt.Errorf("inject: write payload: %w", err)
 	}
 
-	// Compute the 5-byte JMP rel32 displacement.
-	// E9 <disp32> jumps to RIP+disp, where RIP = cgtAddr+5 (after the JMP itself).
-	disp := int64(newPage) - int64(cgtAddr+5)
-	if disp != int64(int32(disp)) {
-		return nil, fmt.Errorf("inject: JMP rel32 displacement %d overflows int32 "+
-			"(vDSO 0x%x, trampoline 0x%x are too far apart; try hint-based mmap)", disp, cgtAddr, newPage)
+	hooks := [3]struct {
+		name        string
+		vdsoAddr    uintptr
+		entryOffset int
+	}{
+		{"clock_gettime", info.ClockGettimeAddr, trampoline.ClockGettimeEntryOffset},
+		{"gettimeofday", info.GettimeofdayAddr, trampoline.GettimeofdayEntryOffset},
+		{"time", info.TimeAddr, trampoline.TimeEntryOffset},
 	}
 
-	// Save the original 5 bytes at the vDSO entry for future uninstall.
-	var orig [5]byte
-	if _, err := procmem.ReadMem(pid, cgtAddr, orig[:]); err != nil {
-		return nil, fmt.Errorf("inject: save original vDSO bytes: %w", err)
-	}
+	var patched [3]patchedHook
+	for i, hook := range hooks {
+		target := newPage + uintptr(hook.entryOffset)
 
-	// Overwrite the vDSO clock_gettime entry with our JMP.
-	var jmp [5]byte
-	jmp[0] = 0xE9
-	binary.LittleEndian.PutUint32(jmp[1:], uint32(int32(disp)))
-	if err := tr.PokeText(cgtAddr, jmp[:]); err != nil {
-		return nil, fmt.Errorf("inject: PokeText JMP: %w", err)
+		// Compute the 5-byte JMP rel32 displacement.
+		// E9 <disp32> jumps to RIP+disp, where RIP = vdsoAddr+5 (after the JMP itself).
+		disp := int64(target) - int64(hook.vdsoAddr+5)
+		if disp != int64(int32(disp)) {
+			return nil, fmt.Errorf("inject: %s: JMP rel32 displacement %d overflows int32 "+
+				"(vDSO 0x%x, trampoline 0x%x are too far apart; try hint-based mmap)",
+				hook.name, disp, hook.vdsoAddr, target)
+		}
+
+		// Save the original 5 bytes at the vDSO entry for future uninstall.
+		var orig [5]byte
+		if _, err := procmem.ReadMem(pid, hook.vdsoAddr, orig[:]); err != nil {
+			return nil, fmt.Errorf("inject: %s: save original vDSO bytes: %w", hook.name, err)
+		}
+
+		// Overwrite the vDSO entry with our JMP.
+		var jmp [5]byte
+		jmp[0] = 0xE9
+		binary.LittleEndian.PutUint32(jmp[1:], uint32(int32(disp)))
+		if err := tr.PokeText(hook.vdsoAddr, jmp[:]); err != nil {
+			return nil, fmt.Errorf("inject: %s: PokeText JMP: %w", hook.name, err)
+		}
+
+		patched[i] = patchedHook{addr: hook.vdsoAddr, orig: orig}
 	}
 
 	return &Handle{
 		PID:       pid,
 		StateAddr: newPage + uintptr(trampoline.StateOffset),
-		origBytes: orig,
+		patched:   patched,
 	}, nil
 }
 
