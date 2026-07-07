@@ -59,23 +59,23 @@ them consistently.
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  Target process address space                                           │
 │                                                                         │
-│  [vdso]   0x7fff....a40  ← clock_gettime entry point   ─┐                │
-│  [vdso]   0x7fff....7a0  ← gettimeofday entry point    ─┼─┐              │
-│  [vdso]   0x7fff....a10  ← time entry point            ─┼─┼─┐            │
+│  [vdso]   0x7fff....a40  ← clock_gettime entry point   ─┐               │
+│  [vdso]   0x7fff....7a0  ← gettimeofday entry point    ─┼─┐             │
+│  [vdso]   0x7fff....a10  ← time entry point            ─┼─┼─┐           │
 │    │  Before: original vDSO code                        │ │ │           │
 │    │  After:  E9 xx xx xx xx  ← JMP rel32, one per entry│ │ │           │
 │    └───────────────────────────────────────────────────▼─▼─▼            │
 │                                                                         │
 │  [anon rwx page, allocated by the target itself via mmap]               │
 │    ├─ clock_gettime stub  (offset 0)                                    │
-│    │    intercepts clk_id ∈ {CLOCK_REALTIME, CLOCK_REALTIME_COARSE};     │
+│    │    intercepts clk_id ∈ {CLOCK_REALTIME, CLOCK_REALTIME_COARSE};    │
 │    │    real syscall → add offsetSec/offsetNsec → normalise tv_nsec     │
 │    ├─ gettimeofday stub   (offset 141)                                  │
 │    │    same shape, tv_usec instead of tv_nsec (offsetNsec / 1000)      │
-│    ├─ time stub           (offset 306)                                 │
+│    ├─ time stub           (offset 306)                                  │
 │    │    real clock_gettime(CLOCK_REALTIME) internally (not the time()   │
-│    │    syscall, which discards the real fractional second before this │
-│    │    stub would ever see it) → same normalised add → return tv_sec  │
+│    │    syscall, which discards the real fractional second before this  │
+│    │    stub would ever see it) → same normalised add → return tv_sec   │
 │    └─ shared state struct (32 bytes, at StateOffset = 436)              │
 │         +0   int64  offsetSec                                           │
 │         +8   int64  offsetNsec                                          │
