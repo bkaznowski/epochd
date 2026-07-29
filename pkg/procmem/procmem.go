@@ -236,14 +236,28 @@ func (t *Tracer) SetOptionsPID(pid, opts int) error {
 // WaitAnyNonBlocking checks for a stop event from any traced child without
 // blocking. Returns pid=0 if no events are pending, or syscall.ECHILD if
 // there are no traced children.
+//
+// Uses WNOTHREAD to restrict reaping to tracees of this Tracer's own pinned
+// OS thread. Without it, wait4(-1, ...) reaps children across every thread in
+// the calling thread group by default (Linux only skips other threads when
+// __WNOTHREAD is set) — so when a process hosts multiple independent Tracers
+// concurrently (e.g. one ChildTracker per process added to a faketime
+// Session), one Tracer's wait4 can steal a ptrace-stop that actually belongs
+// to a different Tracer's tracee. The stealing Tracer doesn't recognize the
+// pid, its PTRACE_CONT fallback fails silently with ESRCH (ptrace ops are
+// still correctly restricted to the registered tracer thread), and the
+// rightful owner never observes the event again — leaving that tracee
+// permanently ptrace-stopped. This was observed as sessions with many
+// concurrently tracked process trees (e.g. Postgres, Redpanda, and a mix of
+// Go/Python services all under one Session) silently hanging.
 func (t *Tracer) WaitAnyNonBlocking() (int, unix.WaitStatus, error) {
 	var ws unix.WaitStatus
 	var pid int
 	var err error
 	t.run(func() {
-		p, e := unix.Wait4(-1, &ws, unix.WNOHANG, nil)
+		p, e := unix.Wait4(-1, &ws, unix.WNOHANG|unix.WNOTHREAD, nil)
 		if e != nil {
-			err = fmt.Errorf("procmem: wait4(-1, WNOHANG): %w", e)
+			err = fmt.Errorf("procmem: wait4(-1, WNOHANG|WNOTHREAD): %w", e)
 			return
 		}
 		pid = p

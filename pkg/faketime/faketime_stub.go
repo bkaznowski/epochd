@@ -35,6 +35,16 @@ func WithTracking() SessionOption { return func(*Session) {} }
 // process. On non-Linux platforms it is accepted but has no effect.
 func WithTrackingFilter(_ TrackingFilter) SessionOption { return func(*Session) {} }
 
+// FakeTimeFilter decides whether a process being added to a Session should
+// receive fake time at all. On non-Linux platforms it is accepted but never
+// called.
+type FakeTimeFilter func(path string) bool
+
+// WithFakeTimeFilter returns a SessionOption that decides per process whether
+// fake time is injected at all. On non-Linux platforms it is accepted but has
+// no effect.
+func WithFakeTimeFilter(_ FakeTimeFilter) SessionOption { return func(*Session) {} }
+
 func (h *Handle) PID() int                 { return 0 }
 func (h *Handle) IsAlive() bool            { return false }
 func (h *Handle) IsFrozen() bool           { return false }

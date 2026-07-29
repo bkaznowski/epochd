@@ -221,11 +221,35 @@ func WithTrackingFilter(filter TrackingFilter) SessionOption {
 
 // readBinaryPath best-effort reads the resolved executable path of a running
 // process from /proc/<pid>/exe. Used by Session.Attach to feed a
-// TrackingFilter. Returns "" if it could not be read (e.g. the process has
-// already exited).
+// TrackingFilter or FakeTimeFilter. Returns "" if it could not be read (e.g.
+// the process has already exited).
 func readBinaryPath(pid int) string {
 	path, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	return path
+}
+
+// FakeTimeFilter decides, for a single process being added to a Session,
+// whether it should receive fake time at all. path is the resolved
+// executable path — for Session.Start this is cmd.Path; for Session.Attach it
+// is read from /proc/<pid>/exe and may be empty if it could not be read.
+//
+// Returning true injects fake time as usual (still subject to the session's
+// TrackingFilter/WithTracking for whether descendants get auto-tracked).
+// Returning false skips injection entirely: Session.Start just starts cmd
+// normally (no ptrace, real clock, no Handle added) and Session.Attach leaves
+// the already-running process untouched (no Handle added). Either way the
+// process is not under fake-time control and Session.SetTime/Freeze/Reset
+// never touch it.
+type FakeTimeFilter func(path string) bool
+
+// WithFakeTimeFilter restricts which processes added to the session receive
+// fake time at all, on a per-process basis; see FakeTimeFilter's
+// documentation for exact semantics. Without this option, every process
+// added via Start/Attach gets fake time, matching prior behaviour. Checked
+// before TrackingFilter/WithTracking, which only matter for processes this
+// filter accepts.
+func WithFakeTimeFilter(filter FakeTimeFilter) SessionOption {
+	return func(s *Session) { s.fakeTimeFilter = filter }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,12 +270,14 @@ type Session struct {
 	frozen         bool
 	tracking       bool
 	trackingFilter TrackingFilter
+	fakeTimeFilter FakeTimeFilter
 	trackers       []*ChildTracker
 }
 
 // NewSession creates an empty session with the given initial target time.
 // Pass WithTracking() to enable automatic injection into forked/exec'd
-// children for every process, or WithTrackingFilter to decide per process.
+// children for every process, WithTrackingFilter to decide per process, or
+// WithFakeTimeFilter to decide per process whether it gets fake time at all.
 func NewSession(target time.Time, opts ...SessionOption) *Session {
 	s := &Session{offset: time.Until(target)}
 	for _, o := range opts {
@@ -268,20 +294,32 @@ func (s *Session) effectiveTarget() time.Time {
 	return time.Now().Add(s.offset)
 }
 
-// Start starts cmd with fake time and adds the resulting handle to the session.
-// Whether cmd gets automatic fork/exec tracking is decided by the session's
-// TrackingFilter if one was given via WithTrackingFilter, otherwise by the
-// session-wide WithTracking on/off switch.
+// Start starts cmd and adds the resulting handle to the session. Whether cmd
+// gets fake time at all is decided by the session's FakeTimeFilter if one was
+// given via WithFakeTimeFilter; when it does, whether it also gets automatic
+// fork/exec tracking is decided by TrackingFilter if given via
+// WithTrackingFilter, otherwise by the session-wide WithTracking on/off switch.
 func (s *Session) Start(cmd *exec.Cmd) error {
 	s.mu.Lock()
 	target := s.effectiveTarget()
 	frozen := s.frozen
 	tracking := s.tracking
-	filter := s.trackingFilter
+	trackingFilter := s.trackingFilter
+	fakeTimeFilter := s.fakeTimeFilter
 	s.mu.Unlock()
 
-	if filter != nil {
-		tracking = filter(cmd.Path)
+	if fakeTimeFilter != nil && !fakeTimeFilter(cmd.Path) {
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("faketime: Session.Start: %w", err)
+		}
+		s.mu.Lock()
+		s.cmds = append(s.cmds, cmd)
+		s.mu.Unlock()
+		return nil
+	}
+
+	if trackingFilter != nil {
+		tracking = trackingFilter(cmd.Path)
 	}
 
 	if tracking {
@@ -321,21 +359,33 @@ func (s *Session) Start(cmd *exec.Cmd) error {
 }
 
 // Attach attaches to an already-running process and adds it to the session.
-// Whether pid gets automatic fork/exec tracking is decided by the session's
-// TrackingFilter if one was given via WithTrackingFilter (its path is read
-// from /proc/<pid>/exe), otherwise by the session-wide WithTracking on/off
-// switch.
+// Whether pid gets fake time at all is decided by the session's
+// FakeTimeFilter if one was given via WithFakeTimeFilter; when it does,
+// whether it also gets automatic fork/exec tracking is decided by
+// TrackingFilter if given via WithTrackingFilter, otherwise by the
+// session-wide WithTracking on/off switch. Both filters read pid's path from
+// /proc/<pid>/exe.
 // Requires CAP_SYS_PTRACE and ptrace_scope <= 1 when tracking is active.
 func (s *Session) Attach(pid int) error {
 	s.mu.Lock()
 	target := s.effectiveTarget()
 	frozen := s.frozen
 	tracking := s.tracking
-	filter := s.trackingFilter
+	trackingFilter := s.trackingFilter
+	fakeTimeFilter := s.fakeTimeFilter
 	s.mu.Unlock()
 
-	if filter != nil {
-		tracking = filter(readBinaryPath(pid))
+	var path string
+	if trackingFilter != nil || fakeTimeFilter != nil {
+		path = readBinaryPath(pid)
+	}
+
+	if fakeTimeFilter != nil && !fakeTimeFilter(path) {
+		return nil
+	}
+
+	if trackingFilter != nil {
+		tracking = trackingFilter(path)
 	}
 
 	if tracking {
