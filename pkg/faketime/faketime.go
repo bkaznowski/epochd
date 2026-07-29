@@ -8,6 +8,7 @@ package faketime
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -189,8 +190,42 @@ type SessionOption func(*Session)
 // used, Session.Start internally calls StartWithTracking and Session.Close must
 // be called when the session is no longer needed to stop the watch goroutine
 // and detach ptrace.
+//
+// This is a single session-wide on/off switch: every process added via
+// Session.Start/Session.Attach gets tracking. To decide tracking on a
+// per-process basis instead, use WithTrackingFilter.
 func WithTracking() SessionOption {
 	return func(s *Session) { s.tracking = true }
+}
+
+// TrackingFilter decides, for a single process being added to a Session,
+// whether it should be started/attached with automatic child-process
+// tracking (fork/exec descendants auto-injected) or as a plain, untracked
+// handle. path is the resolved executable path — for Session.Start this is
+// cmd.Path; for Session.Attach it is read from /proc/<pid>/exe and may be
+// empty if it could not be read.
+//
+// Returning true makes the session call StartWithTracking/AttachWithTracking
+// for this process. Returning false makes it call the plain Start/Attach:
+// only this one process is faked, its forks and execs are not observed.
+type TrackingFilter func(path string) bool
+
+// WithTrackingFilter makes tracking a per-process decision instead of the
+// single session-wide on/off switch WithTracking provides: filter is
+// consulted on every call to Session.Start and Session.Attach, and its
+// return value decides whether that specific process is started/attached
+// with tracking. Takes precedence over WithTracking if both are given.
+func WithTrackingFilter(filter TrackingFilter) SessionOption {
+	return func(s *Session) { s.trackingFilter = filter }
+}
+
+// readBinaryPath best-effort reads the resolved executable path of a running
+// process from /proc/<pid>/exe. Used by Session.Attach to feed a
+// TrackingFilter. Returns "" if it could not be read (e.g. the process has
+// already exited).
+func readBinaryPath(pid int) string {
+	path, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	return path
 }
 
 // ---------------------------------------------------------------------------
@@ -206,15 +241,17 @@ type Session struct {
 	cmds    []*exec.Cmd // commands added via Start; waited on by testing helpers
 	// For advancing mode: effective target = time.Now() + offset.
 	// For frozen mode: effective target = frozenAt (constant).
-	offset   time.Duration
-	frozenAt time.Time
-	frozen   bool
-	tracking bool
-	trackers []*ChildTracker
+	offset         time.Duration
+	frozenAt       time.Time
+	frozen         bool
+	tracking       bool
+	trackingFilter TrackingFilter
+	trackers       []*ChildTracker
 }
 
 // NewSession creates an empty session with the given initial target time.
-// Pass WithTracking() to enable automatic injection into forked/exec'd children.
+// Pass WithTracking() to enable automatic injection into forked/exec'd
+// children for every process, or WithTrackingFilter to decide per process.
 func NewSession(target time.Time, opts ...SessionOption) *Session {
 	s := &Session{offset: time.Until(target)}
 	for _, o := range opts {
@@ -232,14 +269,20 @@ func (s *Session) effectiveTarget() time.Time {
 }
 
 // Start starts cmd with fake time and adds the resulting handle to the session.
-// When the session was created with WithTracking, fork and exec events are
-// automatically tracked and injected.
+// Whether cmd gets automatic fork/exec tracking is decided by the session's
+// TrackingFilter if one was given via WithTrackingFilter, otherwise by the
+// session-wide WithTracking on/off switch.
 func (s *Session) Start(cmd *exec.Cmd) error {
 	s.mu.Lock()
 	target := s.effectiveTarget()
 	frozen := s.frozen
 	tracking := s.tracking
+	filter := s.trackingFilter
 	s.mu.Unlock()
+
+	if filter != nil {
+		tracking = filter(cmd.Path)
+	}
 
 	if tracking {
 		var ct *ChildTracker
@@ -278,15 +321,22 @@ func (s *Session) Start(cmd *exec.Cmd) error {
 }
 
 // Attach attaches to an already-running process and adds it to the session.
-// When the session was created with WithTracking, fork and exec events from the
-// attached process are automatically tracked and injected.
-// Requires CAP_SYS_PTRACE and ptrace_scope <= 1 when WithTracking is active.
+// Whether pid gets automatic fork/exec tracking is decided by the session's
+// TrackingFilter if one was given via WithTrackingFilter (its path is read
+// from /proc/<pid>/exe), otherwise by the session-wide WithTracking on/off
+// switch.
+// Requires CAP_SYS_PTRACE and ptrace_scope <= 1 when tracking is active.
 func (s *Session) Attach(pid int) error {
 	s.mu.Lock()
 	target := s.effectiveTarget()
 	frozen := s.frozen
 	tracking := s.tracking
+	filter := s.trackingFilter
 	s.mu.Unlock()
+
+	if filter != nil {
+		tracking = filter(readBinaryPath(pid))
+	}
 
 	if tracking {
 		var ct *ChildTracker

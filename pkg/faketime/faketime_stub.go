@@ -22,9 +22,18 @@ type Session struct{}
 // SessionOption configures a Session.
 type SessionOption func(*Session)
 
+// TrackingFilter decides whether a process being added to a Session should be
+// started/attached with tracking. On non-Linux platforms it is accepted but
+// never called.
+type TrackingFilter func(path string) bool
+
 // WithTracking returns a SessionOption that enables child-process tracking.
 // On non-Linux platforms it is accepted but has no effect.
 func WithTracking() SessionOption { return func(*Session) {} }
+
+// WithTrackingFilter returns a SessionOption that decides tracking per
+// process. On non-Linux platforms it is accepted but has no effect.
+func WithTrackingFilter(_ TrackingFilter) SessionOption { return func(*Session) {} }
 
 func (h *Handle) PID() int                 { return 0 }
 func (h *Handle) IsAlive() bool            { return false }
