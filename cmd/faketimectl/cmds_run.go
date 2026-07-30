@@ -44,32 +44,35 @@ func cmdRun(args []string) error {
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("run: %v", err)
-	}
-	pid := cmd.Process.Pid
-
+	// cmd.Start() is not called here: the inject.*FollowChild* functions
+	// below start cmd themselves, on the Tracer's own pinned OS thread. The
+	// fork (which performs PTRACE_TRACEME) must happen on that same thread as
+	// the ptrace requests that follow it, or they intermittently fail with
+	// ESRCH depending on Go scheduler behavior.
 	var h *inject.Handle
 	var tr *procmem.Tracer
 
 	if *track {
 		if *freeze {
-			h, tr, err = inject.InjectFrozenFollowChildKeepTracer(pid, target)
+			h, tr, err = inject.InjectFrozenFollowChildKeepTracer(cmd, target)
 		} else {
-			h, tr, err = inject.InjectAtTimeFollowChildKeepTracer(pid, target)
+			h, tr, err = inject.InjectAtTimeFollowChildKeepTracer(cmd, target)
 		}
 	} else {
 		if *freeze {
-			h, err = inject.InjectFrozenFollowChild(pid, target)
+			h, err = inject.InjectFrozenFollowChild(cmd, target)
 		} else {
-			h, err = inject.InjectAtTimeFollowChild(pid, target)
+			h, err = inject.InjectAtTimeFollowChild(cmd, target)
 		}
 	}
 	if err != nil {
-		cmd.Process.Kill() //nolint:errcheck
-		cmd.Wait()         //nolint:errcheck
+		if cmd.Process != nil {
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
+		}
 		return fmt.Errorf("run: inject: %v", err)
 	}
+	pid := cmd.Process.Pid
 
 	mode := "advancing"
 	if *freeze {

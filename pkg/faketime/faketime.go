@@ -71,22 +71,23 @@ func (h *Handle) EffectiveTime() time.Time {
 }
 
 // Start starts cmd with fake time injected from the moment the process begins.
-// It sets cmd.SysProcAttr to enable ptrace, calls cmd.Start(), then uses the
-// FollowChild path to inject before the process executes any user code.
+// It sets cmd.SysProcAttr to enable ptrace, then uses the FollowChild path to
+// start cmd and inject before the process executes any user code.
 // No elevated permissions required. The caller must not call cmd.Start() before
-// calling Start.
+// calling Start: Start calls it, on the same OS thread that drives the ptrace
+// requests injection needs — required for correctness, since PTRACE_TRACEME
+// ties the tracee's tracer to the exact thread that performed the fork.
 func Start(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Ptrace = true
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("faketime: Start: %w", err)
-	}
-	h, err := inject.InjectAtTimeFollowChild(cmd.Process.Pid, target)
+	h, err := inject.InjectAtTimeFollowChild(cmd, target)
 	if err != nil {
-		cmd.Process.Kill() //nolint:errcheck
-		cmd.Wait()         //nolint:errcheck
+		if cmd.Process != nil {
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
+		}
 		return nil, fmt.Errorf("faketime: inject: %w", err)
 	}
 	return newAdvancingHandle(h, target), nil
@@ -94,19 +95,19 @@ func Start(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 
 // StartFrozen starts cmd with the clock frozen at target. Unlike Start, the
 // process sees the same timestamp on every call to clock_gettime until
-// SetTime or Freeze is called.
+// SetTime or Freeze is called. The caller must not call cmd.Start() before
+// calling StartFrozen; see Start's doc comment for why.
 func StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Ptrace = true
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("faketime: StartFrozen: %w", err)
-	}
-	h, err := inject.InjectFrozenFollowChild(cmd.Process.Pid, target)
+	h, err := inject.InjectFrozenFollowChild(cmd, target)
 	if err != nil {
-		cmd.Process.Kill() //nolint:errcheck
-		cmd.Wait()         //nolint:errcheck
+		if cmd.Process != nil {
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
+		}
 		return nil, fmt.Errorf("faketime: inject frozen: %w", err)
 	}
 	return newFrozenHandle(h, target), nil
@@ -532,6 +533,7 @@ type ChildTracker struct {
 	mu          sync.Mutex
 	tracer      *procmem.Tracer
 	parentPID   int
+	parentGone  bool            // set once the parent's exit has been observed
 	children    map[int]*Handle // childPID → Handle
 	pendingStop map[int]bool    // children waiting for their initial ptrace stop
 	done        chan struct{}
@@ -682,19 +684,20 @@ func AttachFrozenWithTracking(pid int, target time.Time) (*ChildTracker, error) 
 
 // StartWithTracking starts cmd with advancing fake time and returns a
 // ChildTracker that automatically injects fake time into any processes spawned
-// via fork or vfork. No elevated permissions required.
+// via fork or vfork. No elevated permissions required. The caller must not
+// call cmd.Start() before calling StartWithTracking; see Start's doc comment
+// for why.
 func StartWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Ptrace = true
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("faketime: StartWithTracking: %w", err)
-	}
-	ih, tr, err := inject.InjectAtTimeFollowChildKeepTracer(cmd.Process.Pid, target)
+	ih, tr, err := inject.InjectAtTimeFollowChildKeepTracer(cmd, target)
 	if err != nil {
-		cmd.Process.Kill() //nolint:errcheck
-		cmd.Wait()         //nolint:errcheck
+		if cmd.Process != nil {
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
+		}
 		return nil, fmt.Errorf("faketime: StartWithTracking: %w", err)
 	}
 	return newChildTracker(newAdvancingHandle(ih, target), tr, cmd.Process.Pid), nil
@@ -702,19 +705,19 @@ func StartWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error) {
 
 // StartFrozenWithTracking starts cmd with the clock frozen at target and
 // returns a ChildTracker that automatically injects fake time into any
-// processes spawned via fork or vfork.
+// processes spawned via fork or vfork. The caller must not call cmd.Start()
+// before calling StartFrozenWithTracking; see Start's doc comment for why.
 func StartFrozenWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Ptrace = true
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("faketime: StartFrozenWithTracking: %w", err)
-	}
-	ih, tr, err := inject.InjectFrozenFollowChildKeepTracer(cmd.Process.Pid, target)
+	ih, tr, err := inject.InjectFrozenFollowChildKeepTracer(cmd, target)
 	if err != nil {
-		cmd.Process.Kill() //nolint:errcheck
-		cmd.Wait()         //nolint:errcheck
+		if cmd.Process != nil {
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
+		}
 		return nil, fmt.Errorf("faketime: StartFrozenWithTracking: %w", err)
 	}
 	return newChildTracker(newFrozenHandle(ih, target), tr, cmd.Process.Pid), nil
@@ -734,6 +737,22 @@ func newChildTracker(h *Handle, tr *procmem.Tracer, parentPID int) *ChildTracker
 	return ct
 }
 
+// trackedPIDs returns a snapshot of every pid this tracker is currently
+// responsible for observing: the parent (unless its exit has already been
+// observed) plus every child discovered so far.
+func (c *ChildTracker) trackedPIDs() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	pids := make([]int, 0, 1+len(c.children))
+	if !c.parentGone {
+		pids = append(pids, c.parentPID)
+	}
+	for pid := range c.children {
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
 func (c *ChildTracker) watchLoop() {
 	defer c.wg.Done()
 	defer c.cleanup()
@@ -745,23 +764,55 @@ func (c *ChildTracker) watchLoop() {
 		default:
 		}
 
-		pid, ws, err := c.tracer.WaitAnyNonBlocking()
-		if err != nil {
-			// ECHILD means no more traced children — normal exit when parent dies.
-			if !errors.Is(err, syscall.ECHILD) {
+		pids := c.trackedPIDs()
+		if len(pids) == 0 {
+			// Parent and every discovered child have exited — nothing left
+			// to observe.
+			return
+		}
+
+		// Poll each tracked pid individually (WaitPIDNonBlocking) instead of
+		// a single wildcard wait4(-1, ...) (WaitAnyNonBlocking). A session
+		// with WithTracking creates one ChildTracker — and one dedicated
+		// tracer OS thread — per process, all forked by the same caller
+		// goroutine rather than by each tracker's own thread. WNOTHREAD only
+		// restricts a -1 wait to children of the calling thread specifically,
+		// which none of these tracees are, so it does not actually prevent
+		// one tracker's wildcard wait from observing (and consuming, via
+		// ContPID/SetOptionsPID) a wait-status transition that belongs to a
+		// completely different tracker's tracee — corrupting both: the
+		// rightful tracker misses the event it was waiting for, and the
+		// tracee gets resumed by code that knows nothing about it. An
+		// exact-pid wait cannot have this ambiguity: every ptrace event this
+		// tracker cares about always arrives on a pid already in this set —
+		// the parent, an already-known child, or (via a fork event's
+		// GetEventMsgPID, itself delivered on an already-known pid) a child
+		// just added to it — so there is no need for a wildcard wait at all.
+		found := false
+		for _, pid := range pids {
+			ws, ok, err := c.tracer.WaitPIDNonBlocking(pid)
+			if err != nil {
+				if errors.Is(err, syscall.ECHILD) {
+					// Already reaped by a previous iteration; the next
+					// trackedPIDs() snapshot will drop it.
+					continue
+				}
 				c.mu.Lock()
 				c.loopErr = err
 				c.mu.Unlock()
+				continue
 			}
-			return
-		}
-		if pid == 0 {
-			// No events pending — avoid busy-spinning.
-			time.Sleep(5 * time.Millisecond)
-			continue
+			if !ok {
+				continue
+			}
+			found = true
+			c.handleEvent(pid, ws)
 		}
 
-		c.handleEvent(pid, ws)
+		if !found {
+			// No events pending on any tracked pid — avoid busy-spinning.
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
 }
 
@@ -774,6 +825,7 @@ func (c *ChildTracker) handleEvent(pid int, ws unix.WaitStatus) {
 		if pid == c.parentPID {
 			// Parent exited — no more fork events to expect.
 			c.mu.Lock()
+			c.parentGone = true
 			if c.loopErr == nil {
 				c.loopErr = fmt.Errorf("faketime: parent process %d exited unexpectedly", pid)
 			}

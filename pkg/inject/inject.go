@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -54,38 +55,41 @@ func InjectFrozen(pid int, target time.Time) (*Handle, error) {
 	return injectCore(pid, sec, nsec, trampoline.MaskFrozen)
 }
 
-// InjectAtTimeFollowChild injects the trampoline into a child process that was
-// started with SysProcAttr{Ptrace: true}. The child called PTRACE_TRACEME
-// before exec and is stopped on its initial SIGTRAP; this function collects
-// that stop without issuing PTRACE_ATTACH. No elevated permissions required.
-func InjectAtTimeFollowChild(pid int, target time.Time) (*Handle, error) {
+// InjectAtTimeFollowChild starts cmd (which must have SysProcAttr.Ptrace set)
+// and injects the trampoline into it. The caller must not call cmd.Start()
+// itself: cmd is started on the Tracer's own pinned OS thread so that the
+// PTRACE_TRACEME relationship established by the fork, and every ptrace
+// request this function goes on to issue, come from the same thread — see
+// procmem.Tracer's doc comment for why that's required for correctness, not
+// just style. No elevated permissions required.
+func InjectAtTimeFollowChild(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 	sec, nsec := diffSecNsec(target, time.Now())
-	return injectFollowChild(pid, sec, nsec, trampoline.MaskEnabled)
+	return injectFollowChild(cmd, sec, nsec, trampoline.MaskEnabled)
 }
 
 // InjectFrozenFollowChild is like InjectAtTimeFollowChild but starts the clock
 // in freeze mode so time never advances.
-func InjectFrozenFollowChild(pid int, target time.Time) (*Handle, error) {
+func InjectFrozenFollowChild(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 	sec := target.Unix()
 	nsec := int64(target.Nanosecond())
-	return injectFollowChild(pid, sec, nsec, trampoline.MaskFrozen)
+	return injectFollowChild(cmd, sec, nsec, trampoline.MaskFrozen)
 }
 
 // InjectAtTimeFollowChildKeepTracer is like InjectAtTimeFollowChild but keeps
 // ptrace active on the parent with PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK set
 // and resumes the parent before returning. The caller owns the Tracer and must
 // drive the event loop, calling tr.InterruptDetach() when done.
-func InjectAtTimeFollowChildKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer, error) {
+func InjectAtTimeFollowChildKeepTracer(cmd *exec.Cmd, target time.Time) (*Handle, *procmem.Tracer, error) {
 	sec, nsec := diffSecNsec(target, time.Now())
-	return injectFollowChildKeepTracer(pid, sec, nsec, trampoline.MaskEnabled)
+	return injectFollowChildKeepTracer(cmd, sec, nsec, trampoline.MaskEnabled)
 }
 
 // InjectFrozenFollowChildKeepTracer is like InjectFrozenFollowChild but keeps
 // ptrace active on the parent with PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK set.
-func InjectFrozenFollowChildKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer, error) {
+func InjectFrozenFollowChildKeepTracer(cmd *exec.Cmd, target time.Time) (*Handle, *procmem.Tracer, error) {
 	sec := target.Unix()
 	nsec := int64(target.Nanosecond())
-	return injectFollowChildKeepTracer(pid, sec, nsec, trampoline.MaskFrozen)
+	return injectFollowChildKeepTracer(cmd, sec, nsec, trampoline.MaskFrozen)
 }
 
 // InjectAtTimeKeepTracer attaches to an already-running process, injects the
@@ -140,10 +144,11 @@ func injectCoreKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle, *proc
 	return h, tr, nil
 }
 
-func injectFollowChildKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle, *procmem.Tracer, error) {
+func injectFollowChildKeepTracer(cmd *exec.Cmd, sec, nsec int64, mask uint64) (*Handle, *procmem.Tracer, error) {
 	tr := procmem.NewTracer()
-	if err := tr.FollowChild(pid); err != nil {
-		return nil, nil, fmt.Errorf("inject: FollowChild pid %d: %w", pid, err)
+	pid, err := tr.StartAndFollowChild(cmd)
+	if err != nil {
+		return nil, nil, fmt.Errorf("inject: StartAndFollowChild: %w", err)
 	}
 	info, err := vdso.Locate(pid)
 	if err != nil {
@@ -229,14 +234,15 @@ func (h *Handle) Freeze(target time.Time) error {
 }
 
 // injectFollowChild is the FollowChild variant of the core inject path.
-func injectFollowChild(pid int, sec, nsec int64, mask uint64) (*Handle, error) {
+func injectFollowChild(cmd *exec.Cmd, sec, nsec int64, mask uint64) (*Handle, error) {
 	tr := procmem.NewTracer()
 	// Wait for the child's exec-entry SIGTRAP before reading maps. There is a
 	// race between cmd.Start() returning and the child completing execve; reading
 	// /proc/<pid>/maps before the exec-stop may catch the address space mid-
 	// replacement, where [vdso] is not yet visible.
-	if err := tr.FollowChild(pid); err != nil {
-		return nil, fmt.Errorf("inject: FollowChild pid %d: %w", pid, err)
+	pid, err := tr.StartAndFollowChild(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("inject: StartAndFollowChild: %w", err)
 	}
 	info, err := vdso.Locate(pid)
 	if err != nil {

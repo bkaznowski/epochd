@@ -10,10 +10,11 @@ import (
 	"time"
 )
 
-// spawnHelperFresh launches the test binary with Ptrace: true but does NOT call
-// FollowChild. The returned PID is ready for InjectAtTimeFollowChild and similar
-// functions that handle FollowChild internally.
-func spawnHelperFresh(t *testing.T) int {
+// spawnHelperFresh builds an *exec.Cmd for the test binary with Ptrace: true,
+// but does NOT start it. The Inject*FollowChild* functions under test start
+// cmd themselves, on their Tracer's own pinned OS thread — the caller must
+// not call cmd.Start() first.
+func spawnHelperFresh(t *testing.T) *exec.Cmd {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
@@ -22,24 +23,27 @@ func spawnHelperFresh(t *testing.T) int {
 	cmd := exec.Command(exe, "-test.run=TestInjectHelperBlock", "-test.v")
 	cmd.Env = append(os.Environ(), helperEnv+"=1")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("cmd.Start: %v", err)
-	}
-	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
-	return cmd.Process.Pid
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
+		}
+	})
+	return cmd
 }
 
 func TestInjectAtTimeFollowChild(t *testing.T) {
 	if os.Getenv("EPOCHD_INJECT_E2E") == "" {
 		t.Skip("set EPOCHD_INJECT_E2E=1 to run (Go runtime can consume ptrace exec-stop in CI)")
 	}
-	pid := spawnHelperFresh(t)
+	cmd := spawnHelperFresh(t)
 	target := time.Now().Add(24 * time.Hour)
 
-	h, err := InjectAtTimeFollowChild(pid, target)
+	h, err := InjectAtTimeFollowChild(cmd, target)
 	if err != nil {
 		t.Fatalf("InjectAtTimeFollowChild: %v", err)
 	}
+	pid := cmd.Process.Pid
 	if h.PID != pid {
 		t.Errorf("Handle.PID = %d, want %d", h.PID, pid)
 	}
@@ -68,13 +72,14 @@ func TestInjectFrozenFollowChild(t *testing.T) {
 	if os.Getenv("EPOCHD_INJECT_E2E") == "" {
 		t.Skip("set EPOCHD_INJECT_E2E=1 to run (Go runtime can consume ptrace exec-stop in CI)")
 	}
-	pid := spawnHelperFresh(t)
+	cmd := spawnHelperFresh(t)
 	target := time.Now().Add(24 * time.Hour)
 
-	h, err := InjectFrozenFollowChild(pid, target)
+	h, err := InjectFrozenFollowChild(cmd, target)
 	if err != nil {
 		t.Fatalf("InjectFrozenFollowChild: %v", err)
 	}
+	pid := cmd.Process.Pid
 	if h.PID != pid {
 		t.Errorf("Handle.PID = %d, want %d", h.PID, pid)
 	}
@@ -92,10 +97,10 @@ func TestInjectAtTimeFollowChildKeepTracer(t *testing.T) {
 	if os.Getenv("EPOCHD_INJECT_E2E") == "" {
 		t.Skip("set EPOCHD_INJECT_E2E=1 to run (Go runtime can consume ptrace exec-stop in CI)")
 	}
-	pid := spawnHelperFresh(t)
+	cmd := spawnHelperFresh(t)
 	target := time.Now().Add(24 * time.Hour)
 
-	h, tr, err := InjectAtTimeFollowChildKeepTracer(pid, target)
+	h, tr, err := InjectAtTimeFollowChildKeepTracer(cmd, target)
 	if err != nil {
 		t.Fatalf("InjectAtTimeFollowChildKeepTracer: %v", err)
 	}
@@ -108,7 +113,7 @@ func TestInjectAtTimeFollowChildKeepTracer(t *testing.T) {
 	defer tr.Detach() //nolint:errcheck
 
 	// ChildHandle should share the same StateAddr as the parent handle.
-	fakePID := pid + 1000
+	fakePID := cmd.Process.Pid + 1000
 	ch := ChildHandle(h, fakePID)
 	if ch.PID != fakePID {
 		t.Errorf("ChildHandle.PID = %d, want %d", ch.PID, fakePID)
@@ -122,10 +127,10 @@ func TestInjectFrozenFollowChildKeepTracer(t *testing.T) {
 	if os.Getenv("EPOCHD_INJECT_E2E") == "" {
 		t.Skip("set EPOCHD_INJECT_E2E=1 to run (Go runtime can consume ptrace exec-stop in CI)")
 	}
-	pid := spawnHelperFresh(t)
+	cmd := spawnHelperFresh(t)
 	target := time.Now().Add(24 * time.Hour)
 
-	h, tr, err := InjectFrozenFollowChildKeepTracer(pid, target)
+	h, tr, err := InjectFrozenFollowChildKeepTracer(cmd, target)
 	if err != nil {
 		t.Fatalf("InjectFrozenFollowChildKeepTracer: %v", err)
 	}

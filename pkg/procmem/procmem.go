@@ -6,6 +6,7 @@ package procmem
 import (
 	"errors"
 	"fmt"
+	"os/exec"
 	"runtime"
 
 	"golang.org/x/sys/unix"
@@ -15,6 +16,17 @@ import (
 // dedicated goroutine that calls runtime.LockOSThread at startup and never
 // releases it, satisfying the Linux kernel requirement that every ptrace call for
 // a given tracee come from the same OS thread that issued PTRACE_ATTACH.
+//
+// This requirement is exact-thread, not just same-thread-group: PTRACE_TRACEME
+// records the tracee's tracer as the specific task that was its parent at the
+// moment TRACEME ran, i.e. whichever OS thread performed the fork. A wait4 for
+// that tracee's initial stop succeeds from any thread in the process (TRACEME
+// leaves the tracee's real parent and ptrace-parent identical, so ordinary
+// thread-group-wide wait eligibility applies) — but a subsequent ptrace
+// request such as PTRACE_GETREGS does not: it is checked against that exact
+// task, and fails with ESRCH from any other thread, even one in the same
+// process. So the fork itself must happen on this Tracer's pinned thread too;
+// see StartAndFollowChild.
 type Tracer struct {
 	ch  chan func()
 	pid int
@@ -41,30 +53,66 @@ func (t *Tracer) run(fn func()) {
 	<-done
 }
 
+// followChildLocked waits for pid's initial post-execve ptrace stop and
+// records it as this Tracer's tracee. Must be called from the pinned thread
+// (i.e. from within run) — see StartAndFollowChild and FollowChild.
+func (t *Tracer) followChildLocked(pid int) error {
+	var ws unix.WaitStatus
+	if _, e := unix.Wait4(pid, &ws, 0, nil); e != nil {
+		return fmt.Errorf("procmem: wait for ptrace child %d: %w", pid, e)
+	}
+	if !ws.Stopped() {
+		if ws.Exited() {
+			return fmt.Errorf("procmem: ptrace child %d exited (code %d) before stopping; check exec permissions and ptrace_scope", pid, ws.ExitStatus())
+		}
+		return fmt.Errorf("procmem: ptrace child %d did not stop as expected (status 0x%08x)", pid, uint32(ws))
+	}
+	t.pid = pid
+	return nil
+}
+
 // FollowChild sets up the Tracer for a child that was started with
 // SysProcAttr{Ptrace: true}. The child calls PTRACE_TRACEME before exec and
 // then stops on SIGTRAP; this method collects that stop without issuing
 // PTRACE_ATTACH. Use this in tests and any context where you own the child
 // process. Use Attach for attaching to an already-running process.
+//
+// The caller must have started pid from this same Tracer's pinned thread —
+// via StartAndFollowChild — not via a plain cmd.Start() on some other
+// goroutine. See the Tracer doc comment for why: a wait4 for the initial stop
+// works from any thread, but this Tracer's later ptrace requests (GetRegs,
+// PokeText, ...) require the fork to have happened on its own pinned thread.
 func (t *Tracer) FollowChild(pid int) error {
 	var err error
-	t.run(func() {
-		var ws unix.WaitStatus
-		if _, e := unix.Wait4(pid, &ws, 0, nil); e != nil {
-			err = fmt.Errorf("procmem: wait for ptrace child %d: %w", pid, e)
-			return
-		}
-		if !ws.Stopped() {
-			if ws.Exited() {
-				err = fmt.Errorf("procmem: ptrace child %d exited (code %d) before stopping; check exec permissions and ptrace_scope", pid, ws.ExitStatus())
-			} else {
-				err = fmt.Errorf("procmem: ptrace child %d did not stop as expected (status 0x%08x)", pid, uint32(ws))
-			}
-			return
-		}
-		t.pid = pid
-	})
+	t.run(func() { err = t.followChildLocked(pid) })
 	return err
+}
+
+// StartAndFollowChild starts cmd (which must already have SysProcAttr.Ptrace
+// set) and waits for its initial post-execve ptrace stop, all on this
+// Tracer's own pinned OS thread. The caller must not call cmd.Start() itself.
+//
+// This is the correct way to start a traced child: PTRACE_TRACEME ties the
+// tracee's tracer to the exact thread that performed the fork, and every
+// subsequent ptrace request this Tracer issues (GetRegs, PokeText, Cont, ...)
+// must come from that same thread. Calling cmd.Start() separately, on
+// whatever thread the caller's goroutine happens to be scheduled on, and only
+// later creating a Tracer to follow the result, binds the fork to a different
+// thread than the one that will drive those later requests — a mismatch that
+// intermittently (not always) makes them fail with ESRCH, since it depends on
+// whether the Go scheduler happens to reuse the same underlying OS thread.
+func (t *Tracer) StartAndFollowChild(cmd *exec.Cmd) (int, error) {
+	var pid int
+	var err error
+	t.run(func() {
+		if startErr := cmd.Start(); startErr != nil {
+			err = startErr
+			return
+		}
+		pid = cmd.Process.Pid
+		err = t.followChildLocked(pid)
+	})
+	return pid, err
 }
 
 // Attach calls PTRACE_ATTACH and waits for the tracee to stop.
@@ -263,6 +311,34 @@ func (t *Tracer) WaitAnyNonBlocking() (int, unix.WaitStatus, error) {
 		pid = p
 	})
 	return pid, ws, err
+}
+
+// WaitPIDNonBlocking checks for a stop or exit event on one specific,
+// already-known pid without blocking. ok is false if no event is pending for
+// pid right now.
+//
+// Unlike WaitAnyNonBlocking, this can never observe an event belonging to a
+// different pid, so it carries none of that method's cross-Tracer hazard: it
+// is safe to call concurrently from many independent Tracers (e.g. one
+// ChildTracker per process in a faketime Session using WithTracking, all
+// forked by the same caller and so all real children of the same thread) even
+// though WNOTHREAD only restricts wait4(-1, ...) to children of the calling
+// thread specifically, not children of the calling thread's whole process —
+// an exact-pid wait has no such ambiguity to exploit, because the kernel can
+// only ever report status for the pid actually asked for.
+func (t *Tracer) WaitPIDNonBlocking(pid int) (unix.WaitStatus, bool, error) {
+	var ws unix.WaitStatus
+	var ok bool
+	var err error
+	t.run(func() {
+		p, e := unix.Wait4(pid, &ws, unix.WNOHANG, nil)
+		if e != nil {
+			err = fmt.Errorf("procmem: wait4(%d, WNOHANG): %w", pid, e)
+			return
+		}
+		ok = p == pid
+	})
+	return ws, ok, err
 }
 
 // GetEventMsgPID retrieves the ptrace event message from an arbitrary

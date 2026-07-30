@@ -45,17 +45,17 @@ func TestInjectRoundTrip(t *testing.T) {
 	cmd.Env = append(os.Environ(), helperEnv+"=2")
 	cmd.Stdout = pw
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("cmd.Start: %v", err)
+
+	tr := procmem.NewTracer()
+	pid, err := tr.StartAndFollowChild(cmd)
+	if err != nil {
+		t.Fatalf("StartAndFollowChild: %v", err)
 	}
 	pw.Close()
-	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
-
-	pid := cmd.Process.Pid
-	tr := procmem.NewTracer()
-	if err := tr.FollowChild(pid); err != nil {
-		t.Fatalf("FollowChild: %v", err)
-	}
+	t.Cleanup(func() {
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+	})
 
 	info, err := vdso.Locate(pid)
 	if err != nil {

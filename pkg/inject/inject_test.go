@@ -53,6 +53,15 @@ func TestInjectHelperClock(t *testing.T) {
 // startPtraceChild spawns the test binary as a ptrace tracee using the given
 // helper env value, waits for the initial SIGTRAP, and returns the Tracer and
 // pid. The caller is responsible for Detach and Kill via t.Cleanup.
+//
+// cmd.Start() is driven through tr.StartAndFollowChild rather than called
+// directly: PTRACE_TRACEME ties the tracee's tracer to the exact OS thread
+// that performed the fork, and every later ptrace request this Tracer issues
+// must come from that same thread. Starting cmd separately, on whatever
+// thread the calling goroutine happens to run on, and only afterward handing
+// the pid to a Tracer's FollowChild binds the fork to a different thread —
+// which intermittently (not always, depending on Go scheduler behavior)
+// makes those later requests fail with ESRCH.
 func startPtraceChild(t *testing.T, helperVal string, extraArgs ...string) (*procmem.Tracer, int) {
 	t.Helper()
 	exe, err := os.Executable()
@@ -63,18 +72,21 @@ func startPtraceChild(t *testing.T, helperVal string, extraArgs ...string) (*pro
 	cmd := exec.Command(exe, args...)
 	cmd.Env = append(os.Environ(), helperEnv+"="+helperVal)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("cmd.Start: %v", err)
-	}
-	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
 
 	tr := procmem.NewTracer()
-	if err := tr.FollowChild(cmd.Process.Pid); err != nil {
-		t.Fatalf("FollowChild: %v", err)
+	pid, err := tr.StartAndFollowChild(cmd)
+	if err != nil {
+		t.Fatalf("StartAndFollowChild: %v", err)
 	}
-	t.Cleanup(func() { tr.Detach() })
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
+		}
+	})
+	t.Cleanup(func() { tr.Detach() }) //nolint:errcheck
 
-	return tr, cmd.Process.Pid
+	return tr, pid
 }
 
 // ---------------------------------------------------------------------------
