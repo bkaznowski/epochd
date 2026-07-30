@@ -67,6 +67,7 @@ func (s *Session) Reset() error                           { return errNotSupport
 func (s *Session) Close() error                           { return errNotSupported }
 func (s *Session) Prune() int                             { return 0 }
 func (s *Session) IsFrozen() bool                         { return false }
+func (s *Session) EffectiveTime() time.Time               { return time.Time{} }
 func (s *Session) PIDs() []int                            { return nil }
 func (s *Session) Len() int                               { return 0 }
 

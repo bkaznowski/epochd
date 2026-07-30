@@ -469,6 +469,16 @@ func (s *Session) IsFrozen() bool {
 	return s.frozen
 }
 
+// EffectiveTime returns the fake time the session's tracked processes
+// currently see: for advancing mode this is time.Now() plus the session's
+// offset; for frozen mode it is the pinned instant. This is also the target
+// new processes are injected at via Start/Attach.
+func (s *Session) EffectiveTime() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.effectiveTarget()
+}
+
 // Len returns the number of handles currently in the session.
 func (s *Session) Len() int {
 	s.mu.Lock()
