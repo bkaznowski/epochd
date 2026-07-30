@@ -852,16 +852,33 @@ func (c *ChildTracker) handleEvent(pid int, ws unix.WaitStatus) {
 		}
 		childPID := int(childPIDMsg) //nolint:gosec — PID fits in int on all supported arches
 
-		// The child inherits the trampoline via fork — build a Handle for it.
-		c.Handle.mu.Lock()
-		childIH := inject.ChildHandle(c.Handle.h, childPID)
-		var childH *Handle
-		if c.Handle.frozen {
-			childH = newFrozenHandle(childIH, c.Handle.frozenAt)
-		} else {
-			childH = newAdvancingHandle(childIH, c.Handle.effectiveTime())
+		// The child inherits the trampoline via fork — build a Handle for it,
+		// based on the Handle of whichever process actually just forked (pid),
+		// not unconditionally the top-level parent's. Forking preserves the
+		// FORKING process's own current address space, which only matches the
+		// top-level parent's original one if pid is that parent or a
+		// descendant that has never exec'd — once anything in the chain execs,
+		// handleExec re-injects a fresh trampoline at a new address recorded on
+		// that process's own Handle, and any later fork from it must build its
+		// child's Handle from that current one instead.
+		parentH := c.Handle
+		if pid != c.parentPID {
+			c.mu.Lock()
+			if h, ok := c.children[pid]; ok {
+				parentH = h
+			}
+			c.mu.Unlock()
 		}
-		c.Handle.mu.Unlock()
+
+		parentH.mu.Lock()
+		childIH := inject.ChildHandle(parentH.h, childPID)
+		var childH *Handle
+		if parentH.frozen {
+			childH = newFrozenHandle(childIH, parentH.frozenAt)
+		} else {
+			childH = newAdvancingHandle(childIH, parentH.effectiveTime())
+		}
+		parentH.mu.Unlock()
 
 		c.mu.Lock()
 		c.children[childPID] = childH
