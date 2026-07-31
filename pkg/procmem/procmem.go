@@ -298,12 +298,18 @@ func (t *Tracer) SetOptionsPID(pid, opts int) error {
 // permanently ptrace-stopped. This was observed as sessions with many
 // concurrently tracked process trees (e.g. Postgres, Redpanda, and a mix of
 // Go/Python services all under one Session) silently hanging.
+//
+// Also passes WUNTRACED, WCONTINUED, and WALL/__WALL: heavily multi-threaded
+// tracees (e.g. Redpanda's Seastar reactor, one thread per shard) rely on
+// wait4 reporting stop/continue transitions for clone-created threads, not
+// just SIGCHLD-signaling children — the default filtering otherwise applied
+// to non-ptrace waits.
 func (t *Tracer) WaitAnyNonBlocking() (int, unix.WaitStatus, error) {
 	var ws unix.WaitStatus
 	var pid int
 	var err error
 	t.run(func() {
-		p, e := unix.Wait4(-1, &ws, unix.WNOHANG|unix.WNOTHREAD, nil)
+		p, e := unix.Wait4(-1, &ws, unix.WNOHANG|unix.WNOTHREAD|unix.WUNTRACED|unix.WCONTINUED|unix.WALL, nil)
 		if e != nil {
 			err = fmt.Errorf("procmem: wait4(-1, WNOHANG|WNOTHREAD): %w", e)
 			return
@@ -326,12 +332,16 @@ func (t *Tracer) WaitAnyNonBlocking() (int, unix.WaitStatus, error) {
 // thread specifically, not children of the calling thread's whole process —
 // an exact-pid wait has no such ambiguity to exploit, because the kernel can
 // only ever report status for the pid actually asked for.
+//
+// Also passes WUNTRACED, WCONTINUED, and WALL/__WALL — see WaitAnyNonBlocking
+// for why: pid may be a clone-created thread of a heavily multi-threaded
+// tracee, not just a SIGCHLD-signaling child.
 func (t *Tracer) WaitPIDNonBlocking(pid int) (unix.WaitStatus, bool, error) {
 	var ws unix.WaitStatus
 	var ok bool
 	var err error
 	t.run(func() {
-		p, e := unix.Wait4(pid, &ws, unix.WNOHANG, nil)
+		p, e := unix.Wait4(pid, &ws, unix.WNOHANG|unix.WUNTRACED|unix.WCONTINUED|unix.WALL, nil)
 		if e != nil {
 			err = fmt.Errorf("procmem: wait4(%d, WNOHANG): %w", pid, e)
 			return
