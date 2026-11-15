@@ -559,12 +559,23 @@ tr:last-child td { border-bottom: none; }
   <div class="step">
     <div class="step-num"></div>
     <div class="step-body">
+      <h3>Create the credentials</h3>
+      <p>The agent can change the clock of any process on its node, so neither it nor the controller will start without credentials. Create the Secret before applying the DaemonSet, or the agent pods wait for a volume that does not exist. It holds two tokens: <code>api-token</code>, which your tests present to the controller, and <code>agent-token</code>, which only the controller presents to the agents.</p>
+      <pre><code class="language-bash">kubectl -n epochd create secret generic epochd-auth \
+  --from-literal=api-token="$(openssl rand -hex 32)" \
+  --from-literal=agent-token="$(openssl rand -hex 32)"</code></pre>
+      <p>For local experiments only, both binaries accept <code>--allow-unauthenticated</code>. Never use it where the port is reachable by anything you do not control. See <a href="https://github.com/bkaznowski/epochd/blob/main/deploy/README.md">deploy/README.md</a> for TLS and mutual TLS.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num"></div>
+    <div class="step-body">
       <h3>Apply RBAC, the agent DaemonSet, and the controller Deployment</h3>
       <pre><code class="language-bash">kubectl apply -f https://raw.githubusercontent.com/bkaznowski/epochd/main/deploy/rbac.yaml
 kubectl apply -f https://raw.githubusercontent.com/bkaznowski/epochd/main/deploy/daemonset.yaml
 kubectl apply -f https://raw.githubusercontent.com/bkaznowski/epochd/main/deploy/controller-deployment.yaml</code></pre>
       <p>Or from a local clone:</p>
-      <pre><code class="language-bash">kubectl apply -f deploy/</code></pre>
+      <pre><code class="language-bash">kubectl apply -f deploy/rbac.yaml -f deploy/daemonset.yaml -f deploy/controller-deployment.yaml</code></pre>
     </div>
   </div>
   <div class="step">
@@ -586,7 +597,10 @@ export EPOCHD_URL=http://epochd-controller.epochd.svc
 
 # From outside the cluster (for local development):
 kubectl -n epochd port-forward svc/epochd-controller 8080:80 &amp;
-export EPOCHD_URL=http://localhost:8080</code></pre>
+export EPOCHD_URL=http://localhost:8080
+
+# The token your tests present (and faketimectl, and sdk WithToken):
+export EPOCHD_TOKEN="$(kubectl -n epochd get secret epochd-auth -o jsonpath='{.data.api-token}' | base64 -d)"</code></pre>
     </div>
   </div>
 </div>
@@ -604,6 +618,7 @@ docker push my-registry/epochd-controller:v1</code></pre>
 
 <p>Import the SDK into your e2e test package:</p>
 <pre><code class="language-bash">go get epochd/pkg/sdk</code></pre>
+<p>The controller requires the <code>api-token</code> as a bearer token. Give it to the client with <code>sdk.NewClient(url).WithToken(os.Getenv("EPOCHD_TOKEN"))</code>; the examples below omit it for brevity.</p>
 
 <h3>WithTimeT — the recommended test helper</h3>
 <p><code>WithTimeT</code> creates a timeshift, runs your assertions, then automatically deletes the timeshift via <code>t.Cleanup</code> — even if the test panics. It automatically skips when <code>EPOCHD_URL</code> is not set, so the same test can be run against a local unit test runner and a full cluster.</p>
@@ -715,7 +730,7 @@ for _, c := range status.Containers {
 
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <h2 id="k8s-api">Kubernetes cluster — HTTP API reference</h2>
-<p>The controller exposes a JSON REST API on port 80 (internal ClusterIP). All request and response bodies use <code>Content-Type: application/json</code>.</p>
+<p>The controller exposes a JSON REST API on port 80 (internal ClusterIP). All request and response bodies use <code>Content-Type: application/json</code>. Every endpoint except <code>/healthz</code> and <code>/metrics</code> requires <code>Authorization: Bearer &lt;api-token&gt;</code> and answers <code>401</code> without it.</p>
 
 <div class="endpoint">
   <div class="endpoint-header">
@@ -1196,13 +1211,14 @@ if err := s.Reset(); err != nil { ... }</code></pre>
 <table>
   <thead><tr><th>Method</th><th>Description</th></tr></thead>
   <tbody>
-    <tr><td><code>NewSession(target time.Time, opts ...SessionOption) *Session</code></td><td>Creates an empty session in advancing mode with the given initial target. Pass <code>WithTracking()</code> to enable automatic child-process injection, or <code>WithMode(ModePreload)</code> to use <code>LD_PRELOAD</code> instead of ptrace.</td></tr>
+    <tr><td><code>NewSession(target time.Time, opts ...SessionOption) *Session</code></td><td>Creates an empty session in advancing mode with the given initial target. Pass <code>WithTracking()</code> to enable automatic child-process injection, <code>WithMode(ModePreload)</code> to use <code>LD_PRELOAD</code> instead of ptrace, or <code>WithAutoMode()</code> to choose between them per process.</td></tr>
     <tr><td><code>WithMode(m Mode) SessionOption</code></td><td>Sets the session's default mode. <code>ModeVDSO</code> (default) uses ptrace and a patched vDSO: works on any binary and on running processes, but needs ptrace. <code>ModePreload</code> uses <code>LD_PRELOAD</code>: no ptrace, descendants inherit the clock so tracking does not apply to them, but only for dynamically linked non-Go binaries that <code>s.Start</code> launches; <code>s.Attach</code> returns an error and Go or static binaries are refused. A session can mix both: see <code>WithModeFilter</code> and <code>s.StartMode</code>. Whatever the mode, <code>SetTime</code>/<code>Freeze</code>/<code>Advance</code> apply to every process in the session.</td></tr>
-    <tr><td><code>WithModeFilter(f func(path string) Mode) SessionOption</code></td><td>Decides the mode per process. <code>f</code> is called on every <code>s.Start</code> (with <code>cmd.Path</code>) and <code>s.Attach</code> (with the path from <code>/proc/&lt;pid&gt;/exe</code>), and overrides the <code>WithMode</code> default. Typical use is preload where it works and vDSO where it does not: return <code>ModeVDSO</code> when <code>preload.CheckInterposable(path) != nil</code> (Go or static binary), else <code>ModePreload</code>. That check inspects only the binary itself, so a script that goes on to exec a Go binary should be started with <code>ModeVDSO</code> and <code>WithTracking()</code>. <code>WithTracking</code>/<code>WithTrackingFilter</code> apply only to the processes that end up in <code>ModeVDSO</code>. <code>WithFakeTimeFilter</code> runs first.</td></tr>
-    <tr><td><code>s.StartMode(cmd *exec.Cmd, mode Mode) error</code></td><td>Like <code>s.Start</code> but picks the mode for this one call, overriding both the filter and the default. Precedence: <code>StartMode</code>, then <code>WithModeFilter</code>, then <code>WithMode</code>, then <code>ModeVDSO</code>. An undefined <code>Mode</code> value is an error and starts nothing.</td></tr>
+    <tr><td><code>WithModeFilter(f func(path string) Mode) SessionOption</code></td><td>Decides the mode per process. <code>f</code> is called on every <code>s.Start</code> (with <code>cmd.Path</code>) and <code>s.Attach</code> (with the path from <code>/proc/&lt;pid&gt;/exe</code>), and overrides the <code>WithMode</code> default. It cannot tell <code>s.Start</code> from <code>s.Attach</code>, and a running process can only use <code>ModeVDSO</code>, so a filter that returns <code>ModePreload</code> for a binary you later attach to makes <code>s.Attach</code> fail. For the usual policy (preload where it surely works, vDSO otherwise) use <code>WithAutoMode()</code>; write a filter for any other policy, for example by path. <code>WithTracking</code>/<code>WithTrackingFilter</code> apply only to the processes that end up in <code>ModeVDSO</code>. <code>WithFakeTimeFilter</code> runs first.</td></tr>
+    <tr><td><code>WithAutoMode() SessionOption</code></td><td>Picks the mode per process by what the binary is, so you do not write a filter: <code>s.Start</code> uses <code>ModePreload</code> for a binary that is positively a dynamically linked, non-Go ELF file (checked with <code>preload.CheckStrict</code>), and <code>ModeVDSO</code> for everything else, including shell scripts (which may exec a Go or static binary that preload would leave on real time), setuid/setgid binaries and binaries with file capabilities (the loader ignores <code>LD_PRELOAD</code> for them), and anything it cannot read. <code>s.Attach</code> always uses <code>ModeVDSO</code>, since a running process cannot be given a preload library. Combine with <code>WithTracking()</code> so the processes that get ptrace have their children followed. It replaces <code>WithMode</code> as the default; a <code>WithModeFilter</code> decides before it and <code>s.StartMode</code> before both. One case it cannot see: a dynamic binary that later execs a Go child leaves that child on real time, so start such a tree with <code>s.StartMode(cmd, ModeVDSO)</code>.</td></tr>
+    <tr><td><code>s.StartMode(cmd *exec.Cmd, mode Mode) error</code></td><td>Like <code>s.Start</code> but picks the mode for this one call, overriding both the filter and the default. Precedence: <code>StartMode</code>, then <code>WithModeFilter</code>, then <code>WithAutoMode</code>, then <code>WithMode</code>, then <code>ModeVDSO</code>. An undefined <code>Mode</code> value is an error and starts nothing.</td></tr>
     <tr><td><code>WithTracking() SessionOption</code></td><td>Session option that enables fork/exec tracking. Each process added via <code>s.Start</code> gets a <code>ChildTracker</code>; <code>SetTime</code>/<code>Freeze</code>/<code>Advance</code> also update all tracked descendants. Call <code>s.Close()</code> to stop the watcher goroutines.</td></tr>
     <tr><td><code>s.Start(cmd *exec.Cmd) error</code></td><td>Starts the command and adds its handle to the session. Respects the session's current mode (advancing or frozen).</td></tr>
-    <tr><td><code>s.Attach(pid int) error</code></td><td>Attaches to a running process and adds it to the session. Respects the session's current mode (advancing or frozen). Only <code>ModeVDSO</code> can attach: if the mode resolves to <code>ModePreload</code> (default or filter) it returns an error.</td></tr>
+    <tr><td><code>s.Attach(pid int) error</code></td><td>Attaches to a running process and adds it to the session. Respects the session's current mode (advancing or frozen). Only <code>ModeVDSO</code> can attach: if the mode resolves to <code>ModePreload</code> (default or filter) it returns an error. <code>WithAutoMode</code> always resolves to <code>ModeVDSO</code> here.</td></tr>
     <tr><td><code>s.SetTime(target time.Time) error</code></td><td>Switches all handles to advancing mode and updates the time concurrently. Also propagates to any children tracked via <code>WithTracking()</code>.</td></tr>
     <tr><td><code>s.Freeze(target time.Time) error</code></td><td>Switches all handles to frozen mode at <code>target</code> concurrently.</td></tr>
     <tr><td><code>s.Advance(d time.Duration) error</code></td><td>Shifts all handles by <code>d</code> concurrently, preserving the current mode.</td></tr>
@@ -1294,6 +1310,37 @@ if err := s.Reset(); err != nil { ... }</code></pre>
     )
     // WithSession calls s.Close() automatically on cleanup.
 }</code></pre>
+
+<h4>WithAutoMode example — one clock, the right mechanism per process</h4>
+<p>A test often starts both kinds of program: a database written in C and a service written in Go. <code>WithAutoMode()</code> fakes the first with <code>LD_PRELOAD</code> (no ptrace, children inherit the clock) and the second with ptrace and the vDSO patch, which is the only way to reach a Go binary. One session clock drives both, so <code>s.Advance</code> moves them together.</p>
+<pre><code class="language-go">func TestDatabaseAndService(t *testing.T) {
+    target := time.Now().Add(365 * 24 * time.Hour)
+    s := faketime.NewSession(target,
+        faketime.WithAutoMode(), // dynamic C binary -> preload; anything else -> vDSO
+        faketime.WithTracking(), // follow forks of the processes that end up on vDSO
+    )
+    defer s.Close() // after the processes have exited: also frees the preload state
+
+    // Dynamically linked, non-Go: preload.
+    if err := s.Start(exec.Command("postgres", "-D", dataDir)); err != nil {
+        t.Fatal(err)
+    }
+    // A Go binary: ptrace and the vDSO patch (preload would refuse it).
+    if err := s.Start(exec.Command("./my-go-service")); err != nil {
+        t.Fatal(err)
+    }
+
+    if err := s.Advance(30 * 24 * time.Hour); err != nil { // both move
+        t.Fatal(err)
+    }
+
+    // A process that is already running can only be attached with ptrace,
+    // so Attach uses the vDSO mode whatever the binary is.
+    if err := s.Attach(existingPID); err != nil {
+        t.Fatal(err)
+    }
+}</code></pre>
+<p>Auto mode picks preload only for a binary that is positively a dynamically linked, non-Go ELF file. A shell script, a setuid binary and anything it cannot read go to ptrace, because a script may exec something preload cannot affect. To force one process either way, use <code>s.StartMode(cmd, faketime.ModeVDSO)</code> or <code>faketime.ModePreload</code>.</p>
 
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <h2 id="child-tracking">Fork &amp; exec tracking — ChildTracker</h2>
@@ -1404,6 +1451,8 @@ if err := s.Reset(); err != nil { ... }</code></pre>
 
 <p><code>faketimectl</code> is a command-line tool for managing epochd timeshifts. It has two sets of subcommands: <strong>controller subcommands</strong> that talk to a running epochd controller over HTTP, and <strong>local injection subcommands</strong> that inject directly into a process via ptrace.</p>
 
+<p>Controller subcommands send the token from the <code>EPOCHD_TOKEN</code> environment variable, or read it from the file named by <code>EPOCHD_TOKEN_FILE</code>. There is deliberately no flag for it, so it stays out of the process list and shell history.</p>
+
 <h3>Build</h3>
 <pre><code class="language-bash">GOOS=linux go build -o faketimectl ./cmd/faketimectl</code></pre>
 
@@ -1411,7 +1460,10 @@ if err := s.Reset(); err != nil { ... }</code></pre>
 <pre><code class="language-bash">faketimectl [--url=&lt;controller-url&gt;] &lt;subcommand&gt; [flags]
 
 # The controller URL can also be set via environment variable:
-export EPOCHD_URL=http://localhost:8080</code></pre>
+export EPOCHD_URL=http://localhost:8080
+
+# The token your tests present (and faketimectl, and sdk WithToken):
+export EPOCHD_TOKEN="$(kubectl -n epochd get secret epochd-auth -o jsonpath='{.data.api-token}' | base64 -d)"</code></pre>
 
 <h3>Controller subcommands</h3>
 <p>These subcommands talk to a running epochd controller. Set <code>EPOCHD_URL</code> or pass <code>--url</code> to each command.</p>
