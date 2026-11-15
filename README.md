@@ -174,10 +174,11 @@ epochd/
 | Go 1.26+ | Build and test |
 | Linux x86-64 | Runtime (vDSO hook is arch-specific) |
 | Docker | Run tests in a Linux container when developing on macOS/Windows |
-| nasm | Re-assemble the trampoline (only if editing `trampoline.asm`) |
 
-The pre-assembled `trampoline.bin` is committed to the repo; NASM is only needed if you
-edit the assembly source.
+The compiled `trampoline.bin` (vDSO mode) and `libepochd_preload.so` (preload mode) are
+committed to the repo, so `go build` needs no C toolchain. Docker is only needed to rebuild
+them after editing their C sources (`pkg/trampoline/src/build.sh`,
+`pkg/preload/lib/build.sh`).
 
 ---
 
@@ -378,140 +379,112 @@ echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
 
 ---
 
-## The trampoline assembly
+## The trampoline
 
-### Source: `pkg/trampoline/trampoline.asm`
+### Source: `pkg/trampoline/src/trampoline.c`
 
-The payload is hand-written NASM with the `.asm` extension (not `.s`) to prevent Go's
-plan9 assembler from touching it. It contains three independent entry points — one per
-hooked vDSO function — followed by one shared state struct. `inject.go` JMP-patches each
-vDSO function's real entry point to the corresponding label.
+The payload is freestanding C: no libc, no startup code, no stack protector. It contains
+three independent entry points, one per hooked vDSO function, followed by one shared state
+struct. `inject.go` JMP-patches each vDSO function's real entry point to the corresponding
+`*_entry` symbol. The only assembly is the `syscall` instruction inside two tiny inline
+helpers; register allocation, spilling and the System V calling convention are left to the
+compiler.
 
-The `clock_gettime` stub (see the full file for `gettimeofday_entry` and `time_entry`,
-which follow the same shape with their own calling convention):
+The `clock_gettime` hook (see the file for `gettimeofday_entry` and `time_entry`, which
+follow the same shape):
 
-```nasm
-; entry: rdi = clk_id, rsi = struct timespec *
-clock_gettime_entry:
-cmp  edi, 0            ; CLOCK_REALTIME == 0; edi saves a REX prefix vs rdi
-je   .maybe_intercept
-cmp  edi, 5            ; CLOCK_REALTIME_COARSE == 5 -- same wall clock, coarser resolution
-jne  .real_syscall
+```c
+int clock_gettime_entry(int clk_id, struct timespec *tp)
+{
+    if (clk_id != CLOCK_REALTIME && clk_id != CLOCK_REALTIME_COARSE)
+        return (int)raw_syscall2(SYS_clock_gettime, clk_id, (long)tp);
 
-.maybe_intercept:
-lea  r11, [rel state]  ; RIP-relative — works wherever this page lands
-test byte [r11 + 16], 1 ; bit 0: interception enabled?
-jz   .real_syscall
-test byte [r11 + 16], 2 ; bit 1: freeze mode?
-jnz  .freeze
+    uint64_t mask = g_state.enabled_mask;
+    if (!(mask & MASK_ENABLED))
+        return (int)raw_syscall2(SYS_clock_gettime, clk_id, (long)tp);
 
-push rdi
-push rsi
-mov  eax, 228          ; SYS_clock_gettime — shorter than mov rax (no REX prefix)
-syscall                ; get real time first, always
-pop  rsi
-pop  rdi
+    if (mask & MASK_FROZEN) {                 /* no real read at all */
+        tp->tv_sec  = g_state.offset_sec;
+        tp->tv_nsec = g_state.offset_nsec;
+        return 0;
+    }
 
-lea  r11, [rel state]  ; reload -- syscall clobbers r11
-mov  r8,  [r11]        ; offsetSec
-mov  r9,  [r11 + 8]    ; offsetNsec
-add  [rsi],     r8     ; tp->tv_sec  += offsetSec
-add  [rsi + 8], r9     ; tp->tv_nsec += offsetNsec
+    long rc = raw_syscall2(SYS_clock_gettime, clk_id, (long)tp);
+    if (rc)
+        return (int)rc;                       /* the real error, offset not applied */
+    int64_t sec  = tp->tv_sec + g_state.offset_sec;
+    int64_t nsec = tp->tv_nsec + g_state.offset_nsec;
+    normalize(&sec, &nsec, NS_PER_SEC);       /* one step: offset_nsec is in (-1e9, 1e9) */
+    tp->tv_sec  = sec;
+    tp->tv_nsec = nsec;
+    return 0;
+}
+```
 
-; normalise tv_nsec to [0, 1e9)  — one step is enough because offsetNsec ∈ (-1e9, 1e9)
-mov  rax, [rsi + 8]
-cmp  rax, 1000000000
-jl   .check_negative
-sub  rax, 1000000000
-mov  [rsi + 8], rax
-inc  qword [rsi]
-jmp  .done
+State struct, shared by all three hooks and written by the Go layer with
+`process_vm_writev`:
 
-.check_negative:
-cmp  rax, 0
-jge  .done
-add  rax, 1000000000
-mov  [rsi + 8], rax
-dec  qword [rsi]
-jmp  .done
-
-.freeze:
-mov  r8,  [r11]
-mov  r9,  [r11 + 8]
-mov  [rsi],     r8
-mov  [rsi + 8], r9
-jmp  .done
-
-.real_syscall:
-push rdi
-push rsi
-mov  eax, 228
-syscall
-pop  rsi
-pop  rdi
-
-.done:
-xor  eax, eax          ; return 0; xor eax shorter than xor rax
-ret
-
-; ... gettimeofday_entry, time_entry (same shape, own ABI/precision) ...
-
-state:
-    dq 0   ; offsetSec    (+0)
-    dq 0   ; offsetNsec   (+8)
-    dq 1   ; enabledMask  (+16) — CLOCK_REALTIME/COARSE on by default
-    dd 0   ; generation   (+24)
-    dd 0   ; _pad         (+28)
+```c
+struct state {
+    int64_t  offset_sec;    /* +0   advancing: added to tv_sec;  frozen: absolute tv_sec  */
+    int64_t  offset_nsec;   /* +8   advancing: added to tv_nsec; frozen: absolute tv_nsec */
+    uint64_t enabled_mask;  /* +16  bit 0 = enabled, bit 1 = freeze mode                  */
+    uint32_t generation;    /* +24  bumped on every SetTime/Freeze                        */
+    uint32_t _pad;          /* +28                                                        */
+};
 ```
 
 Key design choices:
-- **No call back into original vDSO code** — each stub issues a raw `syscall` to get
-  the real time. This avoids the need to save, relocate, and re-execute the original
-  instruction bytes (the fiddly part of classic inline hooks).
-- **Position-independent** — `lea r11, [rel state]` is RIP-relative. The payload can be
-  placed anywhere in the address space.
+- **No call back into original vDSO code**: each hook issues a raw `syscall` to get the
+  real time. This avoids saving, relocating and re-executing the original instruction
+  bytes (the fiddly part of classic inline hooks). The cost is that an advancing clock pays
+  a real syscall per read.
+- **Position-independent**: every access to the state struct is RIP-relative, so the
+  payload can be placed anywhere within the JMP's reach. The build fails if the object
+  contains an absolute address, a GOT/PLT entry or a `call`.
 - **`clock_gettime` intercepts `CLOCK_REALTIME` and `CLOCK_REALTIME_COARSE`** (same wall
   clock, the latter is just a faster/coarser read of it). `CLOCK_MONOTONIC`,
   `CLOCK_BOOTTIME`, etc. deliberately pass through unchanged, so internal
   timeout/latency logic in the target process (e.g. PostgreSQL's `statement_timeout`,
   lock waits) keeps seeing real elapsed time.
-- **`gettimeofday` and `time` are also intercepted**, not just `clock_gettime` — they are
+- **`gettimeofday` and `time` are also intercepted**, not just `clock_gettime`: they are
   independent functions at independent vDSO addresses, not aliases, and PostgreSQL's
   `GetCurrentTimestamp()` calls `gettimeofday`, not `clock_gettime`.
 - **`time_entry` calls the real `clock_gettime(CLOCK_REALTIME)` internally, not the
-  `time()` syscall** — `SYS_time` only ever returns whole seconds, discarding the real
+  `time()` syscall**: `SYS_time` only ever returns whole seconds, discarding the real
   fractional second before the trampoline would ever see it, which could make `time()`
   disagree with `clock_gettime`/`gettimeofday` about the current second by up to 1s
-  whenever `offsetNsec` was nonzero. Calling the finer-grained syscall and applying the
-  same carry-normalised add keeps all three in agreement to the second.
-- **REX-prefix micro-optimisations** — `mov eax` (3 bytes) instead of `mov rax` (4 bytes),
-  `cmp edi` instead of `cmp rdi`, `xor eax, eax` instead of `xor rax, rax`. Saves bytes
-  in a payload where every byte shifts later stubs and the `state:` label offset.
+  whenever `offset_nsec` was nonzero. Applying the same carry-normalised add keeps all
+  three in agreement to the second.
+- **Errors are the real errors.** A hook returns what the real vDSO function would: 0, or
+  a negative errno such as `-EINVAL` for an unsupported clock or `-EFAULT` for a bad
+  pointer. Arguments the hooks do not use (such as `gettimeofday`'s timezone pointer) are
+  passed through to the kernel untouched.
 
-### Assembling
-
-```bash
-nasm -f bin pkg/trampoline/trampoline.asm -o pkg/trampoline/trampoline.bin
-```
-
-After reassembling, verify the binary and update the offset constants if the code size
-changed:
+### Building
 
 ```bash
-# Disassemble to confirm layout
-objdump -D -b binary -m i386:x86-64 pkg/trampoline/trampoline.bin
-
-# StateOffset should equal (total binary size - 32); ClockGettimeEntryOffset /
-# GettimeofdayEntryOffset / TimeEntryOffset are each stub's starting offset.
-# TestStateOffsetRegression and TestEntryOffsetRegression fail loudly if they diverge.
-wc -c pkg/trampoline/trampoline.bin   # currently 468 bytes → StateOffset = 436
+pkg/trampoline/src/build.sh        # needs only Docker
 ```
 
-The constants in `pkg/trampoline/trampoline.go` (`StateOffset = 436`,
-`ClockGettimeEntryOffset = 0`, `GettimeofdayEntryOffset = 141`, `TimeEntryOffset = 306`)
-must match. `TestStateOffsetRegression` asserts `StateOffset == len(Payload) - StateSize`;
-`TestEntryOffsetRegression` checks the assembled bytes at each `*EntryOffset` against the
-expected first instruction of that stub. Both catch any drift at CI time.
+The build compiles `trampoline.c` with `link.ld`, verifies the result is genuinely
+position-independent, and writes four artifacts into `pkg/trampoline/`, all of which are
+committed so that consumers need no C toolchain:
+
+| File | Purpose |
+|------|---------|
+| `trampoline.bin` | The flat blob Go embeds |
+| `trampoline.elf` | The linked ELF; tests read its symbol table |
+| `offsets_generated.go` | `StateOffset` and the three `*EntryOffset` constants, read from the ELF's symbols rather than counted by hand |
+| `trampoline.src.sha256` | Hash of `trampoline.c` and `link.ld` |
+
+Nothing relies on a developer remembering to rebuild. `go test ./pkg/trampoline` checks
+that each `*EntryOffset` and `StateOffset` equals its symbol's address in the ELF, that
+`trampoline.bin` is the flat image of that ELF with `g_state` as its last 32 bytes, and
+that the sources still hash to the recorded value, so editing the C without rebuilding
+fails the test. A further set of tests maps the blob executable and calls the hooks
+directly, covering carry and borrow, error propagation and argument passthrough without
+ptrace or a target process.
 
 ### Embedding
 
@@ -712,7 +685,7 @@ err = session.Advance(24 * time.Hour)
 
 ## Known limitations
 
-- **x86-64 only.** The trampoline is hand-assembled for `x86_64`. `aarch64` would need a
+- **x86-64 only.** The trampoline's JMP patch and `syscall` sequence are specific to `x86_64`. `aarch64` would need a
   different payload and a different JMP patch strategy (AArch64 `B` has only a 26-bit
   offset; you'd need an indirect branch via a scratch register instead).
 

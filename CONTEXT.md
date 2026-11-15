@@ -142,7 +142,7 @@ can be set or overridden via seccomp.
 
 ### `pkg/trampoline`
 
-**Files**: `pkg/trampoline/trampoline.go`, `trampoline.asm`, `trampoline.bin`
+**Files**: `pkg/trampoline/trampoline.go`, `offsets_generated.go`, `trampoline.bin`, `trampoline.elf`; C source and build in `pkg/trampoline/src/` (`trampoline.c`, `link.ld`, `Dockerfile`, `build.sh`)
 
 The payload holds **three** independent hook stubs — one per hooked vDSO function
 (`clock_gettime`, `gettimeofday`, `time`) — followed by one shared state struct.
@@ -155,22 +155,19 @@ notably PostgreSQL's `GetCurrentTimestamp()` and glibc/bash's own wall-clock rea
 
 ```go
 //go:embed trampoline.bin
-var Payload []byte          // 468 bytes total
+var Payload []byte          // built from src/trampoline.c; see offsets_generated.go
 
-const StateOffset = 436     // byte offset of state struct within Payload
-
-// Entry offsets of each hook stub within Payload:
-const ClockGettimeEntryOffset = 0
-const GettimeofdayEntryOffset = 141
-const TimeEntryOffset         = 306
+// offsets_generated.go (written by src/build.sh from the linked ELF's symbols, never
+// edited by hand): ClockGettimeEntryOffset (always 0), GettimeofdayEntryOffset,
+// TimeEntryOffset and StateOffset. StateOffset == len(Payload) - StateSize.
 
 const StateSize   = 32      // 8+8+8+4+4
 
-// Field offsets (absolute, from Payload[0]):
-const FieldOffsetSec  = 436   // int64
-const FieldOffsetNsec = 444   // int64
-const FieldEnabledMask = 452  // uint64, bit 0 = interception enabled, bit 1 = freeze
-const FieldGeneration  = 460  // uint32
+// Field offsets (absolute, from Payload[0]; derived from StateOffset):
+const FieldOffsetSec  = StateOffset + 0   // int64
+const FieldOffsetNsec = StateOffset + 8   // int64
+const FieldEnabledMask = StateOffset + 16 // uint64, bit 0 = interception enabled, bit 1 = freeze
+const FieldGeneration  = StateOffset + 24 // uint32
 
 func EncodeState(offsetSec, offsetNsec int64, mask uint64, generation uint32) []byte
 func DecodeState(b []byte) (offsetSec, offsetNsec int64, mask uint64, generation uint32, err error)
@@ -189,13 +186,15 @@ shared by all three stubs):
 **Trampoline behaviour, per stub**:
 - `clock_gettime_entry` — intercepts `clk_id ∈ {CLOCK_REALTIME (0), CLOCK_REALTIME_COARSE
   (5)}`; other clock IDs (`CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, ...) pass straight through to
-  the real syscall. Pushes rdi/rsi, issues raw `syscall 228` to get the real time, restores
-  rdi/rsi, loads `offsetSec`/`offsetNsec` via `lea r11, [rel state]` (RIP-relative,
-  position-independent), adds them to `tp->tv_sec`/`tp->tv_nsec`, normalises `tv_nsec` into
-  `[0, 1e9)` with a single add or sub, returns 0.
+  the real syscall. Issues raw `syscall 228` to get the real time, reads
+  `offset_sec`/`offset_nsec` from `g_state` (RIP-relative, position-independent), adds
+  them to `tp->tv_sec`/`tp->tv_nsec`, normalises `tv_nsec` into `[0, 1e9)` with a single
+  add or sub, returns 0. If the real read fails it returns the kernel's error unchanged
+  and applies no offset.
 - `gettimeofday_entry` — same shape, `struct timeval` (`tv_sec`/`tv_usec`) instead of
-  `timespec`; `offsetNsec` is divided by 1000 (`cqo` + `idiv`) to get the microsecond offset,
-  then normalised into `[0, 1e6)`. Returns 0.
+  `timespec`; `offset_nsec` is divided by 1000 (the compiler emits a multiply, no `idiv`) to
+  get the microsecond offset, then normalised into `[0, 1e6)`. The `tz` argument is passed
+  through to the kernel untouched. Returns 0 or the kernel's error.
 - `time_entry` — deliberately does **not** use the `time()` syscall (`SYS_time`) for its
   real-time read: that syscall only ever returns whole seconds, discarding the real
   fractional second before the trampoline would ever see it, so a nonzero `offsetNsec`
@@ -204,18 +203,22 @@ shared by all three stubs):
   the same instant. Instead it calls the real `clock_gettime(CLOCK_REALTIME)` internally on
   a scratch stack buffer, applies the same carry-normalised add, and returns only the
   resulting `tv_sec` (also stores it to `*tloc` if non-NULL) — the return value itself
-  is the seconds count, so unlike the other two stubs it does **not** zero `rax` before
-  `ret`.
+  is the seconds count, not 0. If the internal `clock_gettime` fails it falls back to the
+  real `time()` syscall.
 
-**`StateOffset`/`*EntryOffset` are hardcoded constants.** `TestStateOffsetRegression`
-asserts `StateOffset == len(Payload) - StateSize`; `TestEntryOffsetRegression` checks the
-assembled bytes at each `*EntryOffset` against the expected first instruction of that stub.
-Both fail loudly if the assembly is edited and the binary changes without updating the
-constants. Check these tests first if you ever touch the assembly.
+**Offsets are generated, and guarded.** `src/build.sh` (Docker only) compiles
+`src/trampoline.c` with `src/link.ld`, fails the build if the object has an absolute
+relocation, a GOT/PLT entry or a `call`, then writes `trampoline.bin`, `trampoline.elf`,
+`offsets_generated.go` (offsets read from `nm`, not counted by hand) and
+`trampoline.src.sha256`. `go test ./pkg/trampoline` checks each offset against the ELF's
+symbols (`TestOffsetsMatchLinkedSymbols`), that the blob is the flat image of that ELF
+(`TestPayloadMatchesELF`), and that the sources still hash to the recorded value
+(`TestSourcesMatchBuiltArtifacts`, which fails if the C was edited without rebuilding).
+`behavior_test.go` maps the blob executable and calls the hooks directly via
+`internal/callasm`: carry/borrow, error propagation and argument passthrough, no ptrace
+needed. The C lives in `src/` because Go rejects `.c` files in a non-cgo package directory.
 
-**To reassemble**: `nasm -f bin pkg/trampoline/trampoline.asm -o pkg/trampoline/trampoline.bin`
-Then update `StateOffset`/`*EntryOffset` if the binary size or stub layout changed (use
-`nasm -l trampoline.lst` to read exact label addresses off the listing).
+**To rebuild**: `pkg/trampoline/src/build.sh`, then commit the regenerated artifacts.
 
 ---
 
@@ -821,7 +824,7 @@ self-contained.
    For test workloads this is harmless (one slightly wrong timestamp). Adding a seqlock to
    the assembly would eliminate this at the cost of 3–4 more instruction bytes.
 
-5. **x86-64 only**: The trampoline is hand-assembled. AArch64 (arm64) would need a
+5. **x86-64 only**: The trampoline's JMP patch and `syscall` sequence are x86-64 specific. AArch64 (arm64) would need a
    different payload. The `JMP rel32` approach doesn't exist on AArch64 (`B` has 26-bit
    offset, ~128 MB reach). Alternative: patch with `LDR x16, [pc+8]; BR x16; .quad addr`
    (12 bytes, reach = full 64-bit space) — requires saving 12 bytes instead of 5.
@@ -881,9 +884,11 @@ epochd/
 │   │   ├── procmem.go                         # ✅ Tracer, ReadMem, WriteMem, PokeText, FollowChild; SetTracee, SetOptions, SetOptionsPID, WaitAnyNonBlocking, GetEventMsgPID, ContPID, InterruptDetach, DetachAll
 │   │   └── procmem_test.go                    # ✅ TestTracerBasic
 │   ├── trampoline/
-│   │   ├── trampoline.asm                     # ✅ NASM source (468 bytes; 3 stubs: clock_gettime/gettimeofday/time); MaskEnabled=1, MaskFrozen=3
-│   │   ├── trampoline.bin                     # ✅ assembled binary (committed)
-│   │   ├── trampoline.go                      # ✅ Payload, StateOffset=436, *EntryOffset consts, EncodeState, DecodeState, MaskEnabled, MaskFrozen
+│   │   ├── src/                               # ✅ trampoline.c, link.ld, Dockerfile, build.sh (C source and Docker build)
+│   │   ├── offsets_generated.go               # ✅ generated: *EntryOffset and StateOffset, read from the linked ELF
+│   │   ├── trampoline.elf                     # ✅ linked ELF (committed; tests read its symbols)
+│   │   ├── trampoline.bin                     # ✅ compiled binary (committed)
+│   │   ├── trampoline.go                      # ✅ Payload, EncodeState, DecodeState, MaskEnabled, MaskFrozen, Field* consts
 │   │   └── trampoline_test.go                 # ✅ regression (state + entry offsets) + round-trip tests
 │   ├── inject/
 │   │   ├── inject.go                          # ✅ InjectAtTime, InjectFrozen, InjectAtTimeFollowChild, InjectFrozenFollowChild; InjectAtTimeFollowChildKeepTracer, InjectFrozenFollowChildKeepTracer, ChildHandle, ReInjectAtTimeAfterExec, ReInjectFrozenAfterExec

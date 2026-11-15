@@ -1649,7 +1649,7 @@ faketimectl run --mode=preload --time=2030-01-01T00:00:00Z -- postgres -D /tmp/p
     <tr>
       <td><strong>Linux x86-64 only</strong></td>
       <td>Cannot run on ARM64, macOS, or Windows.</td>
-      <td>The trampoline is hand-assembled for <code>x86_64</code>. ARM64 support is on the roadmap. Tests can be cross-compiled on macOS/Windows and run in Docker or CI.</td>
+      <td>The trampoline's JMP patch and <code>syscall</code> sequence are specific to <code>x86_64</code>. ARM64 support is on the roadmap. Tests can be cross-compiled on macOS/Windows and run in Docker or CI.</td>
     </tr>
     <tr>
       <td><strong>Wall clock only</strong></td>
@@ -1702,7 +1702,7 @@ faketimectl run --mode=preload --time=2030-01-01T00:00:00Z -- postgres -D /tmp/p
     <tr><td>Kubernetes</td><td>1.28+ (for cluster deployment)</td></tr>
     <tr><td>Container runtime</td><td>containerd (for cluster deployment)</td></tr>
     <tr><td>Docker</td><td>Any recent version, for building images or running tests on macOS/Windows</td></tr>
-    <tr><td>NASM</td><td>Only needed if editing <code>pkg/trampoline/trampoline.asm</code>. The pre-assembled <code>trampoline.bin</code> is committed to the repo.</td></tr>
+    <tr><td>Docker</td><td>Only needed to rebuild the compiled artifacts after editing their C sources (<code>pkg/trampoline/src/build.sh</code>, <code>pkg/preload/lib/build.sh</code>). The built <code>trampoline.bin</code> and <code>libepochd_preload.so</code> are committed to the repo.</td></tr>
   </tbody>
 </table>
 </div>

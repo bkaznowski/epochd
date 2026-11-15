@@ -1,7 +1,13 @@
 //go:build linux
 
-// Package trampoline holds the hand-assembled vDSO hook payload and the helpers
-// needed to encode and decode the state struct that sits immediately after it.
+// Package trampoline holds the compiled vDSO hook payload and the helpers
+// needed to encode and decode the state struct that sits at the end of it.
+//
+// The payload is built from trampoline.c and link.ld by build.sh. That script
+// also regenerates offsets_generated.go (the entry and state offsets, read from
+// the linked ELF's symbol table rather than counted by hand) and records a hash
+// of the sources; the tests in this package fail if the committed artifacts
+// disagree with each other or with the sources.
 package trampoline
 
 import (
@@ -13,23 +19,10 @@ import (
 //go:embed trampoline.bin
 var Payload []byte
 
-// StateOffset is the byte offset of the state struct within Payload.
-// It equals the size of all three hook stubs combined and must match the
-// position of the `state:` label in trampoline.asm.  The regression test
-// below will catch any future edit to the assembly that shifts the struct
-// without updating this constant.
-const StateOffset = 436
-
-// Entry offsets locate each hook stub within Payload. inject.go computes the
+// ClockGettimeEntryOffset, GettimeofdayEntryOffset, TimeEntryOffset and
+// StateOffset are defined in offsets_generated.go. inject.go computes the
 // JMP-rel32 target for a given vDSO function as (trampoline page base) +
-// (its EntryOffset). The regression test below pins these to the actual
-// nasm-assembled layout so a future edit to trampoline.asm that reorders or
-// resizes a stub fails loudly instead of silently patching the wrong code.
-const (
-	ClockGettimeEntryOffset = 0
-	GettimeofdayEntryOffset = 141
-	TimeEntryOffset         = 306
-)
+// (its EntryOffset).
 
 // State field offsets within Payload (absolute, not relative to StateOffset).
 // Use these when computing the address to pass to procmem.WriteMem.

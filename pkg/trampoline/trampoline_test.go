@@ -3,51 +3,155 @@
 package trampoline
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"debug/elf"
+	_ "embed"
 	"encoding/binary"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
-// TestStateOffsetRegression is the CI guard called out in the plan.
-// If someone edits trampoline.s and the state struct shifts without updating
-// StateOffset, this fails loudly rather than silently corrupting memory in the
-// target process at runtime.
-func TestStateOffsetRegression(t *testing.T) {
-	want := len(Payload) - StateSize
-	if StateOffset != want {
-		t.Errorf("StateOffset = %d, but len(Payload)-StateSize = %d; "+
-			"update the StateOffset constant after re-assembling trampoline.s",
-			StateOffset, want)
+// trampolineELF is the linked ELF that trampoline.bin was flattened from. It is
+// only embedded here, in the test binary: it lets the tests below check the
+// blob against the linker's own symbol table instead of pinning opcode bytes.
+//
+//go:embed trampoline.elf
+var trampolineELF []byte
+
+func loadELF(t *testing.T) *elf.File {
+	t.Helper()
+	f, err := elf.NewFile(bytes.NewReader(trampolineELF))
+	if err != nil {
+		t.Fatalf("trampoline.elf is not a valid ELF file: %v", err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+func symbolAddrs(t *testing.T, f *elf.File) map[string]uint64 {
+	t.Helper()
+	syms, err := f.Symbols()
+	if err != nil {
+		t.Fatalf("reading trampoline.elf symbols: %v", err)
+	}
+	m := make(map[string]uint64, len(syms))
+	for _, s := range syms {
+		m[s.Name] = s.Value
+	}
+	return m
+}
+
+// TestOffsetsMatchLinkedSymbols proves the generated offset constants describe
+// the blob: each one equals the address of the corresponding symbol in the ELF
+// the blob was built from. This replaces pinning opcode prefixes, which would
+// only encode one compiler version's output.
+func TestOffsetsMatchLinkedSymbols(t *testing.T) {
+	syms := symbolAddrs(t, loadELF(t))
+	for _, c := range []struct {
+		symbol string
+		got    int
+	}{
+		{"clock_gettime_entry", ClockGettimeEntryOffset},
+		{"gettimeofday_entry", GettimeofdayEntryOffset},
+		{"time_entry", TimeEntryOffset},
+		{"g_state", StateOffset},
+	} {
+		addr, ok := syms[c.symbol]
+		if !ok {
+			t.Errorf("symbol %s missing from trampoline.elf", c.symbol)
+			continue
+		}
+		if uint64(c.got) != addr {
+			t.Errorf("%s: constant = %d, linked address = %d; rerun build.sh", c.symbol, c.got, addr)
+		}
 	}
 }
 
-// TestEntryOffsetRegression pins each hook stub's entry offset to a
-// distinguishing prefix of its first assembled instruction. If a future edit
-// to trampoline.asm reorders or resizes a stub without updating the
-// corresponding *EntryOffset constant, the bytes at that offset will no
-// longer match and this fails loudly instead of silently patching a vDSO
-// function with a JMP into the middle of some other stub's code.
-func TestEntryOffsetRegression(t *testing.T) {
-	cases := []struct {
+// TestPayloadMatchesELF proves trampoline.bin is the flat image of
+// trampoline.elf: the .text section is a prefix of the blob and g_state's
+// initial contents sit at StateOffset.
+func TestPayloadMatchesELF(t *testing.T) {
+	f := loadELF(t)
+
+	text := f.Section(".text")
+	data := f.Section(".data")
+	if text == nil || data == nil {
+		t.Fatal("trampoline.elf must have .text and .data sections")
+	}
+	textBytes, err := text.Data()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataBytes, err := data.Data()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.HasPrefix(Payload, textBytes) {
+		t.Error("trampoline.bin does not start with the ELF's .text; rerun build.sh")
+	}
+	if got := Payload[StateOffset:]; !bytes.Equal(got, dataBytes) {
+		t.Errorf("state region differs from the ELF's .data:\n got % x\nwant % x", got, dataBytes)
+	}
+	if len(Payload)-StateSize != StateOffset {
+		t.Errorf("g_state must be the last %d bytes: len(Payload)=%d, StateOffset=%d", StateSize, len(Payload), StateOffset)
+	}
+}
+
+// TestEntryOffsetOrdering checks the structural invariants inject.go relies on:
+// clock_gettime first at offset 0, then gettimeofday, then time, all before the
+// state, each pointing at real code.
+func TestEntryOffsetOrdering(t *testing.T) {
+	offsets := []struct {
 		name   string
 		offset int
-		want   []byte // first bytes of the instruction at this label
 	}{
-		{"ClockGettimeEntryOffset", ClockGettimeEntryOffset, []byte{0x83, 0xFF, 0x00}}, // cmp edi, 0
-		{"GettimeofdayEntryOffset", GettimeofdayEntryOffset, []byte{0x4C, 0x8D, 0x1D}}, // lea r11, [rel state]
-		{"TimeEntryOffset", TimeEntryOffset, []byte{0x4C, 0x8D, 0x1D}},                 // lea r11, [rel state]
+		{"ClockGettimeEntryOffset", ClockGettimeEntryOffset},
+		{"GettimeofdayEntryOffset", GettimeofdayEntryOffset},
+		{"TimeEntryOffset", TimeEntryOffset},
 	}
-	for _, c := range cases {
-		if c.offset+len(c.want) > len(Payload) {
-			t.Fatalf("%s = %d is out of range for Payload of length %d", c.name, c.offset, len(Payload))
+	if ClockGettimeEntryOffset != 0 {
+		t.Errorf("ClockGettimeEntryOffset = %d, want 0", ClockGettimeEntryOffset)
+	}
+	for i := 1; i < len(offsets); i++ {
+		if offsets[i].offset <= offsets[i-1].offset {
+			t.Errorf("%s (%d) must come after %s (%d)", offsets[i].name, offsets[i].offset, offsets[i-1].name, offsets[i-1].offset)
 		}
-		got := Payload[c.offset : c.offset+len(c.want)]
-		for i, b := range c.want {
-			if got[i] != b {
-				t.Errorf("%s = %d: Payload bytes = % x, want prefix % x; "+
-					"update the offset constant after re-assembling trampoline.asm",
-					c.name, c.offset, got, c.want)
-				break
-			}
+	}
+	for _, c := range offsets {
+		if c.offset < 0 || c.offset >= StateOffset {
+			t.Errorf("%s = %d is outside the code region [0, %d)", c.name, c.offset, StateOffset)
+		}
+	}
+}
+
+// TestSourcesMatchBuiltArtifacts fails when trampoline.c or link.ld was edited
+// without rerunning build.sh, which would leave the committed blob stale.
+func TestSourcesMatchBuiltArtifacts(t *testing.T) {
+	recorded, err := os.ReadFile("trampoline.src.sha256")
+	if err != nil {
+		t.Fatalf("trampoline.src.sha256: %v", err)
+	}
+	want := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(recorded)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			t.Fatalf("malformed line in trampoline.src.sha256: %q", line)
+		}
+		want[fields[1]] = fields[0]
+	}
+	for _, name := range []string{"trampoline.c", "link.ld"} {
+		src, err := os.ReadFile(filepath.Join("src", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(src)
+		if got := hex.EncodeToString(sum[:]); got != want[name] {
+			t.Errorf("%s changed since the blob was built (hash %s, recorded %s); run build.sh and commit the results", name, got, want[name])
 		}
 	}
 }
