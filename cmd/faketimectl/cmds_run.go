@@ -12,8 +12,15 @@ import (
 	"time"
 
 	"github.com/bkaznowski/epochd/pkg/inject"
+	"github.com/bkaznowski/epochd/pkg/preload"
 	"github.com/bkaznowski/epochd/pkg/procmem"
 	"golang.org/x/sys/unix"
+)
+
+// Values for run's --mode flag.
+const (
+	modeVDSO    = "vdso"
+	modePreload = "preload"
 )
 
 func cmdRun(args []string) error {
@@ -21,21 +28,29 @@ func cmdRun(args []string) error {
 	fs.SetOutput(stderr)
 	timeStr := fs.String("time", "", "fake time in RFC3339, e.g. 2030-01-01T00:00:00Z (required)")
 	freeze := fs.Bool("freeze", false, "freeze clock at --time (clock does not advance)")
-	track := fs.Bool("track", false, "track forked children and re-inject after exec()")
+	track := fs.Bool("track", false, "track forked children and re-inject after exec() (vdso mode only; preload mode always covers children)")
+	modeName := fs.String("mode", modeVDSO, "how to fake the clock: "+modeVDSO+" (ptrace + vDSO patch; works on any binary, including Go and static ones) "+
+		"or "+modePreload+" (LD_PRELOAD; no ptrace, children inherit it, but dynamically linked non-Go binaries only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	cmdArgs := fs.Args()
 	if len(cmdArgs) == 0 {
-		return fmt.Errorf("run: a command is required\nusage: faketimectl run --time=RFC3339 [--freeze] [--track] [--] COMMAND [ARGS]")
+		return fmt.Errorf("run: a command is required\nusage: faketimectl run --time=RFC3339 [--freeze] [--track] [--mode=vdso|preload] [--] COMMAND [ARGS]")
 	}
 	if *timeStr == "" {
 		return fmt.Errorf("run: --time is required")
 	}
+	if *modeName != modeVDSO && *modeName != modePreload {
+		return fmt.Errorf("run: --mode must be %q or %q, got %q", modeVDSO, modePreload, *modeName)
+	}
 	target, err := time.Parse(time.RFC3339, *timeStr)
 	if err != nil {
 		return fmt.Errorf("run: --time: %v", err)
+	}
+	if *modeName == modePreload {
+		return runPreload(cmdArgs, target, *freeze)
 	}
 
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
@@ -104,17 +119,8 @@ func cmdRun(args []string) error {
 
 	exitCode := 0
 	if waitErr := cmd.Wait(); waitErr != nil {
-		if exit, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = exit.ExitCode()
-			if exitCode < 0 {
-				// Killed by signal — use 128+signum convention.
-				if ws, ok := exit.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-					exitCode = 128 + int(ws.Signal())
-				} else {
-					exitCode = 1
-				}
-			}
-		} else {
+		code, ok := exitCodeFor(waitErr)
+		if !ok {
 			select {
 			case <-done:
 			default:
@@ -123,6 +129,7 @@ func cmdRun(args []string) error {
 			<-watchDone
 			return fmt.Errorf("run: wait: %v", waitErr)
 		}
+		exitCode = code
 	}
 
 	// Signal the watch loop to stop and wait for its cleanup to finish.
@@ -134,6 +141,76 @@ func cmdRun(args []string) error {
 	if we := <-watchDone; we != nil {
 		fmt.Fprintf(stderr, "faketimectl: watch: %v\n", we)
 	}
+
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+	return nil
+}
+
+// exitCodeFor maps the error from cmd.Wait to the exit code run should
+// propagate. ok is false when waitErr is not a process exit status at all (a
+// failure of the wait itself), which the caller should report as an error.
+func exitCodeFor(waitErr error) (code int, ok bool) {
+	exit, isExit := waitErr.(*exec.ExitError)
+	if !isExit {
+		return 0, false
+	}
+	code = exit.ExitCode()
+	if code < 0 {
+		// Killed by signal — use 128+signum convention.
+		if ws, ok := exit.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return 128 + int(ws.Signal()), true
+		}
+		return 1, true
+	}
+	return code, true
+}
+
+// runPreload is run's --mode=preload path: instead of ptracing the command and
+// patching its vDSO, it starts the command with the epochd preload library in
+// its environment. No tracer is involved, so --track has nothing to do: every
+// descendant that keeps the environment inherits the clock across fork and
+// exec on its own. Binaries LD_PRELOAD cannot affect (Go, static) are refused
+// up front rather than silently left on real time.
+func runPreload(cmdArgs []string, target time.Time, freeze bool) error {
+	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	var h *preload.Handle
+	var err error
+	if freeze {
+		h, err = preload.StartFrozen(cmd, target)
+	} else {
+		h, err = preload.Start(cmd, target)
+	}
+	if err != nil {
+		if errors.Is(err, preload.ErrNotInterposable) {
+			return fmt.Errorf("run: %v\nrun: use --mode=%s for this binary", err, modeVDSO)
+		}
+		return fmt.Errorf("run: preload: %v", err)
+	}
+
+	clockMode := "advancing"
+	if freeze {
+		clockMode = "frozen"
+	}
+	fmt.Fprintf(stderr, "faketimectl: pid %d: clock set to %s (%s, preload; children inherit it)\n",
+		cmd.Process.Pid, target.Format(time.RFC3339), clockMode)
+
+	exitCode := 0
+	if waitErr := cmd.Wait(); waitErr != nil {
+		code, ok := exitCodeFor(waitErr)
+		if !ok {
+			h.Close() //nolint:errcheck
+			return fmt.Errorf("run: wait: %v", waitErr)
+		}
+		exitCode = code
+	}
+	// Close before os.Exit below, which would skip a deferred call.
+	h.Close() //nolint:errcheck
 
 	if exitCode != 0 {
 		os.Exit(exitCode)

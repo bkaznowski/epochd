@@ -1506,8 +1506,8 @@ faketimectl delete b3f5c2d1-...</code></pre>
     </tr>
     <tr>
       <td><code>run</code></td>
-      <td><code>--time=RFC3339 [--freeze] [--track] [--] CMD [ARGS]</code></td>
-      <td>Start <code>CMD</code> with fake time injected from the first instruction. <code>--freeze</code> pins the clock. <code>--track</code> tracks all forked children and re-injects after <code>exec()</code>. No elevated permissions required — uses the FollowChild ptrace path.</td>
+      <td><code>--time=RFC3339 [--freeze] [--track] [--mode=vdso|preload] [--] CMD [ARGS]</code></td>
+      <td>Start <code>CMD</code> with fake time injected from the first instruction. <code>--freeze</code> pins the clock. <code>--track</code> tracks all forked children and re-injects after <code>exec()</code>. No elevated permissions required — uses the FollowChild ptrace path. <code>--mode=preload</code> uses <code>LD_PRELOAD</code> instead of ptrace: children inherit the clock through the environment, so <code>--track</code> is unnecessary, but it only works for dynamically linked, non-Go binaries (Go and static binaries are refused; use the default <code>--mode=vdso</code> for those).</td>
     </tr>
   </tbody>
 </table>
@@ -1553,7 +1553,14 @@ faketimectl run --time=2030-01-01T00:00:00Z --freeze -- ./clockprinter
 faketimectl run --time=2030-01-01T00:00:00Z --track -- postgres -D /tmp/pgdata
 # faketimectl: pid 12348: clock set to 2030-01-01T00:00:00Z (advancing, tracking children)
 # faketimectl: fork: pid 12348 -> child 12349
-# faketimectl: exec: re-injected pid 12349</code></pre>
+# faketimectl: exec: re-injected pid 12349
+
+# Same idea without ptrace: LD_PRELOAD. Every descendant inherits the clock
+# through its environment, across fork and exec, with no tracer attached.
+# Works for dynamically linked non-Go binaries (Postgres, Python, Redpanda, ...);
+# a Go or statically linked binary is refused with a pointer to --mode=vdso.
+faketimectl run --mode=preload --time=2030-01-01T00:00:00Z -- postgres -D /tmp/pgdata
+# faketimectl: pid 12350: clock set to 2030-01-01T00:00:00Z (advancing, preload; children inherit it)</code></pre>
 
 <div class="callout warn">
   <span class="callout-icon">⚠️</span>

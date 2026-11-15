@@ -21,7 +21,7 @@
 //
 //	inject   --pid=PID --time=RFC3339
 //	reset    --pid=PID
-//	run      --time=RFC3339 [--freeze] [--track] [--] COMMAND [ARGS]
+//	run      --time=RFC3339 [--freeze] [--track] [--mode=vdso|preload] [--] COMMAND [ARGS]
 package main
 
 import (
@@ -94,7 +94,10 @@ Controller subcommands (require --url flag or EPOCHD_URL environment variable):
 Local injection subcommands (Linux only, requires CAP_SYS_PTRACE or root):
   inject   --pid=PID --time=RFC3339 [--freeze]
   reset    --pid=PID
-  run      --time=RFC3339 [--freeze] [--track] [--] COMMAND [ARGS]`
+  run      --time=RFC3339 [--freeze] [--track] [--mode=vdso|preload] [--] COMMAND [ARGS]
+           --mode=vdso (default) uses ptrace and works on any binary, including Go and static ones.
+           --mode=preload uses LD_PRELOAD: no ptrace or privileges, and children inherit the clock,
+           but only for dynamically linked non-Go binaries.`
 
 func printUsage() {
 	fmt.Fprintln(stdout, usageText)
