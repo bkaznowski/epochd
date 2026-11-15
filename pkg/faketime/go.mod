@@ -4,6 +4,6 @@ go 1.26.4
 
 require github.com/bkaznowski/epochd v0.7.3
 
-require golang.org/x/sys v0.46.0
+require golang.org/x/sys v0.50.0
 
 replace github.com/bkaznowski/epochd => ../..
