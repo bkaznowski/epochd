@@ -86,7 +86,7 @@ releases that users can pin with `helm upgrade`.
     agent:      { repository: ghcr.io/bkaznowski/epochd-agent,      tag: latest }
     controller: { repository: ghcr.io/bkaznowski/epochd-controller,  tag: latest }
   agent:
-    port: 9100
+    port: 9433
     resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { cpu: 200m, memory: 128Mi } }
   controller:
     port: 8080

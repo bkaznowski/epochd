@@ -630,7 +630,7 @@ type StatusResponse struct {
 3. **In-memory handle map**: `map[string]*inject.Handle` protected by a `sync.RWMutex`.
    HandleIDs can be UUIDs (`crypto/rand`-based) or `"<containerID>:<pid>"` strings.
 
-4. **Listening address**: bind to pod IP (or `0.0.0.0`) on a fixed port (e.g. 9100).
+4. **Listening address**: bind to pod IP (or `0.0.0.0`) on a fixed port (the shipped default is 9433; 9100 is node-exporter's and collides under hostNetwork).
    The controller will reach it directly by pod IP.
 
 **Important**: the agent binary requires `CAP_SYS_PTRACE` and `hostPID: true` in the pod
@@ -661,7 +661,7 @@ The controller is an ordinary (unprivileged) Deployment. It:
 
 2. **Maintains a node-IP → agent-URL map**: agents are DaemonSet pods, so there's one per
    node. The agent's pod IP is discoverable from the pod list; alternatively, use a fixed
-   port on the node IP (`http://<hostIP>:9100`).
+   port on the node IP (`<hostIP>:9433`).
 
 3. **REST API**:
 
@@ -712,7 +712,7 @@ spec:
         - name: cri-socket
           mountPath: /run/containerd/containerd.sock
         ports:
-        - containerPort: 9100
+        - containerPort: 9433
       volumes:
       - name: cri-socket
         hostPath:

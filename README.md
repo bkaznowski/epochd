@@ -283,6 +283,18 @@ ptrace a process on the current machine (Linux only, requires `CAP_SYS_PTRACE`).
 
 Set `EPOCHD_URL` or pass `--url` on every command.
 
+The controller requires a bearer token unless it was started with
+`--allow-unauthenticated`. Give the CLI the token through the environment, not a flag,
+so it stays out of the process list and shell history:
+
+```bash
+export EPOCHD_TOKEN="$(kubectl -n epochd get secret epochd-auth -o jsonpath='{.data.api-token}' | base64 -d)"
+# or: export EPOCHD_TOKEN_FILE=/path/to/token
+```
+
+See [deploy/README.md](deploy/README.md) for how the tokens, TLS and the agent port fit
+together.
+
 ```
 faketimectl create  --namespace=NS --selector=SEL --time=RFC3339 [--ttl=DUR] [--freeze]
 faketimectl list
@@ -376,6 +388,46 @@ sudo faketimectl reset --pid=$(pgrep clockprinter)
 ```bash
 echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
 ```
+
+### Running a command on a fake clock: `run`
+
+`faketimectl run` starts a command with the clock already faked, and needs no privileges
+for a process it starts itself:
+
+```bash
+faketimectl run --time=2030-01-01T00:00:00Z [--freeze] [--track] [--mode=vdso|preload] -- COMMAND [ARGS]
+```
+
+There are two ways to fake the clock, chosen per command with `--mode`:
+
+| | `--mode=vdso` (default) | `--mode=preload` |
+|---|---|---|
+| How | ptrace + patched vDSO | `LD_PRELOAD` library |
+| Works on | any binary, including Go and statically linked ones | dynamically linked, non-Go binaries (glibc **and** musl/Alpine) |
+| Children | `--track` follows forks and re-injects after `exec` | always inherit it through the environment |
+| Needs ptrace | yes | no |
+| Cannot reach | — | a child started with a scrubbed environment (`env -i`) |
+
+Preload mode refuses a binary it cannot affect (Go or static) and says which mode to use.
+It also tells you when the library was never loaded by the command, in which case the
+command ran on real time:
+
+```
+faketimectl: warning: the preload library was never loaded by "mydaemon", so it ran on real time.
+```
+
+Timeouts in preload mode: only the wall clock moves. A deadline expressed as an absolute
+`CLOCK_REALTIME` time (`pthread_cond_timedwait`, `sem_timedwait`) is passed to the kernel
+unchanged, so a program that computes "now + 5s" from the fake clock waits against the real
+one. Relative timeouts and the monotonic clocks behave normally.
+
+The same choice is available from Go, per process, in one `faketime.Session`:
+`WithMode`, `WithModeFilter` and `Session.StartMode`.
+
+With `--track`, a child forked from a thread that was created after injection produces no
+ptrace event; the tracker finds it by sweeping `/proc` every 100 ms and gives it the
+clock's current state. A child like that that goes on to `exec` reads real time until the
+next sweep reaches it.
 
 ---
 

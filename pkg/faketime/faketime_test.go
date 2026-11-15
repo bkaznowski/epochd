@@ -150,7 +150,8 @@ func TestSessionTwoProcesses(t *testing.T) {
 
 	cmd1 := newHelper(pw1)
 	if err := s.Start(cmd1); err != nil {
-		pw1.Close(); pw2.Close()
+		pw1.Close()
+		pw2.Close()
 		t.Fatalf("Session.Start cmd1: %v", err)
 	}
 	pw1.Close()
@@ -164,8 +165,10 @@ func TestSessionTwoProcesses(t *testing.T) {
 
 	t.Cleanup(func() {
 		s.Reset()
-		cmd1.Process.Kill(); cmd1.Wait()
-		cmd2.Process.Kill(); cmd2.Wait()
+		cmd1.Process.Kill()
+		cmd1.Wait()
+		cmd2.Process.Kill()
+		cmd2.Wait()
 	})
 
 	if s.Len() != 2 {
@@ -249,7 +252,8 @@ func TestWithSession(t *testing.T) {
 			cmd.Env = append(os.Environ(), helperEnv+"=1")
 			cmd.Stdout = pw
 			if err := s.Start(cmd); err != nil {
-				pw.Close(); pr.Close()
+				pw.Close()
+				pr.Close()
 				return err
 			}
 			pw.Close()
@@ -578,7 +582,8 @@ func startHelper(t *testing.T) (*exec.Cmd, *os.File) {
 	cmd.Env = append(os.Environ(), helperEnv+"=1")
 	cmd.Stdout = pw
 	if err := cmd.Start(); err != nil {
-		pw.Close(); pr.Close()
+		pw.Close()
+		pr.Close()
 		t.Fatalf("cmd.Start: %v", err)
 	}
 	pw.Close()
@@ -1085,7 +1090,7 @@ func TestSessionSetTimeAutoprune(t *testing.T) {
 		t.Fatalf("Start cmd2: %v", err)
 	}
 	t.Cleanup(func() {
-		s.Reset()          //nolint:errcheck
+		s.Reset()           //nolint:errcheck
 		cmd1.Process.Kill() //nolint:errcheck
 		cmd1.Wait()         //nolint:errcheck
 		cmd2.Process.Kill() //nolint:errcheck
@@ -1261,7 +1266,8 @@ func TestChildTrackerBulkMethods(t *testing.T) {
 		cmd.Stdout = pw
 		ct, err := StartWithTracking(cmd, time.Now()) // initial target overridden per sub-test
 		if err != nil {
-			pw.Close(); pr.Close()
+			pw.Close()
+			pr.Close()
 			t.Fatalf("StartWithTracking: %v", err)
 		}
 		pw.Close()
@@ -2365,8 +2371,8 @@ func TestHandleFreezeDeadProcess(t *testing.T) {
 	}
 
 	// Kill and reap the process, then attempt to freeze its handle.
-	cmd.Process.Kill() //nolint:errcheck
-	cmd.Wait()         //nolint:errcheck
+	cmd.Process.Kill()                //nolint:errcheck
+	cmd.Wait()                        //nolint:errcheck
 	time.Sleep(20 * time.Millisecond) // ensure OS marks PID as gone
 
 	if err := h.Freeze(time.Now().Add(48 * time.Hour)); err == nil {
@@ -2397,7 +2403,8 @@ func TestSessionPrunePartiallyDeadTrackers(t *testing.T) {
 		t.Fatalf("Start cmd1: %v", err)
 	}
 	if err := s.Start(cmd2); err != nil {
-		cmd1.Process.Kill(); cmd1.Wait() //nolint:errcheck
+		cmd1.Process.Kill()
+		cmd1.Wait() //nolint:errcheck
 		t.Fatalf("Start cmd2: %v", err)
 	}
 	t.Cleanup(func() {

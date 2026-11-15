@@ -120,7 +120,7 @@ func ExampleSession() {
 	if err := s.Start(cmd2); err != nil {
 		panic(err)
 	}
-	defer s.Reset()   //nolint:errcheck
+	defer s.Reset() //nolint:errcheck
 	defer cmd1.Process.Kill()
 	defer cmd1.Wait() //nolint:errcheck
 	defer cmd2.Process.Kill()
@@ -192,8 +192,8 @@ func ExampleHandle_IsFrozen() {
 	defer cmd.Process.Kill()
 	defer cmd.Wait() //nolint:errcheck
 
-	fmt.Println("frozen:", h.IsFrozen())           // true
-	fmt.Println("at:", h.EffectiveTime().Unix())    // exactly target
+	fmt.Println("frozen:", h.IsFrozen())         // true
+	fmt.Println("at:", h.EffectiveTime().Unix()) // exactly target
 
 	// Switch to advancing mode and verify.
 	if err := h.SetTime(target); err != nil {
@@ -241,8 +241,8 @@ func ExampleSession_Prune() {
 func ExampleNewSession_withTracking() {
 	target := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	s := faketime.NewSession(target, faketime.WithTracking())
-	defer s.Reset()   //nolint:errcheck
-	defer s.Close()   //nolint:errcheck
+	defer s.Reset() //nolint:errcheck
+	defer s.Close() //nolint:errcheck
 
 	// The process and every child it forks or execs see the same fake clock.
 	cmd := exec.Command("./postmaster")

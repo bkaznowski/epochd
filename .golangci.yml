@@ -4,6 +4,7 @@ linters:
     - govet
     - staticcheck
     - unused
+    - gofmt
 
 linters-settings:
   errcheck:

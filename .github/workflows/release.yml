@@ -1,68 +1,142 @@
 name: Release
 
+# Releases two Go modules from one commit of main:
+#
+#   vX.Y.Z               the root module, at the commit being released
+#   pkg/faketime/vX.Y.Z  the nested module, at a follow-up commit that pins its
+#                        requirement on the root module to vX.Y.Z
+#
+# Both tags and the follow-up commit are published in ONE atomic push, so a failure
+# leaves nothing half-released. Only the GitHub release pages are created
+# afterwards; if that step fails, re-running the workflow with the same version
+# notices the tags exist and just finishes the pages.
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (e.g. v0.1.0)"
+        description: "Version to release (e.g. v0.8.0)"
         required: true
+
+permissions:
+  contents: read
+
+# Never two releases at once, and never cancel one half-way.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # The input is reached only through the environment. Interpolating
+  # ${{ inputs.version }} into a script would let a crafted value run as shell.
+  VERSION: ${{ inputs.version }}
 
 jobs:
   release:
+    name: Release
+    # A release is cut from main, not from whatever branch the dispatch picked.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
-      contents: write
+      contents: write # push the tags and the follow-up commit, create releases
+      actions: read   # read the CI results for this commit
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate version
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must look like v1.2.3"
+            exit 1
+          fi
 
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - name: Validate version
+      # Both tags present: an earlier run published them and stopped before the
+      # release pages. One present: someone made a tag by hand; do not guess.
+      - name: Check what already exists
+        id: state
         run: |
-          if ! echo "${{ inputs.version }}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Version must be vX.Y.Z"; exit 1
+          have=0
+          for t in "$VERSION" "pkg/faketime/$VERSION"; do
+            if git ls-remote --exit-code --tags origin "refs/tags/$t" >/dev/null; then have=$((have + 1)); fi
+          done
+          case "$have" in
+            0) echo "resume=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "resume=true" >> "$GITHUB_OUTPUT"
+               echo "::notice::both tags for $VERSION already exist; only the release pages will be created" ;;
+            *) echo "::error::exactly one of the tags for $VERSION exists; resolve it by hand before releasing"
+               exit 1 ;;
+          esac
+
+      - name: Must release the tip of main
+        if: steps.state.outputs.resume != 'true'
+        run: |
+          tip=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::error::main has moved on ($tip); this run is for $GITHUB_SHA. Dispatch it again."
+            exit 1
           fi
 
+      # The workflow is run by hand, so nothing else guarantees the commit was
+      # ever tested. Require the push-triggered runs of CI and E2E to have passed.
+      - name: CI and E2E must have passed on this commit
+        if: steps.state.outputs.resume != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for wf in ci.yml e2e.yml; do
+            state=$(gh run list --workflow "$wf" --commit "$GITHUB_SHA" --event push --limit 1 \
+                      --json status,conclusion --jq '.[0] | "\(.status)/\(.conclusion)"')
+            if [ "$state" != "completed/success" ]; then
+              echo "::error::$wf on $GITHUB_SHA is '${state:-not found}', not completed/success. Wait for it, or fix it."
+              exit 1
+            fi
+          done
+
       - name: Configure git
+        if: steps.state.outputs.resume != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Tag root module
+      # The nested module has `replace ... => ../..`, which only matters here:
+      # consumers ignore it and resolve the root module by the version required.
+      - name: Pin pkg/faketime to this version
+        if: steps.state.outputs.resume != 'true'
         run: |
-          git tag "${{ inputs.version }}"
-          git push origin "${{ inputs.version }}"
-
-      - name: Pin faketime → epochd version and tidy
-        run: |
-          sed -i "s|require github.com/bkaznowski/epochd .*|require github.com/bkaznowski/epochd ${{ inputs.version }}|" pkg/faketime/go.mod
-          GOWORK=off go mod tidy -C pkg/faketime
-
-      - name: Commit go.mod update
-        run: |
+          git tag -a "$VERSION" -m "epochd $VERSION"
+          (
+            cd pkg/faketime
+            export GOWORK=off
+            go mod edit -require="github.com/bkaznowski/epochd@$VERSION"
+            go mod tidy
+            # What is about to be tagged must at least build.
+            go build ./...
+          )
           git add pkg/faketime/go.mod pkg/faketime/go.sum
-          git commit -m "chore: bump pkg/faketime dependency to ${{ inputs.version }}"
-          git push origin HEAD:main
+          git commit -m "chore: bump pkg/faketime dependency to $VERSION"
+          git tag -a "pkg/faketime/$VERSION" -m "pkg/faketime $VERSION"
 
-      - name: Tag faketime submodule
+      - name: Publish tags and commit
+        if: steps.state.outputs.resume != 'true'
         run: |
-          git tag "pkg/faketime/${{ inputs.version }}"
-          git push origin "pkg/faketime/${{ inputs.version }}"
+          git push --atomic origin \
+            "HEAD:refs/heads/main" \
+            "refs/tags/$VERSION" \
+            "refs/tags/pkg/faketime/$VERSION"
 
-      - name: Create GitHub Release for epochd
+      # Safe to repeat: a page that exists is left alone.
+      - name: Create GitHub releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ inputs.version }}" \
-            --title "epochd ${{ inputs.version }}" \
-            --generate-notes
-
-      - name: Create GitHub Release for pkg/faketime
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "pkg/faketime/${{ inputs.version }}" \
-            --title "pkg/faketime ${{ inputs.version }}" \
-            --generate-notes
+          gh release view "$VERSION" >/dev/null 2>&1 || \
+            gh release create "$VERSION" --verify-tag \
+              --title "epochd $VERSION" --generate-notes
+          gh release view "pkg/faketime/$VERSION" >/dev/null 2>&1 || \
+            gh release create "pkg/faketime/$VERSION" --verify-tag \
+              --title "pkg/faketime $VERSION" --generate-notes

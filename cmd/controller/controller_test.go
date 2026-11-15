@@ -15,12 +15,12 @@ import (
 	"github.com/bkaznowski/epochd/pkg/api"
 	applog "github.com/bkaznowski/epochd/pkg/log"
 
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
-	"google.golang.org/grpc/codes"
-	grpcstatus "google.golang.org/grpc/status"
 )
 
 // ---------------------------------------------------------------------------
@@ -500,7 +500,11 @@ func TestHTTPAdvanceTimeshift(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse advanced.Time: %v", err)
 	}
-	if got.Sub(want).Abs() > time.Second {
+	// The target was truncated to a whole second and the response is formatted
+	// as RFC3339, which drops the fraction again, so the two can differ from the
+	// exact "now + 48h" by just over a second, depending on where in the second
+	// the test happens to run. A tolerance of exactly one second made this flaky.
+	if got.Sub(want).Abs() > 3*time.Second {
 		t.Errorf("effectiveTime after advance: got %v want ~%v", got, want)
 	}
 
@@ -1739,4 +1743,3 @@ func TestHandlePodEventFrozenMode(t *testing.T) {
 		t.Error("expected freeze=true on re-injection of frozen timeshift")
 	}
 }
-
