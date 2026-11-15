@@ -73,12 +73,12 @@ func StartPreload(_ *exec.Cmd, _ time.Time) (*Handle, error) {
 func StartFrozenPreload(_ *exec.Cmd, _ time.Time) (*Handle, error) {
 	return nil, errNotSupported
 }
-func (h *Handle) Close() error { return nil }
-func Attach(_ int, _ time.Time) (*Handle, error)            { return nil, errNotSupported }
-func AttachFrozen(_ int, _ time.Time) (*Handle, error)      { return nil, errNotSupported }
-func (h *Handle) SetTime(_ time.Time) error                 { return errNotSupported }
-func (h *Handle) Freeze(_ time.Time) error                  { return errNotSupported }
-func (h *Handle) Reset() error                              { return errNotSupported }
+func (h *Handle) Close() error                         { return nil }
+func Attach(_ int, _ time.Time) (*Handle, error)       { return nil, errNotSupported }
+func AttachFrozen(_ int, _ time.Time) (*Handle, error) { return nil, errNotSupported }
+func (h *Handle) SetTime(_ time.Time) error            { return errNotSupported }
+func (h *Handle) Freeze(_ time.Time) error             { return errNotSupported }
+func (h *Handle) Reset() error                         { return errNotSupported }
 
 func NewSession(_ time.Time, _ ...SessionOption) *Session { return &Session{} }
 func (s *Session) Start(_ *exec.Cmd) error                { return errNotSupported }
@@ -150,12 +150,12 @@ func AttachWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
 func AttachFrozenWithTracking(_ int, _ time.Time) (*ChildTracker, error) {
 	return nil, errNotSupported
 }
-func (c *ChildTracker) IsFrozen() bool            { return false }
-func (c *ChildTracker) PIDs() []int               { return nil }
-func (c *ChildTracker) Children() []*Handle       { return nil }
-func (c *ChildTracker) SetTime(_ time.Time) error  { return errNotSupported }
-func (c *ChildTracker) Freeze(_ time.Time) error   { return errNotSupported }
+func (c *ChildTracker) IsFrozen() bool                { return false }
+func (c *ChildTracker) PIDs() []int                   { return nil }
+func (c *ChildTracker) Children() []*Handle           { return nil }
+func (c *ChildTracker) SetTime(_ time.Time) error     { return errNotSupported }
+func (c *ChildTracker) Freeze(_ time.Time) error      { return errNotSupported }
 func (c *ChildTracker) Advance(_ time.Duration) error { return errNotSupported }
-func (c *ChildTracker) Reset() error               { return errNotSupported }
-func (c *ChildTracker) Err() error                 { return errNotSupported }
-func (c *ChildTracker) Close() error               { return errNotSupported }
+func (c *ChildTracker) Reset() error                  { return errNotSupported }
+func (c *ChildTracker) Err() error                    { return errNotSupported }
+func (c *ChildTracker) Close() error                  { return errNotSupported }
