@@ -343,21 +343,57 @@ func WithMode(m Mode) SessionOption {
 // is cmd.Path; for Session.Attach it is read from /proc/<pid>/exe and may be
 // empty if it could not be read.
 //
-// A filter that uses LD_PRELOAD where it works and falls back to ptrace where it
-// does not:
+// The filter is consulted for Attach as well as Start, and it cannot tell which
+// it is being asked about. A process that is already running can only be faked
+// with ModeVDSO, so a filter that returns ModePreload for it makes Attach fail.
+// For the common policy "preload where it surely works, ptrace otherwise" use
+// WithAutoMode, which knows the difference. Write a filter for any other
+// policy, for example by path:
 //
 //	faketime.WithModeFilter(func(path string) faketime.Mode {
-//		if preload.CheckInterposable(path) != nil { // Go or static binary
-//			return faketime.ModeVDSO
+//		if strings.HasPrefix(path, "/usr/lib/postgresql/") {
+//			return faketime.ModePreload
 //		}
-//		return faketime.ModePreload
+//		return faketime.ModeVDSO
 //	})
-//
-// Be aware that CheckInterposable inspects only the binary itself. A shell
-// script that goes on to exec a Go binary passes it, and that grandchild would
-// stay on real time under ModePreload; start such launchers with ModeVDSO and
-// WithTracking instead.
 type ModeFilter func(path string) Mode
+
+// WithAutoMode picks the mode per process by what the binary is: Session.Start
+// uses ModePreload for a binary that is positively a dynamically linked, non-Go
+// ELF file the loader will honour LD_PRELOAD for (preload.CheckStrict), and
+// ModeVDSO for everything else. Session.Attach always uses ModeVDSO, since a
+// running process cannot be given a preload library.
+//
+// "Everything else" includes what cannot be classified: a shell script, which
+// may go on to exec a Go or static binary that preload would leave on real time,
+// and a setuid binary, whose loader ignores LD_PRELOAD. Those get ptrace, which
+// works on all of them; combine with WithTracking so their children are
+// followed. What auto mode cannot see is a dynamic binary that later execs a Go
+// child: that child stays on real time. If the process tree is known to do that,
+// start it with Session.StartMode(cmd, ModeVDSO).
+//
+// It replaces WithMode as the default. A WithModeFilter, if also given, decides
+// first, and an explicit Session.StartMode decides over both.
+func WithAutoMode() SessionOption {
+	return func(s *Session) { s.autoMode = true }
+}
+
+// pickMode applies the precedence between the ways a mode can be chosen:
+// an explicit StartMode, then the filter, then auto mode, then the default.
+func pickMode(path string, attach bool, explicit *Mode, def Mode, filter ModeFilter, auto bool) Mode {
+	switch {
+	case explicit != nil:
+		return *explicit
+	case filter != nil:
+		return filter(path)
+	case auto:
+		if !attach && preload.CheckStrict(path) == nil {
+			return ModePreload
+		}
+		return ModeVDSO
+	}
+	return def
+}
 
 // WithModeFilter makes the mode a per-process decision: filter is consulted on
 // every call to Session.Start and Session.Attach, and its result decides how
@@ -461,6 +497,7 @@ type Session struct {
 	fakeTimeFilter FakeTimeFilter
 	mode           Mode
 	modeFilter     ModeFilter
+	autoMode       bool
 	trackers       []*ChildTracker
 	cmdWaiters     map[int]*cmdWaiter // lazily populated by WaitPID, keyed by pid
 }
@@ -508,8 +545,9 @@ func (s *Session) effectiveTarget() time.Time {
 // comment for why calling cmd.Wait() directly should be avoided.
 //
 // The Mode that fakes cmd's clock is the one WithModeFilter returns for
-// cmd.Path if a filter was given, otherwise the session default from WithMode
-// (ModeVDSO unless set). Use StartMode to choose for one call explicitly.
+// cmd.Path if a filter was given, otherwise WithAutoMode's choice if enabled,
+// otherwise the session default from WithMode (ModeVDSO unless set). Use
+// StartMode to choose for one call explicitly.
 func (s *Session) Start(cmd *exec.Cmd) error {
 	return s.start(cmd, nil)
 }
@@ -535,6 +573,7 @@ func (s *Session) start(cmd *exec.Cmd, explicit *Mode) error {
 	fakeTimeFilter := s.fakeTimeFilter
 	mode := s.mode
 	modeFilter := s.modeFilter
+	autoMode := s.autoMode
 	s.mu.Unlock()
 
 	if fakeTimeFilter != nil && !fakeTimeFilter(cmd.Path) {
@@ -547,12 +586,7 @@ func (s *Session) start(cmd *exec.Cmd, explicit *Mode) error {
 		return nil
 	}
 
-	switch {
-	case explicit != nil:
-		mode = *explicit
-	case modeFilter != nil:
-		mode = modeFilter(cmd.Path)
-	}
+	mode = pickMode(cmd.Path, false, explicit, mode, modeFilter, autoMode)
 	if err := checkMode(mode); err != nil {
 		return fmt.Errorf("faketime: Session.Start: %w", err)
 	}
@@ -628,6 +662,7 @@ func (s *Session) Attach(pid int) error {
 	fakeTimeFilter := s.fakeTimeFilter
 	mode := s.mode
 	modeFilter := s.modeFilter
+	autoMode := s.autoMode
 	s.mu.Unlock()
 
 	var path string
@@ -639,16 +674,14 @@ func (s *Session) Attach(pid int) error {
 		return nil
 	}
 
-	if modeFilter != nil {
-		mode = modeFilter(path)
-	}
+	mode = pickMode(path, true, nil, mode, modeFilter, autoMode)
 	if err := checkMode(mode); err != nil {
 		return fmt.Errorf("faketime: Session.Attach pid %d: %w", pid, err)
 	}
 
 	// LD_PRELOAD is read by the dynamic loader at exec, so a process that is
-	// already running cannot be given the library. In a mixed session this is
-	// the mode filter's cue to return ModeVDSO for processes it expects to attach.
+	// already running cannot be given the library. In a mixed session use
+	// WithAutoMode, which always picks ModeVDSO here, or a filter that does.
 	if mode == ModePreload {
 		return fmt.Errorf("faketime: Session.Attach pid %d: ModePreload cannot attach to a running process; use ModeVDSO (WithModeFilter can pick it per process)", pid)
 	}

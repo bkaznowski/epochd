@@ -422,7 +422,7 @@ unchanged, so a program that computes "now + 5s" from the fake clock waits again
 one. Relative timeouts and the monotonic clocks behave normally.
 
 The same choice is available from Go, per process, in one `faketime.Session`:
-`WithMode`, `WithModeFilter` and `Session.StartMode`.
+`WithMode`, `WithModeFilter` and `Session.StartMode`. `WithAutoMode()` makes the common choice for you: preload for a binary that is positively a dynamically linked, non-Go ELF (`preload.CheckStrict`), ptrace for everything else (scripts, Go, static, setuid) and for `Attach`.
 
 With `--track`, a child forked from a thread that was created after injection produces no
 ptrace event; the tracker finds it by sweeping `/proc` every 100 ms and gives it the

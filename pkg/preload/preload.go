@@ -54,6 +54,8 @@ import (
 	"time"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/bkaznowski/epochd/pkg/trampoline"
 )
 
@@ -324,6 +326,45 @@ func StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 		return nil, err
 	}
 	return h, nil
+}
+
+// CheckStrict is CheckInterposable for a caller that must be sure, because the
+// alternative to preload is a mode that always works and a wrong "yes" leaves the
+// process on real time without a word. It returns nil only for a binary that is
+// positively a dynamically linked, non-Go ELF file the loader will honour
+// LD_PRELOAD for. Everything CheckInterposable lets through as "cannot tell" is
+// refused here:
+//
+//   - a shell script or other non-ELF file: it may go on to exec a Go or static
+//     binary, which would stay on real time;
+//   - a setuid or setgid file, or one with file capabilities: the loader runs
+//     such programs in secure-execution mode and ignores LD_PRELOAD;
+//   - a path that cannot be read.
+//
+// Errors wrap ErrNotInterposable. The check still sees only the binary itself:
+// a dynamic C program that later execs a Go child passes.
+func CheckStrict(path string) error {
+	if resolved, err := exec.LookPath(path); err == nil {
+		path = resolved
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrNotInterposable, err)
+	}
+	if fi.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
+		return fmt.Errorf("%w: %s is setuid/setgid, so the loader ignores LD_PRELOAD for it", ErrNotInterposable, path)
+	}
+	if sz, err := unix.Getxattr(path, "security.capability", nil); err == nil && sz > 0 {
+		return fmt.Errorf("%w: %s has file capabilities, so the loader ignores LD_PRELOAD for it", ErrNotInterposable, path)
+	}
+	if err := CheckInterposable(path); err != nil {
+		return err
+	}
+	f, err := elf.Open(path)
+	if err != nil {
+		return fmt.Errorf("%w: %s is not an ELF binary (a script may exec something LD_PRELOAD cannot affect)", ErrNotInterposable, path)
+	}
+	return f.Close()
 }
 
 // CheckInterposable reports whether LD_PRELOAD can affect the binary at path,

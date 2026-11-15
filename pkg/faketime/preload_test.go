@@ -422,3 +422,92 @@ func TestPreloadAttachedExposedOnHandles(t *testing.T) {
 		t.Error("a handle with no preload backend must report ok=false")
 	}
 }
+
+func TestPickModePrecedence(t *testing.T) {
+	needTool(t, "date")
+	vdso, pre := ModeVDSO, ModePreload
+	always := func(m Mode) ModeFilter { return func(string) Mode { return m } }
+	script := func(t *testing.T) string {
+		p := t.TempDir() + "/s.sh"
+		if err := os.WriteFile(p, []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	self, _ := os.Executable() // a Go binary
+
+	cases := []struct {
+		name     string
+		path     string
+		attach   bool
+		explicit *Mode
+		def      Mode
+		filter   ModeFilter
+		auto     bool
+		want     Mode
+	}{
+		{"default", "date", false, nil, ModeVDSO, nil, false, ModeVDSO},
+		{"WithMode default", "date", false, nil, ModePreload, nil, false, ModePreload},
+		{"auto: dynamic C binary gets preload", "date", false, nil, ModeVDSO, nil, true, ModePreload},
+		{"auto: Go binary gets vdso", self, false, nil, ModeVDSO, nil, true, ModeVDSO},
+		{"auto: script gets vdso", script(t), false, nil, ModeVDSO, nil, true, ModeVDSO},
+		{"auto: unreadable path gets vdso", "/nonexistent/x", false, nil, ModeVDSO, nil, true, ModeVDSO},
+		{"auto overrides WithMode(preload) for a Go binary", self, false, nil, ModePreload, nil, true, ModeVDSO},
+		{"auto: attach is always vdso", "date", true, nil, ModeVDSO, nil, true, ModeVDSO},
+		{"filter beats auto", self, false, nil, ModeVDSO, always(pre), true, ModePreload},
+		{"explicit beats filter", "date", false, &vdso, ModeVDSO, always(pre), true, ModeVDSO},
+		{"explicit beats auto", "date", false, &vdso, ModeVDSO, nil, true, ModeVDSO},
+		{"explicit preload beats auto", self, false, &pre, ModeVDSO, nil, true, ModePreload},
+	}
+	for _, c := range cases {
+		if got := pickMode(c.path, c.attach, c.explicit, c.def, c.filter, c.auto); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// End to end: a session with auto mode fakes a dynamic binary through preload
+// (no tracer) and a Go binary through ptrace, on one clock.
+func TestSessionAutoModeMixesBackends(t *testing.T) {
+	needTool(t, "date")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(time.Now().Add(100*24*time.Hour), WithAutoMode())
+	t.Cleanup(func() { s.Close() }) //nolint:errcheck
+
+	dateCmd := exec.Command("date", "-u", "+%s")
+	var out bytes.Buffer
+	dateCmd.Stdout = &out
+	if err := s.Start(dateCmd); err != nil {
+		t.Fatalf("Start date: %v", err)
+	}
+	goCmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	goCmd.Env = append(os.Environ(), helperEnv+"=1")
+	if err := s.Start(goCmd); err != nil {
+		t.Fatalf("Start Go helper: %v", err)
+	}
+	t.Cleanup(func() { goCmd.Process.Kill(); goCmd.Wait() }) //nolint:errcheck
+
+	if _, err := s.WaitPID(dateCmd.Process.Pid); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := parseEpoch(t, out.String()), time.Now().Add(100*24*time.Hour).Unix(); !near(got, want) {
+		t.Errorf("date saw %d, want ~%d", got, want)
+	}
+
+	var pre, vdso int
+	s.mu.Lock()
+	for _, h := range s.handles {
+		if h.pre != nil {
+			pre++
+		} else {
+			vdso++
+		}
+	}
+	s.mu.Unlock()
+	if pre != 1 || vdso != 1 {
+		t.Errorf("handles: %d preload, %d vdso; want one of each", pre, vdso)
+	}
+}

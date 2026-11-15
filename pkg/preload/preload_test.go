@@ -573,3 +573,54 @@ func TestStuckWriterKeepsLastGoodClock(t *testing.T) {
 			got, target.Unix(), time.Now().Unix())
 	}
 }
+
+func TestCheckStrict(t *testing.T) {
+	requireTool(t, "date")
+	is := func(t *testing.T, err error, substr string) {
+		t.Helper()
+		if !errors.Is(err, ErrNotInterposable) || !strings.Contains(err.Error(), substr) {
+			t.Errorf("got %v, want ErrNotInterposable mentioning %q", err, substr)
+		}
+	}
+
+	t.Run("dynamic C binary passes", func(t *testing.T) {
+		if err := CheckStrict("date"); err != nil {
+			t.Errorf("date: %v", err)
+		}
+	})
+	t.Run("go binary is refused", func(t *testing.T) {
+		self, _ := os.Executable()
+		is(t, CheckStrict(self), "Go binary")
+	})
+	t.Run("script is refused although CheckInterposable lets it through", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "s.sh")
+		if err := os.WriteFile(p, []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckInterposable(p); err != nil {
+			t.Fatalf("premise: CheckInterposable should accept a script, got %v", err)
+		}
+		is(t, CheckStrict(p), "not an ELF")
+	})
+	t.Run("setuid copy is refused", func(t *testing.T) {
+		src, err := exec.LookPath("date")
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(t.TempDir(), "date-suid")
+		if err := os.WriteFile(p, b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o755|os.ModeSetuid); err != nil {
+			t.Skipf("cannot set the setuid bit here: %v", err)
+		}
+		is(t, CheckStrict(p), "setuid")
+	})
+	t.Run("missing file is refused", func(t *testing.T) {
+		is(t, CheckStrict(filepath.Join(t.TempDir(), "nope")), "no such file")
+	})
+}
