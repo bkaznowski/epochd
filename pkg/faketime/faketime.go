@@ -266,7 +266,10 @@ func (h *Handle) Reset() error {
 // SessionOption configures a Session.
 type SessionOption func(*Session)
 
-// Mode selects how a Session fakes the clock for the processes it starts.
+// Mode selects how a Session fakes the clock for a process it starts. A session
+// can use both modes at once: WithMode sets the default, WithModeFilter decides
+// per process, and Session.StartMode decides per call. One session clock still
+// drives them all, whichever mode each process runs in.
 type Mode int
 
 const (
@@ -288,10 +291,66 @@ const (
 	ModePreload
 )
 
-// WithMode selects how the session fakes the clock; see Mode. Without this
-// option the session uses ModeVDSO, matching prior behaviour.
+// String returns the mode's name ("vdso" or "preload").
+func (m Mode) String() string {
+	switch m {
+	case ModeVDSO:
+		return "vdso"
+	case ModePreload:
+		return "preload"
+	}
+	return fmt.Sprintf("Mode(%d)", int(m))
+}
+
+// checkMode returns an error for a Mode value that is neither defined constant,
+// so a typo or a zero-value mix-up fails loudly instead of silently picking one.
+func checkMode(m Mode) error {
+	if m != ModeVDSO && m != ModePreload {
+		return fmt.Errorf("faketime: unknown %v", m)
+	}
+	return nil
+}
+
+// WithMode selects the session's default mode, used for every process that
+// neither WithModeFilter nor Session.StartMode decides otherwise. Without this
+// option the default is ModeVDSO, matching prior behaviour.
 func WithMode(m Mode) SessionOption {
 	return func(s *Session) { s.mode = m }
+}
+
+// ModeFilter decides, for a single process being added to a Session, which Mode
+// fakes its clock. path is the resolved executable path: for Session.Start it
+// is cmd.Path; for Session.Attach it is read from /proc/<pid>/exe and may be
+// empty if it could not be read.
+//
+// A filter that uses LD_PRELOAD where it works and falls back to ptrace where it
+// does not:
+//
+//	faketime.WithModeFilter(func(path string) faketime.Mode {
+//		if preload.CheckInterposable(path) != nil { // Go or static binary
+//			return faketime.ModeVDSO
+//		}
+//		return faketime.ModePreload
+//	})
+//
+// Be aware that CheckInterposable inspects only the binary itself. A shell
+// script that goes on to exec a Go binary passes it, and that grandchild would
+// stay on real time under ModePreload; start such launchers with ModeVDSO and
+// WithTracking instead.
+type ModeFilter func(path string) Mode
+
+// WithModeFilter makes the mode a per-process decision: filter is consulted on
+// every call to Session.Start and Session.Attach, and its result decides how
+// that process is faked. It takes precedence over WithMode, and is itself
+// overridden by an explicit Session.StartMode. WithFakeTimeFilter still runs
+// first, so a process it excludes gets no fake time in either mode.
+//
+// A session with both kinds of process behaves as one clock: SetTime, Freeze,
+// Advance, Reset, WaitPID, Prune and Close all work across the mix.
+// WithTracking and WithTrackingFilter apply only to the processes that end up
+// in ModeVDSO.
+func WithModeFilter(filter ModeFilter) SessionOption {
+	return func(s *Session) { s.modeFilter = filter }
 }
 
 // WithTracking enables automatic fake-time injection into any processes spawned
@@ -381,6 +440,7 @@ type Session struct {
 	trackingFilter TrackingFilter
 	fakeTimeFilter FakeTimeFilter
 	mode           Mode
+	modeFilter     ModeFilter
 	trackers       []*ChildTracker
 	cmdWaiters     map[int]*cmdWaiter // lazily populated by WaitPID, keyed by pid
 }
@@ -426,7 +486,27 @@ func (s *Session) effectiveTarget() time.Time {
 // exits — it works the same way whether or not cmd ends up tracked, so
 // callers don't need to know or care which applies; see WaitPID's doc
 // comment for why calling cmd.Wait() directly should be avoided.
+//
+// The Mode that fakes cmd's clock is the one WithModeFilter returns for
+// cmd.Path if a filter was given, otherwise the session default from WithMode
+// (ModeVDSO unless set). Use StartMode to choose for one call explicitly.
 func (s *Session) Start(cmd *exec.Cmd) error {
+	return s.start(cmd, nil)
+}
+
+// StartMode is like Start but fakes cmd's clock with mode, overriding both
+// WithModeFilter and the session default for this one process. This is how a
+// caller who knows better than any filter picks a mode per process, for
+// example ModePreload for a Postgres server and ModeVDSO for a Go service in the
+// same session. WithFakeTimeFilter still applies first: a process it excludes
+// is started on real time whatever mode is requested.
+func (s *Session) StartMode(cmd *exec.Cmd, mode Mode) error {
+	return s.start(cmd, &mode)
+}
+
+// start is Start and StartMode: explicit, when non-nil, wins over the filter
+// and the session default.
+func (s *Session) start(cmd *exec.Cmd, explicit *Mode) error {
 	s.mu.Lock()
 	target := s.effectiveTarget()
 	frozen := s.frozen
@@ -434,6 +514,7 @@ func (s *Session) Start(cmd *exec.Cmd) error {
 	trackingFilter := s.trackingFilter
 	fakeTimeFilter := s.fakeTimeFilter
 	mode := s.mode
+	modeFilter := s.modeFilter
 	s.mu.Unlock()
 
 	if fakeTimeFilter != nil && !fakeTimeFilter(cmd.Path) {
@@ -444,6 +525,16 @@ func (s *Session) Start(cmd *exec.Cmd) error {
 		s.cmds = append(s.cmds, cmd)
 		s.mu.Unlock()
 		return nil
+	}
+
+	switch {
+	case explicit != nil:
+		mode = *explicit
+	case modeFilter != nil:
+		mode = modeFilter(cmd.Path)
+	}
+	if err := checkMode(mode); err != nil {
+		return fmt.Errorf("faketime: Session.Start: %w", err)
 	}
 
 	// Preload mode needs no tracer: descendants inherit the clock through the
@@ -516,10 +607,11 @@ func (s *Session) Attach(pid int) error {
 	trackingFilter := s.trackingFilter
 	fakeTimeFilter := s.fakeTimeFilter
 	mode := s.mode
+	modeFilter := s.modeFilter
 	s.mu.Unlock()
 
 	var path string
-	if trackingFilter != nil || fakeTimeFilter != nil {
+	if trackingFilter != nil || fakeTimeFilter != nil || modeFilter != nil {
 		path = readBinaryPath(pid)
 	}
 
@@ -527,10 +619,18 @@ func (s *Session) Attach(pid int) error {
 		return nil
 	}
 
+	if modeFilter != nil {
+		mode = modeFilter(path)
+	}
+	if err := checkMode(mode); err != nil {
+		return fmt.Errorf("faketime: Session.Attach pid %d: %w", pid, err)
+	}
+
 	// LD_PRELOAD is read by the dynamic loader at exec, so a process that is
-	// already running cannot be given the library.
+	// already running cannot be given the library. In a mixed session this is
+	// the mode filter's cue to return ModeVDSO for processes it expects to attach.
 	if mode == ModePreload {
-		return fmt.Errorf("faketime: Session.Attach pid %d: ModePreload cannot attach to a running process; use the default ModeVDSO", pid)
+		return fmt.Errorf("faketime: Session.Attach pid %d: ModePreload cannot attach to a running process; use ModeVDSO (WithModeFilter can pick it per process)", pid)
 	}
 
 	if trackingFilter != nil {

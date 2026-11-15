@@ -33,9 +33,28 @@ const (
 	ModePreload
 )
 
+// String returns the mode's name ("vdso" or "preload").
+func (m Mode) String() string {
+	switch m {
+	case ModeVDSO:
+		return "vdso"
+	case ModePreload:
+		return "preload"
+	}
+	return "unknown"
+}
+
 // WithMode returns a SessionOption that selects the mode. On non-Linux
 // platforms it is accepted but has no effect.
 func WithMode(_ Mode) SessionOption { return func(*Session) {} }
+
+// ModeFilter decides which Mode fakes a single process's clock. On non-Linux
+// platforms it is accepted but never called.
+type ModeFilter func(path string) Mode
+
+// WithModeFilter returns a SessionOption that decides the mode per process. On
+// non-Linux platforms it is accepted but has no effect.
+func WithModeFilter(_ ModeFilter) SessionOption { return func(*Session) {} }
 
 // TrackingFilter decides whether a process being added to a Session should be
 // started/attached with tracking. On non-Linux platforms it is accepted but
@@ -82,6 +101,7 @@ func (h *Handle) Reset() error                         { return errNotSupported 
 
 func NewSession(_ time.Time, _ ...SessionOption) *Session { return &Session{} }
 func (s *Session) Start(_ *exec.Cmd) error                { return errNotSupported }
+func (s *Session) StartMode(_ *exec.Cmd, _ Mode) error    { return errNotSupported }
 func (s *Session) Attach(_ int) error                     { return errNotSupported }
 func (s *Session) SetTime(_ time.Time) error              { return errNotSupported }
 func (s *Session) Freeze(_ time.Time) error               { return errNotSupported }

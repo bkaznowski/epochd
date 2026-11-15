@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bkaznowski/epochd/pkg/faketime"
+	"github.com/bkaznowski/epochd/pkg/preload"
 )
 
 // Inject a fake clock into a child process. The process sees time.Now()
@@ -302,4 +303,33 @@ func ExampleWithSession() {
 			// ... assert cross-service behaviour at the frozen instant ...
 		},
 	)
+}
+
+// A session can fake some processes with LD_PRELOAD and others with ptrace and
+// the vDSO, and one clock still drives them all. This filter uses preload where
+// it works (Postgres, Python, Redpanda, ...) and falls back to the vDSO for Go
+// and statically linked binaries, which LD_PRELOAD cannot affect.
+// This example is compiled but not executed by go test.
+func ExampleWithModeFilter() {
+	target := time.Date(2030, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	s := faketime.NewSession(target, faketime.WithModeFilter(func(path string) faketime.Mode {
+		if preload.CheckInterposable(path) != nil { // Go or static binary
+			return faketime.ModeVDSO
+		}
+		return faketime.ModePreload
+	}))
+	defer s.Close() // releases the preload processes' state; call after they exit
+
+	_ = s.Start(exec.Command("postgres", "-D", "/tmp/pgdata")) // preload: forks inherit the clock
+	_ = s.Start(exec.Command("./my-go-service"))               // vdso: the Go runtime reads the vDSO directly
+
+	// To decide for one process regardless of any filter:
+	_ = s.StartMode(exec.Command("./launcher.sh"), faketime.ModeVDSO)
+
+	// One call moves every process, in both modes.
+	if err := s.Freeze(target.Add(24 * time.Hour)); err != nil {
+		panic(err)
+	}
+	fmt.Println(s.Len(), "processes on one clock")
 }
