@@ -7,6 +7,10 @@ metadata:
     app: epochd-controller
 spec:
   replicas: 1
+  # One controller at a time. A rolling update would briefly run two, and both
+  # would sweep, persist to the same ConfigMap and inject into the same pods.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: epochd-controller
@@ -20,15 +24,29 @@ spec:
         app: epochd-controller
     spec:
       serviceAccountName: epochd-controller
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: auth
+          secret:
+            secretName: epochd-auth
 
       containers:
         - name: controller
           image: ghcr.io/bkaznowski/epochd-controller:latest
           imagePullPolicy: IfNotPresent
+          # API clients must present the api-token (a bearer token), and the
+          # controller presents the agent-token to the agents. Both come from the
+          # epochd-auth Secret (see deploy/README.md). Add --agent-ca-file (and
+          # --agent-client-cert-file/--agent-client-key-file for mutual TLS) once the
+          # agents serve TLS.
           args:
             - "--listen=:8080"
-            - "--agent-port=9100"
+            - "--agent-port=9433"
             - "--sweep-interval=30s"
+            - "--auth-token-file=/etc/epochd/auth/api-token"
+            - "--agent-token-file=/etc/epochd/auth/agent-token"
           env:
             - name: CONTROLLER_NAMESPACE
               valueFrom:
@@ -38,6 +56,15 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+          volumeMounts:
+            - name: auth
+              mountPath: /etc/epochd/auth
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           readinessProbe:
             httpGet:
               path: /healthz

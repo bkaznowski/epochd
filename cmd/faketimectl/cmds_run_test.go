@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -128,5 +129,104 @@ func TestExitCodeFor(t *testing.T) {
 	}
 	if _, ok := exitCodeFor(os.ErrNotExist); ok {
 		t.Error("a non-exit error should report ok=false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Signal forwarding
+// ---------------------------------------------------------------------------
+
+// captureExit makes exitFunc record the status instead of ending the test binary.
+func captureExit(t *testing.T) *int {
+	t.Helper()
+	code := -1
+	old := exitFunc
+	exitFunc = func(c int) { code = c }
+	t.Cleanup(func() { exitFunc = old })
+	return &code
+}
+
+// `docker stop` sends SIGTERM to PID 1, which is faketimectl when it is a
+// container's entry point. It must reach the command it started, not just stop
+// faketimectl and orphan it.
+func TestRunForwardsSIGTERMToTheCommand(t *testing.T) {
+	requireTool(t, "sh")
+	requireTool(t, "sleep")
+	captureStderr(t)
+	code := captureExit(t)
+
+	ready := filepath.Join(t.TempDir(), "ready")
+	script := "trap 'exit 42' TERM; : > " + ready + "; while :; do sleep 0.05; done"
+
+	done := make(chan error, 1)
+	go func() {
+		done <- run([]string{"run", "--mode=preload", "--time=2030-01-01T00:00:00Z", "--", "sh", "-c", script})
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never started")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return: the SIGTERM never reached the command")
+	}
+	if *code != 42 {
+		t.Errorf("exit status = %d, want 42 (the command's own handler ran)", *code)
+	}
+}
+
+// The token for the controller subcommands comes from the environment, never a flag.
+func TestTokenFromEnv(t *testing.T) {
+	t.Setenv("EPOCHD_TOKEN", "")
+	t.Setenv("EPOCHD_TOKEN_FILE", "")
+	if tok, err := tokenFromEnv(); tok != "" || err != nil {
+		t.Errorf("with nothing set: (%q, %v), want no token and no error", tok, err)
+	}
+
+	t.Setenv("EPOCHD_TOKEN", "  literal  ")
+	if tok, _ := tokenFromEnv(); tok != "literal" {
+		t.Errorf("EPOCHD_TOKEN = %q, want it trimmed", tok)
+	}
+
+	file := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(file, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EPOCHD_TOKEN", "")
+	t.Setenv("EPOCHD_TOKEN_FILE", file)
+	if tok, err := tokenFromEnv(); tok != "from-file" || err != nil {
+		t.Errorf("EPOCHD_TOKEN_FILE = (%q, %v), want the file's contents", tok, err)
+	}
+
+	t.Setenv("EPOCHD_TOKEN", "wins")
+	if tok, _ := tokenFromEnv(); tok != "wins" {
+		t.Errorf("EPOCHD_TOKEN should take precedence over the file, got %q", tok)
+	}
+
+	t.Setenv("EPOCHD_TOKEN", "")
+	t.Setenv("EPOCHD_TOKEN_FILE", filepath.Join(t.TempDir(), "absent"))
+	if _, err := tokenFromEnv(); err == nil {
+		t.Error("an unreadable EPOCHD_TOKEN_FILE must be an error, not silently no token")
+	}
+	empty := filepath.Join(t.TempDir(), "empty")
+	os.WriteFile(empty, []byte("\n"), 0o600) //nolint:errcheck
+	t.Setenv("EPOCHD_TOKEN_FILE", empty)
+	if _, err := tokenFromEnv(); err == nil {
+		t.Error("an empty EPOCHD_TOKEN_FILE must be an error")
 	}
 }

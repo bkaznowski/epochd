@@ -44,7 +44,7 @@ func TestTimeshiftDate(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	client := sdk.NewClient(controllerURL)
+	client := sdk.NewClient(controllerURL).WithToken(os.Getenv("EPOCHD_TOKEN"))
 
 	const (
 		ns  = "epochd-e2e"
@@ -105,7 +105,7 @@ func TestTimeshiftUpdate(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	client := sdk.NewClient(controllerURL)
+	client := sdk.NewClient(controllerURL).WithToken(os.Getenv("EPOCHD_TOKEN"))
 
 	const (
 		ns  = "epochd-e2e"

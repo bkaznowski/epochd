@@ -3,10 +3,12 @@ package sdk_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -737,5 +739,165 @@ func TestWithTimeTRunsFn(t *testing.T) {
 	})
 	if !called {
 		t.Error("WithTimeT fn body was not called when EPOCHD_URL is set")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Authentication, wrapped errors, escaping and cleanup
+// ---------------------------------------------------------------------------
+
+// recordingServer captures every request the client makes and answers 204 (or
+// the given status for a path) so the client's wire behaviour can be checked.
+type recordingServer struct {
+	mu       sync.Mutex
+	requests []*recordedRequest
+	respond  func(r *http.Request) (int, any)
+}
+
+type recordedRequest struct {
+	method, rawPath, auth string
+}
+
+func (rs *recordingServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rs.mu.Lock()
+	rs.requests = append(rs.requests, &recordedRequest{r.Method, r.URL.EscapedPath(), r.Header.Get("Authorization")})
+	rs.mu.Unlock()
+	code, body := http.StatusNoContent, any(nil)
+	if rs.respond != nil {
+		code, body = rs.respond(r)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if body != nil {
+		json.NewEncoder(w).Encode(body) //nolint:errcheck
+	}
+}
+
+func (rs *recordingServer) seen() []*recordedRequest {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return append([]*recordedRequest(nil), rs.requests...)
+}
+
+func TestWithTokenSendsABearerCredential(t *testing.T) {
+	rs := &recordingServer{}
+	srv := httptest.NewServer(rs)
+	defer srv.Close()
+
+	anon := sdk.NewClient(srv.URL)
+	authed := anon.WithToken("s3cret")
+
+	anon.DeleteTimeshift(context.Background(), "a")   //nolint:errcheck
+	authed.DeleteTimeshift(context.Background(), "b") //nolint:errcheck
+
+	got := rs.seen()
+	if len(got) != 2 {
+		t.Fatalf("%d requests, want 2", len(got))
+	}
+	if got[0].auth != "" {
+		t.Errorf("the original client sent %q; WithToken must not change it", got[0].auth)
+	}
+	if got[1].auth != "Bearer s3cret" {
+		t.Errorf("authorization = %q, want %q", got[1].auth, "Bearer s3cret")
+	}
+}
+
+func TestUnauthorizedIsAnAPIErrorWithTheStatus(t *testing.T) {
+	rs := &recordingServer{respond: func(*http.Request) (int, any) {
+		return http.StatusUnauthorized, api.ErrorResponse{Error: "unauthorized"}
+	}}
+	srv := httptest.NewServer(rs)
+	defer srv.Close()
+
+	err := sdk.NewClient(srv.URL).DeleteTimeshift(context.Background(), "x")
+	var ae *sdk.APIError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusUnauthorized {
+		t.Errorf("error = %v, want an *APIError with status 401", err)
+	}
+}
+
+// The classifiers must see through fmt.Errorf("...: %w", err).
+func TestErrorClassifiersSeeThroughWrapping(t *testing.T) {
+	notFound := &sdk.APIError{StatusCode: http.StatusNotFound, Message: "gone"}
+	conflict := &sdk.APIError{StatusCode: http.StatusConflict, Message: "taken"}
+
+	wrapped := fmt.Errorf("deleting the fixture: %w", notFound)
+	if !sdk.IsNotFound(wrapped) {
+		t.Error("IsNotFound missed a wrapped 404")
+	}
+	if sdk.IsConflict(wrapped) {
+		t.Error("IsConflict reported a 404")
+	}
+	if !sdk.IsConflict(fmt.Errorf("setup: %w", fmt.Errorf("again: %w", conflict))) {
+		t.Error("IsConflict missed a doubly wrapped 409")
+	}
+	if sdk.IsNotFound(nil) || sdk.IsNotFound(errors.New("plain")) {
+		t.Error("IsNotFound matched something that is not an API error")
+	}
+}
+
+// An id with a slash or query character must not be able to address another
+// resource.
+func TestIDsAreEscapedInPaths(t *testing.T) {
+	rs := &recordingServer{}
+	srv := httptest.NewServer(rs)
+	defer srv.Close()
+
+	c := sdk.NewClient(srv.URL)
+	c.DeleteTimeshift(context.Background(), "../resolve?x=1") //nolint:errcheck
+
+	got := rs.seen()
+	if len(got) != 1 {
+		t.Fatalf("%d requests", len(got))
+	}
+	if want := "/timeshifts/..%2Fresolve%3Fx=1"; got[0].rawPath != want {
+		t.Errorf("path = %q, want %q", got[0].rawPath, want)
+	}
+}
+
+func TestWarningsAreExposed(t *testing.T) {
+	rs := &recordingServer{respond: func(*http.Request) (int, any) {
+		return http.StatusOK, api.TimeshiftResponse{
+			ID: "x", Namespace: "default", Time: "2030-01-01T00:00:00Z",
+			AppliedTo: []string{"web-1/main"}, Warnings: []string{"web-2/main: node unreachable"},
+		}
+	}}
+	srv := httptest.NewServer(rs)
+	defer srv.Close()
+
+	ts, err := sdk.NewClient(srv.URL).AdvanceTimeshift(context.Background(), "x", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ts.Warnings) != 1 || !strings.Contains(ts.Warnings[0], "web-2/main") {
+		t.Errorf("Warnings = %v", ts.Warnings)
+	}
+}
+
+// If the caller's context is spent by the time fn returns, the delete must still
+// go out; with that context it would be refused at once and the timeshift left
+// faking the clock until its TTL.
+func TestWithTimeStillDeletesAfterTheContextIsCancelled(t *testing.T) {
+	var deleted atomic.Int32
+	fs := newFakeServer()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted.Add(1)
+		}
+		fs.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	err := sdk.WithTime(ctx, sdk.NewClient(srv.URL), "default", "app=web", time.Now().Add(time.Hour), time.Minute,
+		func(context.Context, *sdk.Timeshift) error {
+			cancel() // the test deadline fires while fn is running
+			return errors.New("fn failed")
+		})
+	if err == nil {
+		t.Fatal("expected fn's error")
+	}
+	if deleted.Load() != 1 {
+		t.Errorf("DELETE requests = %d, want 1: the cleanup was lost with the cancelled context", deleted.Load())
 	}
 }

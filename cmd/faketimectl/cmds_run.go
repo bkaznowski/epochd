@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +24,55 @@ const (
 	modeVDSO    = "vdso"
 	modePreload = "preload"
 )
+
+// exitFunc ends the process with the command's exit status. It is a variable so
+// tests can observe the status without terminating the test binary.
+var exitFunc = os.Exit
+
+// forwardedSignals are relayed to the command run starts. Without this the
+// signal would stop faketimectl and leave the command running: `docker stop`
+// sends SIGTERM to PID 1, and faketimectl is PID 1 when it is a container's entry
+// point.
+var forwardedSignals = []os.Signal{syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGUSR1, syscall.SIGUSR2}
+
+// forwardSignals starts relaying signals to the command once it is running, and
+// returns a function that stops. Call it before starting the command so that a
+// signal arriving in between is held, not lost.
+//
+// SIGINT is relayed only when stdin is not a terminal. From a terminal, Ctrl-C
+// already reaches the command (it is in the same foreground process group), and
+// relaying it too would deliver it twice, which many programs read as "force
+// quit". Without a terminal nothing else delivers it.
+func forwardSignals() (start func(p *os.Process), stop func()) {
+	sigs := []os.Signal{}
+	sigs = append(sigs, forwardedSignals...)
+	if fi, err := os.Stdin.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		sigs = append(sigs, os.Interrupt)
+	}
+	ch := make(chan os.Signal, 16)
+	signal.Notify(ch, sigs...)
+	done := make(chan struct{})
+	start = func(p *os.Process) {
+		go func() {
+			for {
+				select {
+				case sig := <-ch:
+					p.Signal(sig) //nolint:errcheck // the command may already have exited
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			signal.Stop(ch)
+			close(done)
+		})
+	}
+	return start, stop
+}
 
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
@@ -59,6 +110,9 @@ func cmdRun(args []string) error {
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
 
+	startForwarding, stopForwarding := forwardSignals()
+	defer stopForwarding()
+
 	// cmd.Start() is not called here: the inject.*FollowChild* functions
 	// below start cmd themselves, on the Tracer's own pinned OS thread. The
 	// fork (which performs PTRACE_TRACEME) must happen on that same thread as
@@ -88,6 +142,7 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("run: inject: %v", err)
 	}
 	pid := cmd.Process.Pid
+	startForwarding(cmd.Process)
 
 	mode := "advancing"
 	if *freeze {
@@ -143,7 +198,8 @@ func cmdRun(args []string) error {
 	}
 
 	if exitCode != 0 {
-		os.Exit(exitCode)
+		stopForwarding()
+		exitFunc(exitCode)
 	}
 	return nil
 }
@@ -179,6 +235,9 @@ func runPreload(cmdArgs []string, target time.Time, freeze bool) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
+	startForwarding, stopForwarding := forwardSignals()
+	defer stopForwarding()
+
 	var h *preload.Handle
 	var err error
 	if freeze {
@@ -192,6 +251,8 @@ func runPreload(cmdArgs []string, target time.Time, freeze bool) error {
 		}
 		return fmt.Errorf("run: preload: %v", err)
 	}
+
+	startForwarding(cmd.Process)
 
 	clockMode := "advancing"
 	if freeze {
@@ -213,7 +274,8 @@ func runPreload(cmdArgs []string, target time.Time, freeze bool) error {
 	h.Close() //nolint:errcheck
 
 	if exitCode != 0 {
-		os.Exit(exitCode)
+		stopForwarding()
+		exitFunc(exitCode)
 	}
 	return nil
 }

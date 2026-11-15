@@ -75,10 +75,30 @@ func (c *controller) handleListTimeshifts(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// maxRequestBody bounds how much of a request body the API will read. The
+// requests are small JSON documents; a cap stops a client from making the
+// controller buffer an arbitrarily large one.
+const maxRequestBody = 1 << 20
+
+// decodeJSON reads the request body into v. On failure it has already written
+// the error response and returns false.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return false
+	}
+	return true
+}
+
 func (c *controller) handleCreateTimeshift(w http.ResponseWriter, r *http.Request) {
 	var req api.CreateTimeshiftRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Namespace == "" {
@@ -138,8 +158,7 @@ func (c *controller) handleUpdateTimeshift(w http.ResponseWriter, r *http.Reques
 	id := r.PathValue("id")
 
 	var req api.UpdateTimeshiftRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Time != "" && req.Duration != "" {
@@ -173,6 +192,12 @@ func (c *controller) handleUpdateTimeshift(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		// The controller worked; the agents did not take the change.
+		var uf *updateFailedError
+		if errors.As(err, &uf) {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -184,6 +209,13 @@ func (c *controller) handleDeleteTimeshift(w http.ResponseWriter, r *http.Reques
 	if err := c.deleteTimeshift(r.Context(), id); err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		// Some containers could not be put back on the real clock. The timeshift
+		// was kept so the delete can be retried; this is not a success.
+		var re *releaseError
+		if errors.As(err, &re) {
+			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -204,13 +236,12 @@ func (c *controller) handleTimeshiftStatus(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	c.mu.RLock()
-	handles := make([]containerHandle, len(s.handles))
-	copy(handles, s.handles)
-	c.mu.RUnlock()
-
+	// s is a private snapshot, so its handles can be read without a lock. The
+	// agents are asked in parallel: a node that is down must not hold up the rest.
+	handles := s.handles
 	entries := make([]api.ContainerStatusEntry, len(handles))
-	for i, h := range handles {
+	c.parallel(len(handles), func(i int) {
+		h := handles[i]
 		entry := api.ContainerStatusEntry{
 			Pod:       h.pod,
 			Container: h.container,
@@ -223,7 +254,7 @@ func (c *controller) handleTimeshiftStatus(w http.ResponseWriter, r *http.Reques
 			entry.Status = hs
 		}
 		entries[i] = entry
-	}
+	})
 
 	writeJSON(w, http.StatusOK, api.TimeshiftStatusResponse{
 		ID:         s.id,

@@ -5,8 +5,11 @@ AGENT_IMAGE          := epochd-agent:$(IMAGE_TAG)
 CONTROLLER_IMAGE     := epochd-controller:$(IMAGE_TAG)
 CLOCKPRINTER_IMAGE   := epochd-clockprinter:$(IMAGE_TAG)
 
-.PHONY: check-deps cluster delete-cluster images load deploy e2e \
+.PHONY: check-deps cluster delete-cluster images load deploy secret e2e \
         test-integration _integration-inner kind-up-test kind-down-test
+
+# kubectl context flags for the secret target; empty means the current context.
+KCTX ?=
 
 check-deps:
 	@command -v kind    >/dev/null || (echo "ERROR: kind not found.    Install: https://kind.sigs.k8s.io"; exit 1)
@@ -32,11 +35,24 @@ load: images
 	kind load docker-image $(AGENT_IMAGE)      --name $(CLUSTER)
 	kind load docker-image $(CONTROLLER_IMAGE) --name $(CLUSTER)
 
+# Create the Secret holding the two bearer tokens: the one API clients present to
+# the controller, and the one the controller presents to the agents. The agent and
+# the controller refuse to start without them. It is created once and left alone
+# afterwards, so re-running deploy keeps working tokens. It needs the epochd
+# namespace (deploy/rbac.yaml creates it) and must exist before the DaemonSet is
+# applied, or the agent pods wait forever for a volume.
+secret:
+	@kubectl $(KCTX) -n epochd get secret epochd-auth >/dev/null 2>&1 || \
+	  kubectl $(KCTX) -n epochd create secret generic epochd-auth \
+	    --from-literal=api-token=$$(openssl rand -hex 32) \
+	    --from-literal=agent-token=$$(openssl rand -hex 32)
+
 # Apply manifests and patch the images to the locally built tags.
 # `kubectl set image` is used so the production manifests (which reference
 # ghcr.io) stay unchanged.
 deploy: load
 	kubectl apply -f deploy/rbac.yaml
+	$(MAKE) secret
 	kubectl apply -f deploy/daemonset.yaml
 	kubectl set image daemonset/epochd-agent agent=$(AGENT_IMAGE) -n epochd
 	kubectl rollout status daemonset/epochd-agent -n epochd --timeout=60s
@@ -51,7 +67,9 @@ e2e: deploy
 	kubectl port-forward svc/epochd-controller 18080:80 -n epochd & \
 	PF_PID=$$!; \
 	sleep 2; \
-	EPOCHD_URL=http://localhost:18080 go test ./e2e/... -v -tags=e2e -timeout=5m; \
+	EPOCHD_URL=http://localhost:18080 \
+	EPOCHD_TOKEN=$$(kubectl -n epochd get secret epochd-auth -o jsonpath='{.data.api-token}' | base64 -d) \
+	go test ./e2e/... -v -tags=e2e -timeout=5m; \
 	TEST_EXIT=$$?; \
 	kill $$PF_PID 2>/dev/null || true; \
 	exit $$TEST_EXIT
@@ -86,6 +104,7 @@ _integration-inner: images
 	kind load docker-image $(CONTROLLER_IMAGE)     --name $(TEST_CLUSTER)
 	kind load docker-image $(CLOCKPRINTER_IMAGE)   --name $(TEST_CLUSTER)
 	kubectl apply -f deploy/rbac.yaml --context kind-$(TEST_CLUSTER)
+	$(MAKE) secret KCTX="--context kind-$(TEST_CLUSTER)"
 	kubectl apply -f deploy/daemonset.yaml --context kind-$(TEST_CLUSTER)
 	kubectl set image --context kind-$(TEST_CLUSTER) \
 	    daemonset/epochd-agent agent=$(AGENT_IMAGE) -n epochd
@@ -101,7 +120,9 @@ _integration-inner: images
 	    port-forward svc/epochd-controller 18080:80 -n epochd & \
 	PF_PID=$$!; \
 	sleep 2; \
-	EPOCHD_URL=http://localhost:18080 CLOCKPRINTER_IMAGE=$(CLOCKPRINTER_IMAGE) go test ./e2e/... -v -tags=e2e -timeout=5m; \
+	EPOCHD_URL=http://localhost:18080 CLOCKPRINTER_IMAGE=$(CLOCKPRINTER_IMAGE) \
+	EPOCHD_TOKEN=$$(kubectl --context kind-$(TEST_CLUSTER) -n epochd get secret epochd-auth -o jsonpath='{.data.api-token}' | base64 -d) \
+	go test ./e2e/... -v -tags=e2e -timeout=5m; \
 	TEST_EXIT=$$?; \
 	kill $$PF_PID 2>/dev/null || true; \
 	exit $$TEST_EXIT

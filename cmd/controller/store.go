@@ -148,18 +148,17 @@ func (s *store) load(ctx context.Context) (map[string]*timeshift, error) {
 				agentHandle: h.AgentHandle,
 			}
 		}
-		ts := &timeshift{
-			id:            st.ID,
-			namespace:     st.Namespace,
-			labelSelector: st.LabelSelector,
-			offset:        time.Duration(st.Offset),
-			frozenAt:      st.FrozenAt,
-			frozen:        st.Frozen,
-			ttl:           st.TTL,
-			expiresAt:     st.ExpiresAt,
-			createdAt:     st.CreatedAt,
-			handles:       handles,
-		}
+		ts := newTimeshift()
+		ts.id = st.ID
+		ts.namespace = st.Namespace
+		ts.labelSelector = st.LabelSelector
+		ts.offset = time.Duration(st.Offset)
+		ts.frozenAt = st.FrozenAt
+		ts.frozen = st.Frozen
+		ts.ttl = st.TTL
+		ts.expiresAt = st.ExpiresAt
+		ts.createdAt = st.CreatedAt
+		ts.handles = handles
 		result[ts.id] = ts
 	}
 	return result, nil

@@ -9,6 +9,7 @@ type metrics struct {
 	setTimeTotal      *prometheus.CounterVec
 	sweepExpiredTotal prometheus.Counter
 	apiRequestsTotal  *prometheus.CounterVec
+	resetTotal        *prometheus.CounterVec
 }
 
 func newMetrics() *metrics {
@@ -35,6 +36,11 @@ func newMetrics() *metrics {
 			Name: "epochd_api_requests_total",
 			Help: "HTTP requests handled by the controller API.",
 		}, []string{"method", "path", "status"}),
+		resetTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "epochd_reset_total",
+			Help: "Containers put back on the real clock when a timeshift ended, by result. " +
+				"An 'error' means a container may still be on a fake clock; it is retried.",
+		}, []string{"result"}),
 	}
 	reg.MustRegister(
 		m.timeshiftsActive,
@@ -42,6 +48,7 @@ func newMetrics() *metrics {
 		m.setTimeTotal,
 		m.sweepExpiredTotal,
 		m.apiRequestsTotal,
+		m.resetTotal,
 	)
 	return m
 }

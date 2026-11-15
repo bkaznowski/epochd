@@ -16,10 +16,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/bkaznowski/epochd/pkg/api"
@@ -29,16 +31,37 @@ import (
 type Client struct {
 	baseURL string
 	http    *http.Client
+	token   string
 }
 
 // NewClient returns a Client that targets controllerURL (e.g. "http://localhost:8080").
-// A zero-value http.Client with default timeouts is used; pass WithHTTPClient to
-// override.
+// Requests time out after 30 seconds by default; pass WithHTTPClient to use a
+// client with other settings. A controller that requires authentication (the
+// default) also needs WithToken.
 func NewClient(controllerURL string) *Client {
 	return &Client{
 		baseURL: controllerURL,
 		http:    &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// WithToken returns a copy of c that authenticates every request with the given
+// bearer token, as the controller requires unless it was started with
+// --allow-unauthenticated.
+func (c *Client) WithToken(token string) *Client {
+	cp := *c
+	cp.token = token
+	return &cp
+}
+
+// cleanupTimeout bounds the cleanup calls WithTime makes after its caller's
+// context may already be gone.
+const cleanupTimeout = 30 * time.Second
+
+// path builds the URL path for one timeshift, escaping the id so that one
+// containing a slash or a query character cannot address anything else.
+func timeshiftPath(id string, suffix ...string) string {
+	return "/timeshifts/" + url.PathEscape(id) + strings.Join(suffix, "")
 }
 
 // WithHTTPClient returns a copy of c that uses the given HTTP client.
@@ -61,6 +84,10 @@ type Timeshift struct {
 	Frozen    bool      // true when the clock does not advance past Time
 	ExpiresAt time.Time // zero value when no TTL was set
 	AppliedTo []string  // "pod/container", sorted
+
+	// Warnings lists containers an update did not reach ("pod/container: reason").
+	// It is set only when some containers took the change and others did not.
+	Warnings []string
 }
 
 func timeshiftFromResponse(r api.TimeshiftResponse) (*Timeshift, error) {
@@ -82,6 +109,7 @@ func timeshiftFromResponse(r api.TimeshiftResponse) (*Timeshift, error) {
 		Frozen:    r.Frozen,
 		ExpiresAt: exp,
 		AppliedTo: r.AppliedTo,
+		Warnings:  r.Warnings,
 	}, nil
 }
 
@@ -119,15 +147,10 @@ func IsConflict(err error) bool {
 	return false
 }
 
+// isAPIError finds an *APIError anywhere in err's chain, so a caller that wraps
+// the error it got from the client (fmt.Errorf with %w) can still classify it.
 func isAPIError(err error, out **APIError) bool {
-	if err == nil {
-		return false
-	}
-	ae, ok := err.(*APIError)
-	if ok {
-		*out = ae
-	}
-	return ok
+	return err != nil && errors.As(err, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +208,7 @@ func (c *Client) ListTimeshifts(ctx context.Context) ([]Timeshift, error) {
 // GetTimeshift returns the timeshift with the given id.
 func (c *Client) GetTimeshift(ctx context.Context, id string) (*Timeshift, error) {
 	var resp api.TimeshiftResponse
-	if err := c.do(ctx, http.MethodGet, "/timeshifts/"+id, nil, &resp); err != nil {
+	if err := c.do(ctx, http.MethodGet, timeshiftPath(id), nil, &resp); err != nil {
 		return nil, err
 	}
 	return timeshiftFromResponse(resp)
@@ -210,7 +233,7 @@ func (c *Client) FreezeTimeshift(ctx context.Context, id string, target time.Tim
 func (c *Client) AdvanceTimeshift(ctx context.Context, id string, d time.Duration) (*Timeshift, error) {
 	body := api.UpdateTimeshiftRequest{Duration: d.String()}
 	var resp api.TimeshiftResponse
-	if err := c.do(ctx, http.MethodPatch, "/timeshifts/"+id, body, &resp); err != nil {
+	if err := c.do(ctx, http.MethodPatch, timeshiftPath(id), body, &resp); err != nil {
 		return nil, err
 	}
 	return timeshiftFromResponse(resp)
@@ -222,7 +245,7 @@ func (c *Client) updateTimeshift(ctx context.Context, id string, target time.Tim
 		Freeze: freeze,
 	}
 	var resp api.TimeshiftResponse
-	if err := c.do(ctx, http.MethodPatch, "/timeshifts/"+id, body, &resp); err != nil {
+	if err := c.do(ctx, http.MethodPatch, timeshiftPath(id), body, &resp); err != nil {
 		return nil, err
 	}
 	return timeshiftFromResponse(resp)
@@ -231,14 +254,14 @@ func (c *Client) updateTimeshift(ctx context.Context, id string, target time.Tim
 // DeleteTimeshift resets all injected containers back to the real clock and
 // removes the timeshift from the controller registry.
 func (c *Client) DeleteTimeshift(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/timeshifts/"+id, nil, nil)
+	return c.do(ctx, http.MethodDelete, timeshiftPath(id), nil, nil)
 }
 
 // TimeshiftStatus returns the live injection state for every container in the
 // timeshift, as read from the trampoline state struct by each node agent.
 func (c *Client) TimeshiftStatus(ctx context.Context, id string) (*api.TimeshiftStatusResponse, error) {
 	var resp api.TimeshiftStatusResponse
-	if err := c.do(ctx, http.MethodGet, "/timeshifts/"+id+"/status", nil, &resp); err != nil {
+	if err := c.do(ctx, http.MethodGet, timeshiftPath(id, "/status"), nil, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
@@ -360,19 +383,32 @@ func withTimeMode(
 	}
 
 	if err := c.WaitForActive(ctx, ts.ID); err != nil {
-		_ = c.DeleteTimeshift(ctx, ts.ID)
+		c.cleanup(ctx, ts.ID)
 		return fmt.Errorf("sdk: WithTime: %w", err)
 	}
 
 	fnErr := fn(ctx, ts)
 
-	if delErr := c.DeleteTimeshift(ctx, ts.ID); delErr != nil {
+	// The caller's context may be spent by now (a test deadline that fn ran into,
+	// say); the delete must still go out, or the containers stay on a fake clock
+	// until the TTL catches them.
+	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if delErr := c.DeleteTimeshift(delCtx, ts.ID); delErr != nil {
 		if fnErr != nil {
 			return fmt.Errorf("sdk: WithTime fn failed (%w); also failed to delete timeshift %s: %v", fnErr, ts.ID, delErr)
 		}
 		return fmt.Errorf("sdk: WithTime delete timeshift %s: %w", ts.ID, delErr)
 	}
 	return fnErr
+}
+
+// cleanup deletes a timeshift on a path where the caller's context may already
+// be cancelled, which must not stop the delete from being sent.
+func (c *Client) cleanup(ctx context.Context, id string) {
+	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	_ = c.DeleteTimeshift(delCtx, id)
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +431,9 @@ func (c *Client) do(ctx context.Context, method, path string, reqBody, respBody 
 	}
 	if reqBody != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
 	resp, err := c.http.Do(req)

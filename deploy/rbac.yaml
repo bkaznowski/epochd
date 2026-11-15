@@ -11,8 +11,10 @@ metadata:
   namespace: epochd
 
 ---
-# The controller only needs read access to pods in order to resolve label
-# selectors and discover which node each container lives on.
+# The controller reads pods to resolve label selectors and discover which node
+# each container lives on, and posts Events on them (timeshift expiry, and a
+# warning when a container could not be put back on the real clock). Without the
+# events rule the Events are silently dropped by the API server.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -21,6 +23,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 
 ---
 # ConfigMap access is namespace-scoped so a Role (not ClusterRole) is used.

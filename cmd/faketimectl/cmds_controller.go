@@ -28,7 +28,37 @@ func clientFromURL(url string) (*sdk.Client, error) {
 	if url == "" {
 		return nil, fmt.Errorf("controller URL required: set EPOCHD_URL or pass --url")
 	}
-	return sdk.NewClient(url), nil
+	client := sdk.NewClient(url)
+	token, err := tokenFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		client = client.WithToken(token)
+	}
+	return client, nil
+}
+
+// tokenFromEnv returns the bearer token the controller requires, taken from
+// EPOCHD_TOKEN or, if that is unset, read from the file named by
+// EPOCHD_TOKEN_FILE. It is not a flag so the secret stays out of the process
+// list and shell history. No token set means none is sent.
+func tokenFromEnv() (string, error) {
+	if t := strings.TrimSpace(os.Getenv("EPOCHD_TOKEN")); t != "" {
+		return t, nil
+	}
+	if f := os.Getenv("EPOCHD_TOKEN_FILE"); f != "" {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return "", fmt.Errorf("reading EPOCHD_TOKEN_FILE: %w", err)
+		}
+		t := strings.TrimSpace(string(b))
+		if t == "" {
+			return "", fmt.Errorf("EPOCHD_TOKEN_FILE %s is empty", f)
+		}
+		return t, nil
+	}
+	return "", nil
 }
 
 func newTabWriter() *tabwriter.Writer {

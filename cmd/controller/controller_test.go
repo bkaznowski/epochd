@@ -31,6 +31,7 @@ type mockAgentPool struct {
 	injectFn    func(ctx context.Context, nodeIP, containerID string, target time.Time, freeze bool) (string, error)
 	setTimeFn   func(ctx context.Context, nodeIP, handleID string, target time.Time, freeze bool) error
 	resetFn     func(ctx context.Context, nodeIP, handleID string) error
+	releaseFn   func(ctx context.Context, nodeIP, handleID string) error
 	getStatusFn func(ctx context.Context, nodeIP, handleID string) (*api.HandleStatus, error)
 }
 
@@ -51,6 +52,13 @@ func (m *mockAgentPool) SetTime(ctx context.Context, nodeIP, handleID string, ta
 func (m *mockAgentPool) Reset(ctx context.Context, nodeIP, handleID string) error {
 	if m.resetFn != nil {
 		return m.resetFn(ctx, nodeIP, handleID)
+	}
+	return nil
+}
+
+func (m *mockAgentPool) Release(ctx context.Context, nodeIP, handleID string) error {
+	if m.releaseFn != nil {
+		return m.releaseFn(ctx, nodeIP, handleID)
 	}
 	return nil
 }
@@ -100,7 +108,11 @@ func newTestController(t *testing.T, pods ...corev1.Pod) (*controller, *mockAgen
 		}
 	}
 	pool := &mockAgentPool{}
-	return newController(k8s, pool, nil, applog.Discard()), pool
+	ctrl := newController(k8s, pool, nil, applog.Discard())
+	// One agent call at a time: the closures the tests hand the mock count and
+	// record without locking. Parallel behaviour has its own tests.
+	ctrl.concurrency = 1
+	return ctrl, pool
 }
 
 func doRequest(t *testing.T, handler http.Handler, method, path string, body any) *httptest.ResponseRecorder {
@@ -1039,7 +1051,9 @@ func newTestControllerWithStore(t *testing.T, pods ...corev1.Pod) (*controller, 
 	}
 	pool := &mockAgentPool{}
 	st := newStore(k8s, "epochd")
-	return newController(k8s, pool, st, applog.Discard()), pool, k8s
+	ctrl := newController(k8s, pool, st, applog.Discard())
+	ctrl.concurrency = 1
+	return ctrl, pool, k8s
 }
 
 // TestStoreRoundTrip saves a timeshift to a fake ConfigMap and loads it back.
@@ -1634,11 +1648,15 @@ func TestAdvanceTimeshiftFrozen(t *testing.T) {
 
 // TestUpdateTimeshiftSetTimeError verifies that a transient (non-NOT_FOUND)
 // SetTime error is logged and skipped — the timeshift still records the new target.
-func TestUpdateTimeshiftSetTimeError(t *testing.T) {
+// An update that reaches no container at all must fail, and must leave the
+// registry as it was. It used to report success while recording a clock that no
+// container was running.
+func TestUpdateTimeshiftFailsWhenNoContainerAcceptsIt(t *testing.T) {
 	pod := makePod("web-1", "default", "10.0.0.1", "containerd://aabbcc112233")
 	ctrl, pool := newTestController(t, pod)
 
-	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", time.Now().Add(time.Hour), 0, false)
+	initial := time.Now().Add(time.Hour)
+	s, err := ctrl.createTimeshift(context.Background(), "default", "app=web-1", initial, 0, false)
 	if err != nil {
 		t.Fatalf("createTimeshift: %v", err)
 	}
@@ -1648,12 +1666,15 @@ func TestUpdateTimeshiftSetTimeError(t *testing.T) {
 	}
 
 	newTarget := time.Now().Add(48 * time.Hour)
-	s2, err := ctrl.updateTimeshift(context.Background(), s.id, newTarget, false)
-	if err != nil {
-		t.Fatalf("updateTimeshift: %v (expected success despite SetTime error)", err)
+	_, err = ctrl.updateTimeshift(context.Background(), s.id, newTarget, false)
+	var uf *updateFailedError
+	if !errors.As(err, &uf) {
+		t.Fatalf("updateTimeshift = %v, want an *updateFailedError", err)
 	}
-	if got := s2.effectiveTime(); got.Sub(newTarget).Abs() > time.Second {
-		t.Errorf("effectiveTime not updated: got %v want ~%v", got, newTarget)
+
+	after, _ := ctrl.getTimeshift(s.id)
+	if got := after.effectiveTime(); got.Sub(initial).Abs() > 2*time.Second {
+		t.Errorf("the registry recorded %v although no container took the update (was ~%v)", got, initial)
 	}
 }
 

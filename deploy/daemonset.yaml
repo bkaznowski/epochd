@@ -18,7 +18,9 @@ spec:
       # via /proc and attach to them with ptrace.
       hostPID: true
       # Bind to the node's network so the controller can reach the agent
-      # at nodeIP:9100 (hostIP from pod.Status.HostIP).
+      # at nodeIP:9433 (hostIP from pod.Status.HostIP). The port is not 9100:
+      # that is node-exporter's default, and with hostNetwork the two would
+      # fight over it on any cluster that runs it.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
 
@@ -32,14 +34,37 @@ spec:
 
       containers:
         - name: agent
+          # Pin a version tag in production (for example :v0.8.0). With :latest and
+          # IfNotPresent a node that already has an image never pulls an update.
           image: ghcr.io/bkaznowski/epochd-agent:latest
           imagePullPolicy: IfNotPresent
-          args: ["--listen=:9100"]
+          # The agent is privileged and can change the clock of any process on the
+          # node, so it refuses to start without credentials. The token comes from
+          # the epochd-auth Secret (see deploy/README.md); add --tls-cert-file and
+          # --tls-key-file (and --tls-client-ca-file for mutual TLS) so the token is
+          # not sent in the clear.
+          args:
+            - "--listen=:9433"
+            - "--auth-token-file=/etc/epochd/auth/token"
           ports:
             - name: grpc
-              containerPort: 9100
-              hostPort: 9100
+              containerPort: 9433
+              hostPort: 9433
               protocol: TCP
+          volumeMounts:
+            - name: auth
+              mountPath: /etc/epochd/auth
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 9433
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9433
+            initialDelaySeconds: 5
+            periodSeconds: 10
           securityContext:
             # privileged gives CAP_SYS_PTRACE + CAP_SYS_ADMIN required for
             # ptrace-attach across PID namespaces and process_vm_writev.
@@ -51,3 +76,13 @@ spec:
             limits:
               cpu: "200m"
               memory: "128Mi"
+
+      volumes:
+        # Only the agent's own token: the API token the controller accepts from
+        # clients is deliberately not mounted here.
+        - name: auth
+          secret:
+            secretName: epochd-auth
+            items:
+              - key: agent-token
+                path: token
