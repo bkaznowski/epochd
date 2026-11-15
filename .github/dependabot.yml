@@ -9,17 +9,20 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # v7+ of the action installs golangci-lint v2, which needs a migrated
+      # .golangci.yml and a matching pinned version; do that by hand.
+      - dependency-name: golangci/golangci-lint-action
+        update-types: ["version-update:semver-major"]
 
+  # One entry for both modules, so one pull request updates them together.
+  # pkg/faketime has `replace => ../..`, so whenever the root module's
+  # requirements change its go.mod must be re-tidied in the same change, or its CI
+  # fails with "updates to go.mod needed".
   - package-ecosystem: gomod
-    directory: /
-    schedule:
-      interval: weekly
-    groups:
-      go-deps:
-        patterns: ["*"]
-
-  - package-ecosystem: gomod
-    directory: /pkg/faketime
+    directories:
+      - /
+      - /pkg/faketime
     schedule:
       interval: weekly
     groups:
