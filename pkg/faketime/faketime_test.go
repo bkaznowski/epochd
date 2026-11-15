@@ -2141,6 +2141,184 @@ func TestTrackerParentExitNormally(t *testing.T) {
 	}
 }
 
+// TestChildTrackerWaitNormalExit verifies that ChildTracker.Wait observes a
+// process exiting on its own and returns its wait status, without the
+// caller ever calling cmd.Wait() itself.
+func TestChildTrackerWaitNormalExit(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeSelfExitHelper", "-test.v")
+	cmd.Env = append(os.Environ(), selfExitEnv+"=1")
+
+	ct, err := StartWithTracking(cmd, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+	t.Cleanup(func() { ct.Close() }) //nolint:errcheck
+
+	ws, err := ct.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !ws.Exited() {
+		t.Errorf("wait status = %#v, want Exited()", ws)
+	}
+	t.Logf("Wait observed normal exit: %v", ws)
+}
+
+// TestChildTrackerWaitKilled verifies that ChildTracker.Wait observes a
+// process killed by a signal and reports it via Signaled()/Signal().
+func TestChildTrackerWaitKilled(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	ct, err := StartWithTracking(cmd, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+	t.Cleanup(func() { ct.Close() }) //nolint:errcheck
+
+	if killErr := cmd.Process.Kill(); killErr != nil {
+		t.Fatalf("Kill: %v", killErr)
+	}
+
+	ws, err := ct.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !ws.Signaled() {
+		t.Errorf("wait status = %#v, want Signaled()", ws)
+	}
+	t.Logf("Wait observed kill: %v", ws)
+}
+
+// TestChildTrackerWaitClosedBeforeExit verifies that ChildTracker.Wait
+// returns an error, rather than blocking forever, if the tracker is closed
+// before the tracked process's exit is observed.
+func TestChildTrackerWaitClosedBeforeExit(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeHelper", "-test.v")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+
+	ct, err := StartWithTracking(cmd, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("StartWithTracking: %v", err)
+	}
+	t.Cleanup(func() {
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+	})
+
+	waitErr := make(chan error, 1)
+	go func() {
+		_, err := ct.Wait()
+		waitErr <- err
+	}()
+
+	// Give Wait a moment to start blocking, then close the tracker without
+	// the process having exited.
+	time.Sleep(50 * time.Millisecond)
+	if err := ct.Close(); err != nil {
+		t.Logf("Close: %v", err)
+	}
+
+	select {
+	case err := <-waitErr:
+		if err == nil {
+			t.Error("Wait returned nil error after Close with no observed exit, want an error")
+		} else {
+			t.Logf("Wait correctly returned an error after Close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait did not return after Close; it appears to be blocked forever")
+	}
+}
+
+// TestSessionWaitPID verifies Session.WaitPID delegates to the right
+// ChildTracker and reports a normal exit, and that it errors for a pid with
+// no active tracker in the session.
+func TestSessionWaitPID(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeSelfExitHelper", "-test.v")
+	cmd.Env = append(os.Environ(), selfExitEnv+"=1")
+
+	s := NewSession(time.Now().Add(24*time.Hour), WithTracking())
+	if err := s.Start(cmd); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() { s.Close() }) //nolint:errcheck
+
+	ws, err := s.WaitPID(pid)
+	if err != nil {
+		t.Fatalf("WaitPID: %v", err)
+	}
+	if !ws.Exited() {
+		t.Errorf("wait status = %#v, want Exited()", ws)
+	}
+
+	if _, err := s.WaitPID(pid + 1_000_000); err == nil {
+		t.Error("WaitPID for an untracked pid returned nil error, want an error")
+	}
+}
+
+// TestSessionWaitPIDNoTracking verifies Session.WaitPID also works for a
+// process added via Start with no tracking enabled — callers should not
+// need to know or care whether tracking applies to get the same WaitPID
+// behavior. Also confirms it's safe to call twice for the same pid, since
+// nothing else is competing for cmd.Wait() in the untracked case; the
+// caching this relies on (sync.Once) makes that a non-issue.
+func TestSessionWaitPIDNoTracking(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	cmd := exec.Command(exe, "-test.run=TestFaketimeSelfExitHelper", "-test.v")
+	cmd.Env = append(os.Environ(), selfExitEnv+"=1")
+
+	s := NewSession(time.Now().Add(24 * time.Hour)) // no WithTracking
+	if err := s.Start(cmd); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	pid := cmd.Process.Pid
+
+	ws, err := s.WaitPID(pid)
+	if err != nil {
+		t.Fatalf("WaitPID: %v", err)
+	}
+	if !ws.Exited() {
+		t.Errorf("wait status = %#v, want Exited()", ws)
+	}
+
+	// Calling it again for the same pid must not panic or error (Go's
+	// cmd.Wait() itself would error with "Wait was already called" — WaitPID
+	// must not have that problem).
+	ws2, err := s.WaitPID(pid)
+	if err != nil {
+		t.Fatalf("second WaitPID call: %v", err)
+	}
+	if ws2 != ws {
+		t.Errorf("second WaitPID call = %#v, want same result %#v", ws2, ws)
+	}
+}
+
 // TestChildTrackerApplyAllParentESRCH verifies that ChildTracker.applyAll
 // silently clears ESRCH when the tracked parent process has died. Covers the
 // errs[0]=nil path inside ChildTracker.applyAll.

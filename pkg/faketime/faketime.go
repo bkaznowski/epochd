@@ -273,6 +273,17 @@ type Session struct {
 	trackingFilter TrackingFilter
 	fakeTimeFilter FakeTimeFilter
 	trackers       []*ChildTracker
+	cmdWaiters     map[int]*cmdWaiter // lazily populated by WaitPID, keyed by pid
+}
+
+// cmdWaiter caches a single cmd.Wait() call's result behind a sync.Once, so
+// WaitPID is safe to call concurrently or more than once for the same
+// untracked pid — matching the tracked path's ergonomics, where Wait reads
+// from an already-closed channel and so has the same property for free.
+type cmdWaiter struct {
+	once sync.Once
+	ws   unix.WaitStatus
+	err  error
 }
 
 // NewSession creates an empty session with the given initial target time.
@@ -300,6 +311,10 @@ func (s *Session) effectiveTarget() time.Time {
 // given via WithFakeTimeFilter; when it does, whether it also gets automatic
 // fork/exec tracking is decided by TrackingFilter if given via
 // WithTrackingFilter, otherwise by the session-wide WithTracking on/off switch.
+// Use Session.WaitPID(cmd.Process.Pid), not cmd.Wait(), to learn when cmd
+// exits — it works the same way whether or not cmd ends up tracked, so
+// callers don't need to know or care which applies; see WaitPID's doc
+// comment for why calling cmd.Wait() directly should be avoided.
 func (s *Session) Start(cmd *exec.Cmd) error {
 	s.mu.Lock()
 	target := s.effectiveTarget()
@@ -530,15 +545,17 @@ type ChildTracker struct {
 	// Handle is the parent process's fake-time handle.
 	Handle *Handle
 
-	mu          sync.Mutex
-	tracer      *procmem.Tracer
-	parentPID   int
-	parentGone  bool            // set once the parent's exit has been observed
-	children    map[int]*Handle // childPID → Handle
-	pendingStop map[int]bool    // children waiting for their initial ptrace stop
-	done        chan struct{}
-	wg          sync.WaitGroup
-	loopErr     error
+	mu           sync.Mutex
+	tracer       *procmem.Tracer
+	parentPID    int
+	parentGone   bool            // set once the parent's exit has been observed
+	parentExitWS unix.WaitStatus // valid once parentExitCh is closed
+	parentExitCh chan struct{}   // closed once the parent's exit has been observed; see Wait
+	children     map[int]*Handle // childPID → Handle
+	pendingStop  map[int]bool    // children waiting for their initial ptrace stop
+	done         chan struct{}
+	wg           sync.WaitGroup
+	loopErr      error
 }
 
 // IsFrozen reports whether the tracker is currently in frozen mode.
@@ -568,6 +585,34 @@ func (c *ChildTracker) Children() []*Handle {
 		out = append(out, h)
 	}
 	return out
+}
+
+// Wait blocks until the tracked parent process exits and returns its final
+// wait status, or returns an error if the tracker is closed first without
+// having observed an exit.
+//
+// Callers must use this — not cmd.Wait() — to learn when a process started
+// with tracking enabled has exited. ChildTracker's own background loop
+// already reaps the parent's exit via wait4 as part of tracking fork/vfork/
+// exec events; a second, external wait4/waitid call for the same pid (e.g.
+// from cmd.Wait(), one goroutine per process is a common pattern in
+// multi-service integration tests) races it for the same one-time kernel
+// notification. Depending on which call the kernel happens to deliver it to,
+// either cmd.Wait() blocks forever (having missed the exit, since the
+// tracker's loop already reaped it) or the tracker's own bookkeeping misses
+// it — and in between, the two calls can also race for other wait-reportable
+// transitions on that pid (e.g. a stop from an unrelated signal delivery),
+// which can make cmd.Wait() return an incorrect result for what was never
+// actually process termination.
+func (c *ChildTracker) Wait() (unix.WaitStatus, error) {
+	select {
+	case <-c.parentExitCh:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.parentExitWS, nil
+	case <-c.done:
+		return unix.WaitStatus(0), fmt.Errorf("faketime: ChildTracker.Wait: tracker closed before pid %d was observed to exit", c.parentPID)
+	}
 }
 
 // applyAll calls fn on the parent handle and all currently tracked children
@@ -661,7 +706,9 @@ func (c *ChildTracker) Close() error {
 
 // AttachWithTracking attaches to an already-running process with advancing fake
 // time and returns a ChildTracker that automatically injects fake time into any
-// processes the target spawns via fork or vfork.
+// processes the target spawns via fork or vfork. Use the returned
+// ChildTracker's Wait method to learn when pid exits — see ChildTracker.Wait's
+// doc comment for why any other wait-family call for pid should be avoided.
 // Requires CAP_SYS_PTRACE and ptrace_scope <= 1.
 func AttachWithTracking(pid int, target time.Time) (*ChildTracker, error) {
 	ih, tr, err := inject.InjectAtTimeKeepTracer(pid, target)
@@ -672,7 +719,9 @@ func AttachWithTracking(pid int, target time.Time) (*ChildTracker, error) {
 }
 
 // AttachFrozenWithTracking attaches to an already-running process with the
-// clock frozen at target and returns a ChildTracker for its descendants.
+// clock frozen at target and returns a ChildTracker for its descendants. Use
+// the returned ChildTracker's Wait method to learn when pid exits — see
+// ChildTracker.Wait's doc comment for why.
 // Requires CAP_SYS_PTRACE and ptrace_scope <= 1.
 func AttachFrozenWithTracking(pid int, target time.Time) (*ChildTracker, error) {
 	ih, tr, err := inject.InjectFrozenKeepTracer(pid, target)
@@ -686,6 +735,8 @@ func AttachFrozenWithTracking(pid int, target time.Time) (*ChildTracker, error) 
 // ChildTracker that automatically injects fake time into any processes spawned
 // via fork or vfork. No elevated permissions required. The caller must not
 // call cmd.Start() before calling StartWithTracking; see Start's doc comment
+// for why. Likewise, do not call cmd.Wait() to learn when the process exits
+// — use the returned ChildTracker's Wait method instead; see its doc comment
 // for why.
 func StartWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error) {
 	if cmd.SysProcAttr == nil {
@@ -707,6 +758,8 @@ func StartWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error) {
 // returns a ChildTracker that automatically injects fake time into any
 // processes spawned via fork or vfork. The caller must not call cmd.Start()
 // before calling StartFrozenWithTracking; see Start's doc comment for why.
+// Likewise, do not call cmd.Wait() to learn when the process exits — use the
+// returned ChildTracker's Wait method instead; see its doc comment for why.
 func StartFrozenWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -725,12 +778,13 @@ func StartFrozenWithTracking(cmd *exec.Cmd, target time.Time) (*ChildTracker, er
 
 func newChildTracker(h *Handle, tr *procmem.Tracer, parentPID int) *ChildTracker {
 	ct := &ChildTracker{
-		Handle:      h,
-		tracer:      tr,
-		parentPID:   parentPID,
-		children:    make(map[int]*Handle),
-		pendingStop: make(map[int]bool),
-		done:        make(chan struct{}),
+		Handle:       h,
+		tracer:       tr,
+		parentPID:    parentPID,
+		parentExitCh: make(chan struct{}),
+		children:     make(map[int]*Handle),
+		pendingStop:  make(map[int]bool),
+		done:         make(chan struct{}),
 	}
 	ct.wg.Add(1)
 	go ct.watchLoop()
@@ -826,10 +880,12 @@ func (c *ChildTracker) handleEvent(pid int, ws unix.WaitStatus) {
 			// Parent exited — no more fork events to expect.
 			c.mu.Lock()
 			c.parentGone = true
+			c.parentExitWS = ws
 			if c.loopErr == nil {
 				c.loopErr = fmt.Errorf("faketime: parent process %d exited unexpectedly", pid)
 			}
 			c.mu.Unlock()
+			close(c.parentExitCh)
 		}
 		return
 	}
@@ -1130,4 +1186,71 @@ func (s *Session) PIDs() []int {
 		pids[i] = h.PID()
 	}
 	return pids
+}
+
+// WaitPID blocks until pid — the top-level pid from a previous call to
+// Start (not a forked descendant) — exits, and returns its final wait
+// status. Works the same way regardless of whether tracking is enabled for
+// pid, so callers do not need to know or care which applies: it delegates
+// to the ChildTracker's own Wait if pid is tracked (see ChildTracker.Wait
+// for why that matters — calling cmd.Wait() yourself instead races the
+// tracker's internal wait4-based bookkeeping for the same pid and can
+// misbehave); otherwise it safely wraps cmd.Wait() itself, caching the
+// result behind a sync.Once so it's just as safe to call concurrently or
+// more than once for the same pid as the tracked path is.
+//
+// Either way, callers should use WaitPID instead of calling cmd.Wait()
+// directly on a cmd added to this Session via Start.
+//
+// Returns an error if pid was never added to this session via Start (or was,
+// but its cmd/tracker can no longer be found — e.g. after Prune).
+func (s *Session) WaitPID(pid int) (unix.WaitStatus, error) {
+	s.mu.Lock()
+	var ct *ChildTracker
+	for _, t := range s.trackers {
+		if t.parentPID == pid {
+			ct = t
+			break
+		}
+	}
+	if ct != nil {
+		s.mu.Unlock()
+		return ct.Wait()
+	}
+
+	var cmd *exec.Cmd
+	for _, c := range s.cmds {
+		if c.Process != nil && c.Process.Pid == pid {
+			cmd = c
+			break
+		}
+	}
+	if cmd == nil {
+		s.mu.Unlock()
+		return unix.WaitStatus(0), fmt.Errorf("faketime: Session.WaitPID: pid %d not found in this session", pid)
+	}
+	if s.cmdWaiters == nil {
+		s.cmdWaiters = make(map[int]*cmdWaiter)
+	}
+	cw, ok := s.cmdWaiters[pid]
+	if !ok {
+		cw = &cmdWaiter{}
+		s.cmdWaiters[pid] = cw
+	}
+	s.mu.Unlock()
+
+	cw.once.Do(func() {
+		waitErr := cmd.Wait()
+		if cmd.ProcessState == nil {
+			cw.err = fmt.Errorf("faketime: Session.WaitPID: pid %d: wait did not produce a process state: %w", pid, waitErr)
+			return
+		}
+		sysWS, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+		if !ok {
+			cw.err = fmt.Errorf("faketime: Session.WaitPID: pid %d: unexpected process state type %T", pid, cmd.ProcessState.Sys())
+			return
+		}
+		cw.ws = unix.WaitStatus(sysWS)
+	})
+	return cw.ws, cw.err
 }
