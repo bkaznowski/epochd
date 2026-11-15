@@ -2,13 +2,13 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 
 # Single control-plane node is sufficient for the integration test suite.
-# The agent DaemonSet runs as privileged (CAP_SYS_PTRACE + CAP_SYS_ADMIN),
-# which is enough for ptrace-attach and process_vm_writev across PID namespaces.
+# The agent DaemonSet is not privileged: it holds only CAP_SYS_PTRACE, which is
+# enough for ptrace-attach and process_vm_writev across PID namespaces.
 # hostPID: true on the agent pod gives it access to the kind node's /proc, so
 # no extra extraMounts are required.
 nodes:
   - role: control-plane
-    # Ensure the kubelet can schedule privileged pods (required for the agent).
+    # Harmless for the agent, which no longer needs it; kept so a privileged fallback works.
     kubeadmConfigPatches:
       - |
         kind: ClusterConfiguration

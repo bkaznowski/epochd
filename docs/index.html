@@ -541,7 +541,7 @@ tr:last-child td { border-bottom: none; }
   <span class="callout-icon">⚠️</span>
   <div class="callout-body">
     <p class="callout-title">Production cluster advisory</p>
-    <p>Do not deploy epochd in a production cluster. The agent runs as a privileged pod with <code>hostPID: true</code> and the ability to inject code into any process on the node. It should only run in dedicated test clusters.</p>
+    <p>Do not deploy epochd in a production cluster. The agent runs with <code>hostPID: true</code> and <code>CAP_SYS_PTRACE</code> (not as a privileged container) and has the ability to inject code into any process on the node. It should only run in dedicated test clusters.</p>
   </div>
 </div>
 
@@ -1600,7 +1600,7 @@ faketimectl run --mode=preload --time=2030-01-01T00:00:00Z -- postgres -D /tmp/p
 <table>
   <thead><tr><th>Component</th><th>Privilege</th><th>Why</th></tr></thead>
   <tbody>
-    <tr><td>Agent DaemonSet</td><td><code>privileged: true</code></td><td>Needs <code>CAP_SYS_PTRACE</code> for <code>PTRACE_ATTACH</code> and <code>process_vm_writev</code> across PID namespaces.</td></tr>
+    <tr><td>Agent DaemonSet</td><td><code>hostPID: true</code>, <code>CAP_SYS_PTRACE</code> only (not privileged)</td><td>Needs <code>CAP_SYS_PTRACE</code> for <code>PTRACE_ATTACH</code> and <code>process_vm_writev</code> across PID namespaces.</td></tr>
     <tr><td>Agent DaemonSet</td><td><code>hostPID: true</code></td><td>Must see all container PIDs on the node via <code>/proc</code>.</td></tr>
     <tr><td>Agent DaemonSet</td><td>CRI socket mount</td><td>Resolves container IDs to PIDs by querying <code>/run/containerd/containerd.sock</code>.</td></tr>
     <tr><td>Controller Deployment</td><td>ClusterRole: <code>get/list/watch pods</code></td><td>Resolves label selectors to pod objects and container IDs.</td></tr>
@@ -1616,7 +1616,7 @@ faketimectl run --mode=preload --time=2030-01-01T00:00:00Z -- postgres -D /tmp/p
   <span class="callout-icon">🔴</span>
   <div class="callout-body">
     <p class="callout-title">Deploy only in dedicated test clusters</p>
-    <p>The agent DaemonSet runs as a privileged pod with <code>hostPID: true</code>. An attacker who controls the controller API can instruct the agent to inject arbitrary code into any process on any node. Treat this as equivalent to having root on every node in the cluster.</p>
+    <p>The agent DaemonSet runs with <code>hostPID: true</code> and <code>CAP_SYS_PTRACE</code>. An attacker who controls the controller API can instruct the agent to inject arbitrary code into any process on any node. Treat this as equivalent to having root on every node in the cluster.</p>
   </div>
 </div>
 
@@ -1630,7 +1630,7 @@ faketimectl run --mode=preload --time=2030-01-01T00:00:00Z -- postgres -D /tmp/p
 </ul>
 
 <h3>Agent privileges are broad</h3>
-<p>The <code>privileged: true</code> flag gives the agent essentially full access to the host. The recommended mitigation is to only deploy epochd in clusters that are already treated as low-trust dev/test environments, and to apply Kubernetes admission policies (OPA/Gatekeeper, Kyverno) that prevent privileged pods from being created in other contexts.</p>
+<p><code>CAP_SYS_PTRACE</code> together with <code>hostPID</code> lets the agent write into every process on the node, which is close to root on it, although the container is not privileged. The recommended mitigation is to only deploy epochd in clusters that are already treated as low-trust dev/test environments, and to apply Kubernetes admission policies (OPA/Gatekeeper, Kyverno) that prevent privileged pods from being created in other contexts.</p>
 
 <h3>pkg/faketime — local privilege requirements</h3>
 <p>When using <code>pkg/faketime</code> in Go tests:</p>
@@ -1815,7 +1815,7 @@ if sdk.IsConflict(err) {
 <p>Not yet. The <code>deploy/</code> directory contains raw Kubernetes manifests. A Helm chart is on the roadmap.</p>
 
 <h3>Will this work on kind, minikube, or k3s?</h3>
-<p>Yes, with the right configuration. The cluster must allow privileged pods. On kind, the default configuration allows this. On minikube, you may need to pass <code>--extra-config=apiserver.enable-admission-plugins=PodSecurityAdmission</code> and configure the policy to allow privileged pods in the <code>epochd</code> namespace. The e2e tests in the repo target a kind cluster via the Makefile.</p>
+<p>Yes, with the right configuration. The cluster must allow a pod with <code>hostPID</code> and <code>CAP_SYS_PTRACE</code>. On kind, the default configuration allows this. Where Pod Security Admission is enforced, the <code>epochd</code> namespace needs the <code>privileged</code> level, because <code>hostPID</code> is forbidden by the baseline one. The e2e tests in the repo target a kind cluster via the Makefile.</p>
 
 </div><!-- .content -->
 </main><!-- .main -->

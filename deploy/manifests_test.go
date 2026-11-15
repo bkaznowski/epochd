@@ -259,3 +259,42 @@ func TestControllerIsNeverRunTwice(t *testing.T) {
 		t.Errorf("strategy = %q, want Recreate", dep.Spec.Strategy.Type)
 	}
 }
+
+// The agent can ptrace any process on its node, so it gets the one capability that
+// takes and nothing else. This was privileged: true until the end-to-end suite
+// showed CAP_SYS_PTRACE is sufficient; a regression to a broader context should be
+// a conscious change, not an edit that slips through.
+func TestAgentIsNotPrivileged(t *testing.T) {
+	sc := daemonSet(t).Spec.Template.Spec.Containers[0].SecurityContext
+	if sc == nil {
+		t.Fatal("the agent has no securityContext")
+	}
+	if sc.Privileged != nil && *sc.Privileged {
+		t.Error("the agent is privileged; CAP_SYS_PTRACE is enough")
+	}
+	if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		t.Error("allowPrivilegeEscalation must be false")
+	}
+	if sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+		t.Error("the root filesystem should be read-only")
+	}
+	if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("seccompProfile = %+v, want RuntimeDefault", sc.SeccompProfile)
+	}
+	if sc.Capabilities == nil {
+		t.Fatal("no capabilities block")
+	}
+	var drop, add []string
+	for _, c := range sc.Capabilities.Drop {
+		drop = append(drop, string(c))
+	}
+	for _, c := range sc.Capabilities.Add {
+		add = append(add, string(c))
+	}
+	if !contains(drop, "ALL") {
+		t.Errorf("capabilities.drop = %v, want ALL", drop)
+	}
+	if len(add) != 1 || add[0] != "SYS_PTRACE" {
+		t.Errorf("capabilities.add = %v, want exactly [SYS_PTRACE]", add)
+	}
+}

@@ -65,10 +65,20 @@ spec:
               port: 9433
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Not privileged. CAP_SYS_PTRACE is all ptrace-attach and process_vm_writev
+          # across containers need (with hostPID above); the end-to-end suite passes
+          # with exactly this. It is still close to root on the node: see "What the
+          # agent can do" in deploy/README.md, including the AppArmor and SELinux
+          # settings some clusters need.
           securityContext:
-            # privileged gives CAP_SYS_PTRACE + CAP_SYS_ADMIN required for
-            # ptrace-attach across PID namespaces and process_vm_writev.
-            privileged: true
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["SYS_PTRACE"]
+            seccompProfile:
+              type: RuntimeDefault
           resources:
             requests:
               cpu: "10m"

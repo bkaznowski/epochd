@@ -135,7 +135,7 @@ even with `--cap-add SYS_PTRACE --security-opt seccomp=unconfined` because of Ya
 `ptrace_scope=1` enforced by Docker's user namespace setup. `FollowChild` works everywhere
 because the child called `PTRACE_TRACEME` itself. All tests use the `FollowChild` path.
 Production code (`faketimectl`, the phase-7 agent) uses `Attach` — this is fine because
-in Kubernetes the agent runs in a privileged pod with `hostPID: true` where ptrace_scope
+in Kubernetes the agent runs with `hostPID: true` and only `CAP_SYS_PTRACE` (not privileged) where ptrace_scope
 can be set or overridden via seccomp.
 
 ---
@@ -613,7 +613,7 @@ type StatusResponse struct {
 }
 ```
 
-**`cmd/agent/main.go`** — the privileged DaemonSet pod:
+**`cmd/agent/main.go`** — the DaemonSet pod (`hostPID`, `CAP_SYS_PTRACE` only):
 
 1. **Container ID → PID resolution**: call the CRI socket (`/run/containerd/containerd.sock`)
    via `ContainerStatus` (from `k8s.io/cri-api`). That gives you the container's init PID,
