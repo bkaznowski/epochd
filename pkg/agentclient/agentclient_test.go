@@ -2,6 +2,7 @@ package agentclient_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/bkaznowski/epochd/pkg/agentclient"
 	"github.com/bkaznowski/epochd/pkg/agentpb"
+	"github.com/bkaznowski/epochd/pkg/auth"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -24,11 +26,26 @@ type fakeAgent struct {
 	injectErr      error
 	setTimeErr     error
 	resetErr       error
+	releaseErr     error
 	statusResp     *agentpb.StatusResponse
 	statusErr      error
+	hang           time.Duration // how long Inject blocks before answering (0: not at all)
 }
 
-func (f *fakeAgent) Inject(_ context.Context, _ *agentpb.InjectRequest) (*agentpb.InjectResponse, error) {
+func (f *fakeAgent) Release(_ context.Context, _ *agentpb.ReleaseRequest) (*agentpb.ReleaseResponse, error) {
+	if f.releaseErr != nil {
+		return nil, f.releaseErr
+	}
+	return &agentpb.ReleaseResponse{}, nil
+}
+
+func (f *fakeAgent) Inject(ctx context.Context, _ *agentpb.InjectRequest) (*agentpb.InjectResponse, error) {
+	if f.hang > 0 {
+		select {
+		case <-time.After(f.hang):
+		case <-ctx.Done():
+		}
+	}
 	if f.injectErr != nil {
 		return nil, f.injectErr
 	}
@@ -69,18 +86,25 @@ func (f *fakeAgent) Status(_ context.Context, _ *agentpb.StatusRequest) (*agentp
 // dialing it, plus the node IP string. The pool and server are cleaned up via t.Cleanup.
 func setupPool(t *testing.T, agent *fakeAgent) (*agentclient.Pool, string) {
 	t.Helper()
+	return setupPoolWith(t, agent, nil)
+}
+
+// setupPoolWith is setupPool with server options (an auth interceptor, say) and
+// pool options (a token, say).
+func setupPoolWith(t *testing.T, agent *fakeAgent, serverOpts []grpc.ServerOption, poolOpts ...agentclient.PoolOption) (*agentclient.Pool, string) {
+	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("net.Listen: %v", err)
 	}
 	port := lis.Addr().(*net.TCPAddr).Port
 
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(serverOpts...)
 	agentpb.RegisterAgentServiceServer(srv, agent)
 	go srv.Serve(lis) //nolint:errcheck
-	t.Cleanup(srv.GracefulStop)
+	t.Cleanup(srv.Stop)
 
-	pool := agentclient.NewPool(fmt.Sprint(port))
+	pool := agentclient.NewPool(fmt.Sprint(port), poolOpts...)
 	t.Cleanup(pool.Close)
 	return pool, "127.0.0.1"
 }
@@ -219,5 +243,86 @@ func TestPoolConnectionReuse(t *testing.T) {
 		if _, err := pool.Inject(context.Background(), nodeIP, "c1", time.Now(), false); err != nil {
 			t.Fatalf("call %d: %v", i, err)
 		}
+	}
+}
+
+func TestPoolRelease(t *testing.T) {
+	pool, nodeIP := setupPool(t, &fakeAgent{})
+	if err := pool.Release(context.Background(), nodeIP, "h1"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+}
+
+func TestPoolReleaseError(t *testing.T) {
+	pool, nodeIP := setupPool(t, &fakeAgent{releaseErr: status.Error(codes.NotFound, "gone")})
+	err := pool.Release(context.Background(), nodeIP, "h1")
+	if err == nil || status.Code(errors.Unwrap(err)) != codes.NotFound {
+		t.Errorf("Release error = %v, want it to wrap the agent's NOT_FOUND", err)
+	}
+}
+
+func TestPoolGetStatusReturnsEveryPid(t *testing.T) {
+	agent := &fakeAgent{statusResp: &agentpb.StatusResponse{
+		HandleId: "h1", LastTargetTime: timestamppb.Now(), Pid: 10, Pids: []int32{10, 11, 12},
+	}}
+	pool, nodeIP := setupPool(t, agent)
+	st, err := pool.GetStatus(context.Background(), nodeIP, "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.PID != 10 || len(st.PIDs) != 3 {
+		t.Errorf("status = pid %d pids %v, want 10 and all three", st.PID, st.PIDs)
+	}
+}
+
+// With a token configured the pool authenticates; without it, an agent that
+// demands one refuses.
+func TestPoolSendsTheBearerToken(t *testing.T) {
+	serverOpts := []grpc.ServerOption{grpc.UnaryInterceptor(auth.UnaryServerInterceptor("s3cret"))}
+
+	withToken, nodeIP := setupPoolWith(t, &fakeAgent{injectHandleID: "h1"}, serverOpts, agentclient.WithToken("s3cret"))
+	if _, err := withToken.Inject(context.Background(), nodeIP, "containerd://abc", time.Now(), false); err != nil {
+		t.Errorf("Inject with the right token: %v", err)
+	}
+
+	wrong, nodeIP := setupPoolWith(t, &fakeAgent{}, serverOpts, agentclient.WithToken("nope"))
+	_, err := wrong.Inject(context.Background(), nodeIP, "containerd://abc", time.Now(), false)
+	if status.Code(errors.Unwrap(err)) != codes.Unauthenticated {
+		t.Errorf("Inject with the wrong token = %v, want Unauthenticated", err)
+	}
+
+	none, nodeIP := setupPoolWith(t, &fakeAgent{}, serverOpts)
+	if err := none.Reset(context.Background(), nodeIP, "h1"); status.Code(errors.Unwrap(err)) != codes.Unauthenticated {
+		t.Errorf("Reset with no token = %v, want Unauthenticated", err)
+	}
+}
+
+// A call without a deadline of its own must still be bounded, or one dead node
+// stalls a whole timeshift.
+func TestPoolCallTimeoutBoundsAHungAgent(t *testing.T) {
+	pool, nodeIP := setupPoolWith(t, &fakeAgent{hang: time.Minute}, nil, agentclient.WithCallTimeout(150*time.Millisecond))
+
+	start := time.Now()
+	_, err := pool.Inject(context.Background(), nodeIP, "containerd://abc", time.Now(), false)
+	if err == nil {
+		t.Fatal("Inject against a hung agent returned no error")
+	}
+	if code := status.Code(errors.Unwrap(err)); code != codes.DeadlineExceeded {
+		t.Errorf("code = %v, want DeadlineExceeded (%v)", code, err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("the call took %v; the timeout did not bound it", took)
+	}
+}
+
+// A deadline the caller set must win over the pool's default.
+func TestPoolRespectsTheCallersDeadline(t *testing.T) {
+	pool, nodeIP := setupPoolWith(t, &fakeAgent{hang: 300 * time.Millisecond, injectHandleID: "h"}, nil,
+		agentclient.WithCallTimeout(20*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := pool.Inject(ctx, nodeIP, "containerd://abc", time.Now(), false); err != nil {
+		t.Errorf("the pool's 20ms default overrode the caller's 5s deadline: %v", err)
 	}
 }

@@ -23,6 +23,13 @@ service AgentService {
 
   // Status returns the last target time and trampoline generation counter.
   rpc Status(StatusRequest) returns (StatusResponse);
+
+  // Release removes the clock hook from every process behind the handle, which
+  // restores the kernel's own vDSO fast path (Reset alone leaves the hook in
+  // place, so each clock read stays a real syscall), and forgets the handle.
+  // The handle is invalid afterwards: every call with it returns NOT_FOUND.
+  // Releasing a handle whose processes have already exited succeeds.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
 }
 
 message InjectRequest {
@@ -65,10 +72,21 @@ message StatusRequest {
   string handle_id = 1;
 }
 
+message ReleaseRequest {
+  string handle_id = 1;
+}
+
+message ReleaseResponse {}
+
 message StatusResponse {
   string handle_id              = 1;
   google.protobuf.Timestamp last_target_time = 2;  // last time passed to Inject or SetTime
   string state_addr             = 3;  // hex, e.g. "0x7ffd1234abcd" — for debugging
   uint32 generation             = 4;  // bumped on each SetTime; 0 after Inject
-  int32  pid                    = 5;  // host PID of the injected process
+  int32  pid                    = 5;  // host PID of the first injected process
+
+  // pids lists every process the handle currently covers. A container is
+  // usually more than its init process (preforked workers, sidecar-style
+  // helpers), and the agent injects and updates all of them.
+  repeated int32 pids           = 6;
 }

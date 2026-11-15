@@ -8,13 +8,22 @@ package api
 type CreateTimeshiftRequest struct {
 	Namespace     string `json:"namespace"`
 	LabelSelector string `json:"labelSelector"`
-	Time          string `json:"time"`            // RFC3339 absolute timestamp
-	TTL           string `json:"ttl,omitempty"`  // Go duration string, e.g. "1h30m"; omit for no expiry
+	Time          string `json:"time"`             // RFC3339 absolute timestamp
+	TTL           string `json:"ttl,omitempty"`    // Go duration string, e.g. "1h30m"; omit for no expiry
 	Freeze        bool   `json:"freeze,omitempty"` // if true, clock does not advance past target
 }
 
 // UpdateTimeshiftRequest is the body of PATCH /timeshifts/{id}.
 // Provide either Time (absolute) or Duration (relative advance); not both.
+//
+// Time sets the clock to an absolute instant, and Freeze chooses the mode: true
+// freezes it there, false (the default) lets it run on from there.
+//
+// Duration shifts the clock by a relative amount and keeps whatever mode the
+// timeshift is in: advancing a frozen clock leaves it frozen at the new instant,
+// advancing a running clock leaves it running. Freeze=true on a Duration update
+// additionally freezes a running clock at the shifted instant; there is no way to
+// thaw a frozen clock with Duration, use Time for that.
 type UpdateTimeshiftRequest struct {
 	Time     string `json:"time,omitempty"`     // RFC3339 absolute timestamp
 	Duration string `json:"duration,omitempty"` // Go duration string to advance by, e.g. "24h" or "-1h"
@@ -29,6 +38,11 @@ type TimeshiftResponse struct {
 	Frozen    bool     `json:"frozen,omitempty"`    // true when clock is frozen at Time
 	ExpiresAt string   `json:"expiresAt,omitempty"` // RFC3339; absent when no TTL was set
 	AppliedTo []string `json:"appliedTo"`           // "pod-name/container-name", sorted
+
+	// Warnings lists containers an update did not reach, as
+	// "pod-name/container-name: reason". It is set only when some containers took
+	// the change and others did not; if none did, the request fails instead.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // ListTimeshiftsResponse is returned by GET /timeshifts.
@@ -53,10 +67,11 @@ type ResolvedPod struct {
 // HandleStatus is the live injection state for one container, as read directly
 // from the trampoline's state struct by the agent.
 type HandleStatus struct {
-	Generation uint32 `json:"generation"` // bumped on each SetTime/Freeze; 0 after initial Inject
-	LastTarget string `json:"lastTarget"` // RFC3339, last time written by Inject or SetTime
-	StateAddr  string `json:"stateAddr"`  // hex address of the state struct, for debugging
-	PID        int32  `json:"pid"`        // host PID of the injected process
+	Generation uint32  `json:"generation"`     // bumped on each SetTime/Freeze; 0 after initial Inject
+	LastTarget string  `json:"lastTarget"`     // RFC3339, last time written by Inject or SetTime
+	StateAddr  string  `json:"stateAddr"`      // hex address of the state struct, for debugging
+	PID        int32   `json:"pid"`            // host PID of the first injected process
+	PIDs       []int32 `json:"pids,omitempty"` // every process of the container the handle covers
 }
 
 // ContainerStatusEntry is the live injection state for one container within a

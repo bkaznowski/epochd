@@ -28,6 +28,16 @@ import (
 // hooks.
 var ErrUninstalled = errors.New("inject: the hooks were uninstalled from this process")
 
+// ErrHooksLost is returned when a Handle finds that the trampoline is no longer
+// at the address it recorded. The usual cause is that the process called exec,
+// which replaced its address space: the old state address now means nothing, and
+// writing to it would corrupt whatever the new program mapped there. The process
+// needs injecting afresh.
+var ErrHooksLost = errors.New("inject: the hooks are no longer in this process (it has exec'd)")
+
+// ErrNotInjected is returned by Adopt for a process that does not carry the hooks.
+var ErrNotInjected = errors.New("inject: the process does not carry the hooks")
+
 // pageSize is the granule everything here maps, searches and unmaps in.
 const pageSize = uintptr(4096)
 
@@ -548,10 +558,9 @@ func pristineEntry(info *vdso.VDSOInfo, entryAddr uintptr) ([hookLen]byte, error
 	return b, nil
 }
 
-// reuseTrampoline adopts a trampoline that is already installed in pid: it
-// rewrites the state in place and builds a Handle that knows the original vDSO
-// bytes, without mapping or patching anything.
-func reuseTrampoline(pid int, info *vdso.VDSOInfo, page uintptr, sec, nsec int64, mask uint64) (*Handle, error) {
+// adoptTrampoline builds a Handle for a trampoline that is already installed at
+// page in pid. The Handle knows the original vDSO bytes, so it can uninstall.
+func adoptTrampoline(pid int, info *vdso.VDSOInfo, page uintptr) (*Handle, error) {
 	h := &Handle{PID: pid, StateAddr: page + uintptr(trampoline.StateOffset)}
 	for i, addr := range []uintptr{info.ClockGettimeAddr, info.GettimeofdayAddr, info.TimeAddr} {
 		orig, err := pristineEntry(info, addr)
@@ -560,10 +569,37 @@ func reuseTrampoline(pid int, info *vdso.VDSOInfo, page uintptr, sec, nsec int64
 		}
 		h.patched[i] = patchedHook{addr: addr, orig: orig}
 	}
+	return h, nil
+}
+
+// reuseTrampoline adopts a trampoline that is already installed in pid and
+// rewrites its state in place, without mapping or patching anything.
+func reuseTrampoline(pid int, info *vdso.VDSOInfo, page uintptr, sec, nsec int64, mask uint64) (*Handle, error) {
+	h, err := adoptTrampoline(pid, info, page)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := procmem.WriteMem(pid, h.StateAddr, trampoline.EncodeState(sec, nsec, mask, 0)); err != nil {
 		return nil, fmt.Errorf("inject: rewriting the existing trampoline's state: %w", err)
 	}
 	return h, nil
+}
+
+// Adopt returns a Handle for a process that already carries this package's
+// hooks (injected by an agent that has since restarted, say, or by a process
+// that forked from an injected one), or ErrNotInjected if it does not. It reads
+// the process but changes nothing, so it is the cheap way to ask "is this one
+// still hooked?" and the way to get a Handle that can Uninstall.
+func Adopt(pid int) (*Handle, error) {
+	info, err := vdso.Locate(pid)
+	if err != nil {
+		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
+	}
+	page, ok := existingTrampoline(pid, info)
+	if !ok {
+		return nil, ErrNotInjected
+	}
+	return adoptTrampoline(pid, info, page)
 }
 
 // writeState writes new trampoline state via process_vm_writev without stopping
@@ -574,11 +610,33 @@ func (h *Handle) writeState(sec, nsec int64, mask uint64) error {
 	if h.uninstalled {
 		return ErrUninstalled
 	}
+	if err := h.verifyTrampoline(); err != nil {
+		return err
+	}
 	h.gen++
 	encoded := trampoline.EncodeState(sec, nsec, mask, h.gen)
 	if _, err := procmem.WriteMem(h.PID, h.StateAddr, encoded); err != nil {
 		h.gen-- // revert so the next call retries with the same generation
 		return fmt.Errorf("inject: writeState: %w", err)
+	}
+	return nil
+}
+
+// verifyTrampoline checks that this build's trampoline code is still at the
+// address the Handle recorded, so a write never lands in an address space that
+// was replaced by exec. A process that is gone is reported as such (ESRCH), not
+// as lost hooks.
+func (h *Handle) verifyTrampoline() error {
+	page := h.StateAddr - uintptr(trampoline.StateOffset)
+	code := make([]byte, trampoline.StateOffset)
+	if _, err := procmem.ReadMem(h.PID, page, code); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", ErrHooksLost, err)
+	}
+	if !bytes.Equal(code, trampoline.Payload[:trampoline.StateOffset]) {
+		return ErrHooksLost
 	}
 	return nil
 }

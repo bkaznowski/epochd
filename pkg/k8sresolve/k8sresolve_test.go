@@ -4,6 +4,7 @@ package k8sresolve
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 )
@@ -124,4 +125,134 @@ func TestLookupPIDTooShort(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for short container ID, got nil")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// LookupPIDs against a fake /proc tree
+// ---------------------------------------------------------------------------
+
+// fakeProc builds a /proc-shaped directory and points procRoot at it.
+type fakeProc struct {
+	t    *testing.T
+	root string
+}
+
+func newFakeProc(t *testing.T) *fakeProc {
+	t.Helper()
+	root := t.TempDir()
+	old := procRoot
+	procRoot = root
+	t.Cleanup(func() { procRoot = old })
+	return &fakeProc{t: t, root: root}
+}
+
+// add creates /proc/<pid> with the given cgroup content and start time. The stat
+// line has the real layout, including a command name with spaces and parens.
+func (f *fakeProc) add(pid int, cgroup string, start uint64) {
+	f.t.Helper()
+	dir := filepath.Join(f.root, strconv.Itoa(pid))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup"), []byte(cgroup), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+	if start == 0 {
+		return // leave stat unreadable
+	}
+	// pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt
+	// cmajflt utime stime cutime cstime priority nice threads itrealvalue starttime ...
+	stat := strconv.Itoa(pid) + " (my (weird) cmd) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 " +
+		strconv.FormatUint(start, 10) + " 0 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+const fakeCID = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+
+func cg(id string) string { return "0::/kubepods/burstable/pod1234/" + id + "\n" }
+
+func TestLookupPIDsReturnsEveryProcessOfTheContainer(t *testing.T) {
+	f := newFakeProc(t)
+	f.add(300, cg(fakeCID), 1000)
+	f.add(301, cg(fakeCID), 1010)
+	f.add(302, cg(fakeCID), 1020)
+	f.add(400, cg("1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"), 900) // another container
+	f.add(500, "0::/user.slice/session-1.scope\n", 800)                                     // not a container
+
+	got, err := LookupPIDs("containerd://" + fakeCID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []int{300, 301, 302}; !equalInts(got, want) {
+		t.Errorf("LookupPIDs = %v, want exactly this container's processes %v", got, want)
+	}
+}
+
+// pids wrap, so a worker started after the init can have a lower pid number. The
+// init is whichever started first.
+func TestLookupPIDsOrdersByStartTimeNotPidNumber(t *testing.T) {
+	f := newFakeProc(t)
+	f.add(32000, cg(fakeCID), 500) // the init: started first, high pid
+	f.add(12, cg(fakeCID), 9000)   // a worker after the pid counter wrapped
+	f.add(20, cg(fakeCID), 9500)
+
+	got, err := LookupPIDs(fakeCID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []int{32000, 12, 20}; !equalInts(got, want) {
+		t.Errorf("LookupPIDs = %v, want %v (init first)", got, want)
+	}
+	if pid, _ := LookupPID(fakeCID); pid != 32000 {
+		t.Errorf("LookupPID = %d, want the init (32000)", pid)
+	}
+}
+
+func TestLookupPIDsHandlesAnUnreadableStartTime(t *testing.T) {
+	f := newFakeProc(t)
+	f.add(50, cg(fakeCID), 0) // no stat file: sorts last
+	f.add(60, cg(fakeCID), 7)
+	f.add(40, cg(fakeCID), 0) // no stat file, lower pid: before 50
+
+	got, err := LookupPIDs(fakeCID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []int{60, 40, 50}; !equalInts(got, want) {
+		t.Errorf("LookupPIDs = %v, want %v", got, want)
+	}
+}
+
+func TestLookupPIDsErrors(t *testing.T) {
+	f := newFakeProc(t)
+	f.add(300, cg(fakeCID), 1)
+
+	if _, err := LookupPIDs("containerd://ffffffffffffffffffffffffffffffffffffffffffffffff"); err == nil {
+		t.Error("an unknown container must be an error")
+	}
+	if _, err := LookupPIDs("abc"); err == nil {
+		t.Error("a container id that is too short must be an error")
+	}
+}
+
+func TestStartTimeParsesAwkwardCommandNames(t *testing.T) {
+	f := newFakeProc(t)
+	f.add(77, cg(fakeCID), 424242)
+	if got := startTime(77); got != 424242 {
+		t.Errorf("startTime = %d, want 424242 (the command name contains spaces and parentheses)", got)
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
