@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -270,6 +271,11 @@ func runPreload(cmdArgs []string, target time.Time, freeze bool) error {
 		}
 		exitCode = code
 	}
+	// Checked once the command has finished: asked earlier it would race the
+	// dynamic loader. Zero means the library never loaded into anything, so the
+	// command ran on real time and the run proved nothing; say so rather than
+	// leave a fake clock that silently did not apply.
+	warnIfNeverLoaded(stderr, h, cmdArgs[0])
 	// Close before os.Exit below, which would skip a deferred call.
 	h.Close() //nolint:errcheck
 
@@ -278,6 +284,17 @@ func runPreload(cmdArgs []string, target time.Time, freeze bool) error {
 		exitFunc(exitCode)
 	}
 	return nil
+}
+
+// warnIfNeverLoaded tells the user when nothing the command ran loaded the
+// preload library, in which case it saw real time however the clock was set.
+func warnIfNeverLoaded(w io.Writer, h *preload.Handle, command string) {
+	if h.Attached() != 0 {
+		return
+	}
+	fmt.Fprintf(w, "faketimectl: warning: the preload library was never loaded by %q, so it ran on real time.\n"+
+		"  Likely causes: a static or Go binary behind a wrapper, a scrubbed environment (env -i),\n"+
+		"  or a noexec $TMPDIR. Try --mode=%s.\n", command, modeVDSO)
 }
 
 // runWatchLoop handles PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, and

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -344,5 +345,80 @@ func TestDefaultModeIsVDSO(t *testing.T) {
 	}
 	if ModeVDSO != 0 {
 		t.Error("ModeVDSO must be the zero value")
+	}
+}
+
+// The leader exiting does not end a preload clock: a descendant it left behind
+// is still reading it, may still exec programs that load the library by path,
+// and is only reachable through this handle. Prune must leave it alone until
+// the last such process is gone.
+func TestSessionPreloadPruneKeepsHandleWhileDescendantsRun(t *testing.T) {
+	needTool(t, "sh", "sleep")
+	s := NewSession(time.Now().Add(time.Hour), WithMode(ModePreload))
+	t.Cleanup(func() { s.Close() }) //nolint:errcheck
+
+	// The shell backgrounds a sleep (detached from our pipe so Wait returns) and exits.
+	cmd := exec.Command("sh", "-c", "sleep 60 >/dev/null 2>&1 </dev/null & echo $!")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := s.Start(cmd); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := s.WaitPID(cmd.Process.Pid); err != nil {
+		t.Fatalf("WaitPID: %v", err)
+	}
+	orphan, err := strconv.Atoi(strings.TrimSpace(out.String()))
+	if err != nil {
+		t.Fatalf("could not read the orphan's pid from %q: %v", out.String(), err)
+	}
+	t.Cleanup(func() { syscall.Kill(orphan, syscall.SIGKILL) }) //nolint:errcheck
+
+	// Let the orphan finish loading before asking whether it is in use.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if n, _ := s.handles[0].PreloadAttached(); n >= 2 { // sh and sleep
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if n := s.Prune(); n != 0 {
+		t.Errorf("Prune() = %d while a descendant still runs on the clock, want 0", n)
+	}
+	if s.Len() != 1 {
+		t.Fatalf("Len = %d, the handle must stay while its clock is in use", s.Len())
+	}
+	// The clock must still be controllable, and its library must still exist.
+	if err := s.SetTime(time.Now().Add(2 * time.Hour)); err != nil {
+		t.Errorf("SetTime on the kept handle: %v", err)
+	}
+
+	syscall.Kill(orphan, syscall.SIGKILL) //nolint:errcheck
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && syscall.Kill(orphan, 0) == nil {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := s.Prune(); n != 1 {
+		t.Errorf("Prune() = %d once the descendant exited, want 1", n)
+	}
+	if s.Len() != 0 {
+		t.Errorf("Len = %d after the last user of the clock exited, want 0", s.Len())
+	}
+}
+
+func TestPreloadAttachedExposedOnHandles(t *testing.T) {
+	needTool(t, "date")
+	cmd := exec.Command("date")
+	h, err := StartPreload(cmd, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	cmd.Wait() //nolint:errcheck
+	if n, ok := h.PreloadAttached(); !ok || n != 1 {
+		t.Errorf("PreloadAttached() = (%d, %v), want (1, true)", n, ok)
+	}
+	if _, ok := (&Handle{}).PreloadAttached(); ok {
+		t.Error("a handle with no preload backend must report ok=false")
 	}
 }

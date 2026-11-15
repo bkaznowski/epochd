@@ -24,9 +24,19 @@
 //   - It works on processes you start, not on ones already running.
 //   - The advancing path calls the real clock_gettime through libc, so it keeps
 //     the vDSO fast path that the trampoline gives up.
+//   - Only the wall clock moves. Timeouts expressed as an absolute CLOCK_REALTIME
+//     deadline (pthread_cond_timedwait, sem_timedwait, ...) are handed to the
+//     kernel unchanged, so a process computing "now + 5s" from the fake clock
+//     waits against the real one. Relative timeouts and the monotonic clocks are
+//     unaffected and behave normally.
+//
+// One library file serves glibc and musl systems alike; Attached reports whether
+// it ever loaded into a process, so a command that bypassed it is noticed.
 package preload
 
 import (
+	"bufio"
+	"bytes"
 	"debug/buildinfo"
 	"debug/elf"
 	_ "embed"
@@ -36,6 +46,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,6 +75,10 @@ const (
 	offNsec = 8
 	offMask = 16
 	offSeq  = 24
+
+	// offAttached counts the processes that loaded the library (the library
+	// increments it at load time; see lib/epochd_preload.c).
+	offAttached = 28
 )
 
 // Handle is one fake clock shared by every process started through it.
@@ -103,6 +118,16 @@ func newHandle(init func(*Handle) error) (h *Handle, err error) {
 			h = nil
 		}
 	}()
+
+	// MkdirTemp creates the directory 0700, which would stop a child that
+	// changes uid (su, sudo -u, a daemon dropping privileges) from opening the
+	// library: the loader then ignores the preload with a one-line warning and
+	// that process runs on real time. 0711 lets anyone who knows the random
+	// name reach the files without being able to list the directory; the files
+	// are the public library and a clock, and only we can write to either.
+	if err = os.Chmod(dir, 0o711); err != nil {
+		return h, fmt.Errorf("preload: %w", err)
+	}
 
 	// 0755: the dynamic loader mmaps the library with PROT_EXEC, which also
 	// means $TMPDIR must not be on a noexec mount.
@@ -159,6 +184,68 @@ func (h *Handle) write(sec, nsec int64, mask uint64) error {
 	binary.LittleEndian.PutUint64(h.mem[offMask:], mask)
 	atomic.AddUint32(seq, 1) // even: stable
 	return nil
+}
+
+// Attached returns how many processes have loaded the library for this clock. It
+// is how a caller tells "the clock is not working" from "the library never got
+// into the process": zero after the command has run means the preload was
+// bypassed (a static or Go binary behind a wrapper, a scrubbed environment, a
+// noexec $TMPDIR, an incompatible libc) and the command saw real time.
+//
+// Each exec of a binary that loads the library counts once; a plain fork, which
+// shares the parent's mapping, does not. A process running as a different user
+// than the one that created the Handle cannot open the state file for writing
+// and is not counted, though it still reads the clock.
+func (h *Handle) Attached() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.mem == nil {
+		return 0
+	}
+	return int(atomic.LoadUint32((*uint32)(unsafe.Pointer(&h.mem[offAttached]))))
+}
+
+// InUse reports whether any other process on the machine still has this clock's
+// library or state mapped, that is, whether a process started through the
+// Handle (or one of its descendants) is still running with it. Closing a Handle
+// that is in use removes the library out from under children that exec later.
+//
+// It reads /proc/*/maps, so it sees only processes this user may inspect; one
+// it cannot read is treated as not using the clock.
+func (h *Handle) InUse() bool {
+	marker := []byte(h.dir + string(filepath.Separator))
+	self := os.Getpid()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		if mapsMention(filepath.Join("/proc", e.Name(), "maps"), marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// mapsMention reports whether the maps file at path has a line containing marker.
+func mapsMention(path string, marker []byte) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for sc.Scan() {
+		if bytes.Contains(sc.Bytes(), marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // Env returns base (os.Environ() when nil) with LD_PRELOAD and EPOCHD_STATE_FILE

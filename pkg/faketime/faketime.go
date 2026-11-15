@@ -209,6 +209,17 @@ func (h *Handle) Close() error {
 	return h.pre.Close()
 }
 
+// PreloadAttached reports how many processes have loaded the preload library for
+// this handle's clock. ok is false for a vDSO handle, which has no such library.
+// A count of zero once the command has run means LD_PRELOAD never took effect for
+// it (see preload.Handle.Attached for the usual causes) and it saw real time.
+func (h *Handle) PreloadAttached() (n int, ok bool) {
+	if h.pre == nil {
+		return 0, false
+	}
+	return h.pre.Attached(), true
+}
+
 // SetTime updates the fake time without stopping the process (process_vm_writev
 // for the vDSO backend, a shared-memory write for the preload backend).
 func (h *Handle) SetTime(target time.Time) error {
@@ -1388,7 +1399,9 @@ func (s *Session) applyAll(fn func(*Handle) error, updateState func()) error {
 
 // Prune removes handles for processes that are no longer alive and returns the
 // number of handles removed. For sessions created with WithTracking, trackers
-// whose parent process has exited are also closed and removed.
+// whose parent process has exited are also closed and removed. A preload handle
+// whose process has exited is kept while any descendant still has its library
+// mapped, since that descendant is still on the handle's clock.
 func (s *Session) Prune() int {
 	// Determine which trackers are dead outside the lock (IsAlive is cheap).
 	s.mu.Lock()
@@ -1414,7 +1427,7 @@ func (s *Session) Prune() int {
 	}
 
 	n := len(deadTrackers)
-	var deadPreload []*Handle
+	var deadPreload []*Handle // leader gone; descendants may still run on its clock
 	live := make([]*Handle, 0, len(s.handles))
 	for _, h := range s.handles {
 		switch {
@@ -1424,20 +1437,36 @@ func (s *Session) Prune() int {
 			live = append(live, h) // alive tracker parent, keep
 		case h.IsAlive():
 			live = append(live, h)
+		case h.pre != nil:
+			deadPreload = append(deadPreload, h) // decided below, outside the lock
 		default:
 			n++ // dead standalone handle
-			if h.pre != nil {
-				deadPreload = append(deadPreload, h)
-			}
 		}
 	}
 	s.handles = live
 	s.mu.Unlock()
 
-	// A pruned preload handle would otherwise leak its temp dir until process
-	// exit, since Session.Close only sees handles still in the session.
+	// A preload handle's clock outlives the process it was started for: a
+	// daemonised child, or a worker the leader left behind, keeps reading it and
+	// may still exec programs that load the library by path. Pruning such a
+	// handle would delete the library under them and drop the only way to move
+	// their clock, so it stays until nothing is using it. Scanning /proc is done
+	// without the session lock held.
+	var inUse []*Handle
 	for _, h := range deadPreload {
+		if h.pre.InUse() {
+			inUse = append(inUse, h)
+			continue
+		}
+		n++
+		// Otherwise the temp dir would leak until process exit, since
+		// Session.Close only sees handles still in the session.
 		h.Close() //nolint:errcheck
+	}
+	if len(inUse) > 0 {
+		s.mu.Lock()
+		s.handles = append(s.handles, inUse...)
+		s.mu.Unlock()
 	}
 
 	// Close dead trackers outside the lock — Close waits for the watchLoop goroutine.

@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/bkaznowski/epochd/pkg/preload"
 )
 
 // captureStderr redirects the package-level stderr for the test's duration.
@@ -228,5 +230,51 @@ func TestTokenFromEnv(t *testing.T) {
 	t.Setenv("EPOCHD_TOKEN_FILE", empty)
 	if _, err := tokenFromEnv(); err == nil {
 		t.Error("an empty EPOCHD_TOKEN_FILE must be an error")
+	}
+}
+
+// A command that never loads the preload library runs on real time whatever
+// the clock was set to; the user has to be told, since nothing else shows it.
+func TestWarnIfNeverLoaded(t *testing.T) {
+	h, err := preload.New(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	var buf bytes.Buffer
+	warnIfNeverLoaded(&buf, h, "mydaemon")
+	for _, want := range []string{"warning", `"mydaemon"`, "real time", "--mode=vdso"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("warning %q should mention %q", buf.String(), want)
+		}
+	}
+
+	// Once something loaded the library there is nothing to warn about.
+	requireTool(t, "date")
+	cmd := exec.Command("date")
+	h2, err := preload.Start(cmd, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2.Close()
+	cmd.Wait() //nolint:errcheck
+	buf.Reset()
+	warnIfNeverLoaded(&buf, h2, "date")
+	if buf.Len() != 0 {
+		t.Errorf("unexpected warning for a command that loaded the library: %q", buf.String())
+	}
+}
+
+// The ordinary path must stay quiet: a command that loaded the library is not
+// warned about.
+func TestRunPreloadDoesNotWarnWhenLoaded(t *testing.T) {
+	requireTool(t, "sh")
+	logs := captureStderr(t)
+	if err := run([]string{"run", "--mode=preload", "--time=2030-01-01T00:00:00Z", "--", "sh", "-c", "true"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs.String(), "warning") {
+		t.Errorf("unexpected warning: %q", logs.String())
 	}
 }

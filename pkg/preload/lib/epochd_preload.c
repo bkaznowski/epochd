@@ -24,7 +24,13 @@
  *   +8   int64  offset_nsec  advancing: added to tv_nsec; frozen: absolute tv_nsec
  *   +16  uint64 mask         bit 0 = enabled, bit 1 = frozen
  *   +24  uint32 seq          seqlock: odd while the writer is mid-update
- *   +28  uint32 pad
+ *   +28  uint32 attached     number of processes that loaded this library
+ *
+ * `attached` is how the controlling side learns the library was never loaded
+ * (a static binary, a scrubbed environment, a noexec $TMPDIR...), which would
+ * otherwise look exactly like "the clock is not working". The library maps the
+ * file writable only to bump it; a process that cannot open it for writing
+ * (another uid) falls back to a read-only map and is simply not counted.
  *
  * What it cannot affect: statically linked binaries, Go binaries (the Go
  * runtime reads the vDSO directly, not libc), raw syscall(SYS_clock_gettime)
@@ -32,11 +38,16 @@
  *
  * Build against the OLDEST glibc to support (Redpanda bundles 2.35) and keep
  * the imports minimal; a library built against an older glibc loads on newer
- * ones, not the reverse. See Dockerfile in this directory.
+ * ones, not the reverse. It is also linked without any DT_NEEDED entry and
+ * without fortify/stack-protector helpers, so the same file loads under musl
+ * (Alpine), whose loader has no libc.so.6 to satisfy a dependency on it and no
+ * __*_chk functions; every symbol it uses is resolved from the process's own
+ * libc at load time. See Dockerfile in this directory.
  */
 #define _GNU_SOURCE /* RTLD_NEXT */
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,15 +61,19 @@
 #define MASK_FROZEN  2u
 
 /* A writer that dies mid-update leaves seq odd forever; give up after this
- * many attempts and fall back to real time instead of hanging the process. */
-#define MAX_SNAPSHOT_TRIES 1000
+ * many attempts instead of hanging the process. A live writer holds seq odd for
+ * a few nanoseconds, but it can be preempted inside that window, so the reader
+ * yields the CPU now and then rather than spinning through its whole budget
+ * while the writer cannot run. */
+#define MAX_SNAPSHOT_TRIES 4096
+#define YIELD_EVERY        64
 
 typedef struct {
     int64_t  offset_sec;
     int64_t  offset_nsec;
     uint64_t mask;
     uint32_t seq;
-    uint32_t pad;
+    uint32_t attached;
 } State;
 
 typedef struct {
@@ -67,8 +82,15 @@ typedef struct {
     uint64_t mask;
 } Snapshot;
 
-static const State *state_map; /* NULL means pass through to real time */
+static State *state_map; /* NULL means pass through to real time */
 static int init_done;
+
+/* The last consistent snapshot this thread read. If the writer died mid-update
+ * (seq stuck odd), carrying on with the clock as it last stood beats snapping
+ * back to real time, which the process would see as a jump of the whole offset.
+ * Per thread, so a fallback read can never be torn. */
+static __thread Snapshot last_good;
+static __thread int have_last_good;
 
 static int (*real_clock_gettime)(clockid_t, struct timespec *);
 static int (*real_gettimeofday)(struct timeval *, void *);
@@ -81,12 +103,23 @@ static void init_state(void)
 
     const char *path = getenv("EPOCHD_STATE_FILE");
     if (path && *path) {
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        /* Writable only so this process can be counted; the clock fields are
+         * never written from here. Fall back to read-only when we may not. */
+        int writable = 1;
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            writable = 0;
+            fd = open(path, O_RDONLY | O_CLOEXEC);
+        }
         if (fd >= 0) {
-            void *p = mmap(NULL, STATE_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+            void *p = mmap(NULL, STATE_SIZE, writable ? PROT_READ | PROT_WRITE : PROT_READ,
+                           MAP_SHARED, fd, 0);
             close(fd);
-            if (p != MAP_FAILED)
+            if (p != MAP_FAILED) {
                 state_map = p;
+                if (writable)
+                    __atomic_fetch_add(&state_map->attached, 1, __ATOMIC_RELAXED);
+            }
         }
     }
 
@@ -118,6 +151,8 @@ static int read_state(Snapshot *out)
         return 0;
 
     for (int i = 0; i < MAX_SNAPSHOT_TRIES; i++) {
+        if (i && i % YIELD_EVERY == 0)
+            sched_yield();
         uint32_t before = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
         if (before & 1u)
             continue;
@@ -125,8 +160,18 @@ static int read_state(Snapshot *out)
         out->nsec = __atomic_load_n(&s->offset_nsec, __ATOMIC_RELAXED);
         out->mask = __atomic_load_n(&s->mask, __ATOMIC_RELAXED);
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (__atomic_load_n(&s->seq, __ATOMIC_RELAXED) == before)
+        if (__atomic_load_n(&s->seq, __ATOMIC_RELAXED) == before) {
+            last_good      = *out;
+            have_last_good = 1;
             return (out->mask & MASK_ENABLED) != 0;
+        }
+    }
+
+    /* The writer never finished: use what this thread last saw. A thread that
+     * has seen nothing yet has no clock to continue, so it reads real time. */
+    if (have_last_good) {
+        *out = last_good;
+        return (out->mask & MASK_ENABLED) != 0;
     }
     return 0;
 }
