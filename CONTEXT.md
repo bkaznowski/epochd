@@ -1,10 +1,53 @@
-# epochd — implementation context (current phase: 42)
+# epochd — implementation context (phases 0–42, plus the v0.8 hardening below)
 
-This file is a dense reference for an agent or developer continuing the project. It
-captures the state of the codebase after phases 0–29 and 33–42 (phases 30–32 are not yet
-implemented — see the status table in `README.md`), the exact APIs that exist, every
-non-obvious decision that was made and why, and discovered gotchas. See `FUTURE.md` for
-longer-horizon improvements.
+This file is a dense reference for an agent or developer continuing the project. It was
+written phase by phase up to phase 42; the section "Since phase 42" directly below says
+what changed afterwards and **takes precedence** where the older text disagrees. The
+phase-by-phase sections (7–10 especially) are design notes kept for reference: their
+ports, privileges and signatures are the plan as it stood then. Phases 30 (leader
+election) and 31 (validating webhook) are not implemented; see `TODO.md` and `FUTURE.md`.
+
+---
+
+## Since phase 42
+
+- **Trampoline is built from C** (`pkg/trampoline/src/*.c`, `build.sh` in a Docker image),
+  position-independence checked at build, offsets generated from ELF symbols, the output
+  committed with a source-hash test. Not assembly any more.
+- **Injection is safe on running processes**: idempotent (an existing trampoline is
+  reused), multi-threaded targets (every thread is seized and stepped out of the patched
+  range), `Tracer.Close` releases the pinned thread, `inject.Adopt` / `Handle.Uninstall`,
+  `ErrHooksLost` when a process has exec'd, remote syscalls use `orig_rax=-1`.
+- **Agent**: covers every process in the container, not just init (`k8sresolve.LookupPIDs`);
+  has a `Release` RPC (uninstalls the hooks, forgets the handle); reports NOT_FOUND for a
+  handle whose processes are gone. Listens on **9433** (9100 is node-exporter's).
+  Runs with `CAP_SYS_PTRACE` only, not privileged (`deploy/README.md`, "What the agent
+  can do").
+- **Authentication** (`pkg/auth`): bearer token and/or (m)TLS on the agent gRPC port and the
+  controller HTTP API; both refuse to start without it unless `--allow-unauthenticated`.
+  Two tokens in Secret `epochd-auth` (`api-token` for clients, `agent-token` for the
+  controller→agent hop). `faketimectl` reads `EPOCHD_TOKEN` / `EPOCHD_TOKEN_FILE`;
+  `sdk.Client.WithToken`.
+- **Controller semantics**: snapshots instead of live pointers, a per-timeshift operation
+  lock, reservation of containers during create, serialised persist, a timeshift leaves the
+  registry only once every container is confirmed back on real time (delete and TTL both
+  retry), NOT_FOUND from an agent means "take over" (inject then reset), an update that
+  reached no container fails with 502, a duration update keeps the clock's mode.
+- **Preload backend** (`pkg/preload`): one library for glibc and musl (no `DT_NEEDED`),
+  `Handle.Attached` counts loaded processes (the CLI warns when it is zero), seqlock reader
+  falls back to its last good snapshot, absolute `CLOCK_REALTIME` deadlines are translated
+  (frozen: waits as long in real time), `Handle.InUse` keeps `Session.Prune` from closing a
+  clock descendants still use, `preload.CheckStrict`.
+- **`pkg/faketime`**: `WithAutoMode` (preload only where it surely works, ptrace otherwise
+  and for `Attach`), `WithModeFilter`, `StartMode`; the `ChildTracker` sweeps `/proc` for
+  children forked from threads it is not attached to (`strays.go`).
+- **Tests**: `e2e/` covers set, update, delete, TTL expiry, an agent SIGKILL (take-over) and a
+  graceful agent restart on a real cluster. CI runs with `-race`; actions are pinned to SHAs;
+  `release.yml` has a `dry_run` input, an atomic push and a CI gate.
+- **Known limits** are in `README.md` and `TODO.md`: x86-64 only, a stray child that execs
+  reads real time for up to 100 ms, preload does not translate a deadline for a blocked
+  process whose offset later changes, the vDSO mode does not translate absolute deadlines,
+  AppArmor/SELinux nodes may need a different agent security context.
 
 ---
 
@@ -12,13 +55,13 @@ longer-horizon improvements.
 
 - **Module**: `github.com/bkaznowski/epochd`
 - **Go version**: `go 1.26.4` (in go.mod)
-- **Direct dependencies**:
-  - `golang.org/x/sys v0.46.0` — ptrace, `process_vm_readv/writev`, `MAP_FIXED_NOREPLACE`
-  - `google.golang.org/grpc v1.81.1` — controller→agent gRPC transport
-  - `google.golang.org/protobuf v1.36.x` — generated protobuf types
-  - `k8s.io/api v0.32.5`, `k8s.io/apimachinery v0.32.5`, `k8s.io/client-go v0.32.5` — pod listing and informers
+- **Direct dependencies** (exact versions in `go.mod`, kept current by Dependabot):
+  - `golang.org/x/sys` — ptrace, `process_vm_readv/writev`, `MAP_FIXED_NOREPLACE`
+  - `google.golang.org/grpc` — controller→agent gRPC transport
+  - `google.golang.org/protobuf` — generated protobuf types
+  - `k8s.io/api`, `k8s.io/apimachinery`, `k8s.io/client-go` — pod listing and informers
 - **Build constraint on most files**: `//go:build linux` — the vDSO hook is Linux x86-64 only. `pkg/api`, `pkg/sdk`, `pkg/agentclient`, `pkg/agentpb`, and `test/targets/clockprinter` have no build tag (cross-platform).
-- **No CGo anywhere.** The trampoline binary is embedded bytes; no native compilation at runtime.
+- **No CGo anywhere.** The trampoline and the preload library are committed binaries (built from C in Docker, see `pkg/trampoline/src/build.sh` and `pkg/preload/lib/build.sh`); `go build` needs no C toolchain.
 - **Cross-compile from Windows/Mac**: `GOOS=linux GOARCH=amd64 go build ./...` works fine; the `//go:build linux` tag is for runtime, not the host.
 - **golangci-lint**: configured in `.golangci.yml`; CI uses `install-mode: goinstall` so the linter is built with the project's own Go version (avoids version mismatch rejections from older pre-built linter binaries).
 
@@ -802,41 +845,37 @@ self-contained.
 
 ## Known limitations and future work
 
-1. **No `Uninstall`**: `Handle.patched` stores the 5 original vDSO bytes for each of the
-   three hooked functions (`clock_gettime`, `gettimeofday`, `time`) but there is no
-   `Uninstall()` method that uses them. The `SetTime(time.Now())` approach is sufficient
-   for testing. A future `Uninstall()` would PokeText those bytes back for all three and
-   optionally `munmap` the trampoline page via the same `remoteMmap` mechanism (but with
-   `SYS_MUNMAP`).
+The list below was rewritten after phase 42; items that used to be limitations and have
+since been fixed are gone (`Uninstall`, single process per container, no recovery after an
+agent restart).
 
-2. **Single process per injection**: Each `Handle` targets one PID. Containers with
-   multiple processes (e.g. sidecars) each need their own `InjectAtTime` call. The
-   controller should inject into the init PID (PID 1 in the container namespace), which is
-   the parent of all processes in the container; all forked children inherit the same vDSO
-   mapping and will see the same patched `clock_gettime`.
+1. **Torn reads of the clock state**: `SetTime` writes the trampoline's fields with plain
+   stores and the generation counter is for observability only, so a `clock_gettime`
+   concurrent with an update can see a mix of old and new fields (one wrong timestamp).
+   The preload library's state has a real seqlock; the trampoline's does not.
 
-3. **No persistence across agent restart**: The handle map is in-memory. If the agent pod
-   restarts, all injection state is lost. The controller should detect this (via a health
-   endpoint or handle-not-found error) and re-inject.
+2. **x86-64 only**: the JMP patch and syscall sequence are x86-64. arm64 would need a
+   different payload (`LDR x16, [pc+8]; BR x16; .quad addr`, 12 bytes to save). See
+   `FUTURE.md`.
 
-4. **Race on state struct write**: `SetTime` uses plain word stores; there's no seqlock or
-   atomic. A `clock_gettime` call concurrent with a `SetTime` can observe a torn state.
-   For test workloads this is harmless (one slightly wrong timestamp). Adding a seqlock to
-   the assembly would eliminate this at the cost of 3–4 more instruction bytes.
+3. **Wall clock only**: `CLOCK_REALTIME` / `_COARSE`, `gettimeofday` and `time` are
+   intercepted; `CLOCK_MONOTONIC` and friends pass straight through, deliberately, so a
+   target's own timeouts and latency measurements keep seeing real elapsed time. Adding
+   monotonic interception would need a new bit in the mask — see `FUTURE.md`.
 
-5. **x86-64 only**: The trampoline's JMP patch and `syscall` sequence are x86-64 specific. AArch64 (arm64) would need a
-   different payload. The `JMP rel32` approach doesn't exist on AArch64 (`B` has 26-bit
-   offset, ~128 MB reach). Alternative: patch with `LDR x16, [pc+8]; BR x16; .quad addr`
-   (12 bytes, reach = full 64-bit space) — requires saving 12 bytes instead of 5.
+4. **Absolute deadlines in vDSO mode**: a program that hands the kernel an absolute
+   `CLOCK_REALTIME` deadline computed from the fake clock waits against the real one. Preload
+   mode translates these; the vDSO mode cannot, since it only changes what the process reads.
 
-6. **Wall clock only**: `clock_gettime` (`CLOCK_REALTIME` + `CLOCK_REALTIME_COARSE`),
-   `gettimeofday`, and `time` are all intercepted (see the `pkg/trampoline` section above —
-   this used to be `clock_gettime` only, which silently missed `gettimeofday`-based readers
-   like PostgreSQL). `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, etc. still pass straight through —
-   deliberately, so a target's internal timeout/latency logic keeps seeing real elapsed
-   time. Adding monotonic interception would need a new bit in `enabledMask` (bits 0 and 1
-   are taken: interception-enabled and freeze-mode; bit 2 would work) and a new branch in
-   `clock_gettime_entry` — see `FUTURE.md`.
+5. **Children forked from late threads**: found by the tracker's `/proc` sweep within
+   100 ms, so one that execs reads real time until then. `PTRACE_O_TRACECLONE` would close
+   the gap at the price of a stop per thread creation.
+
+6. **Single controller replica**: state lives in a ConfigMap (1 MiB limit) and the
+   Deployment uses the `Recreate` strategy; there is no leader election (phase 30).
+
+7. **Agent on AppArmor/SELinux nodes**: untested; may need an unconfined profile or a
+   permissive SELinux type. See `deploy/README.md`.
 
 ---
 

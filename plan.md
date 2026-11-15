@@ -1,3 +1,9 @@
+> **Historical.** This is the original implementation plan, written before the code. It is
+> kept for the reasoning behind the design, but the code has moved on: for the current state
+> read `README.md`, `CONTEXT.md` (its "Since phase 42" section first) and `TODO.md`. Details
+> here such as ports, privileges, the assembly payload and single-process injection are out
+> of date.
+
 # Implementation plan: Go-based time-injection agent for Kubernetes e2e testing
 
 Scope: code-injection approach (patch the vDSO `clock_gettime` entry point to jump into

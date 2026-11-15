@@ -8,6 +8,11 @@ and what the main complexity is.
 
 ## Security — authentication on the controller API
 
+> **Status: largely done.** Options 1 (shared bearer token) and 3 (TLS and mTLS, controller to
+> agent and client to controller) are implemented; see `deploy/README.md`. Both binaries
+> refuse to start without credentials. What remains is option 2 (`TokenReview`) and making
+> TLS the default rather than something to configure. The text below is the original analysis.
+
 **What it unlocks**: safe exposure of the controller inside a shared cluster.
 Right now any pod that can reach the controller service can shift the clock of
 any other pod in the cluster.
