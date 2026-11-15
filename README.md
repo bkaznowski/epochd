@@ -416,10 +416,18 @@ command ran on real time:
 faketimectl: warning: the preload library was never loaded by "mydaemon", so it ran on real time.
 ```
 
-Timeouts in preload mode: only the wall clock moves. A deadline expressed as an absolute
-`CLOCK_REALTIME` time (`pthread_cond_timedwait`, `sem_timedwait`) is passed to the kernel
-unchanged, so a program that computes "now + 5s" from the fake clock waits against the real
-one. Relative timeouts and the monotonic clocks behave normally.
+Timeouts: a program that computes "now + 5s" from the fake clock and hands that absolute
+`CLOCK_REALTIME` deadline to the kernel would wait against the real clock (a day too long
+for a +1 day offset, not at all for a negative one). In preload mode the library
+translates those deadlines back to real time for `pthread_cond_timedwait` (and
+`_clockwait`), `sem_timedwait`, `pthread_mutex_timedlock`, the rwlock timed locks,
+`pthread_timedjoin_np`, `clock_nanosleep(TIMER_ABSTIME)`, `timerfd_settime` and
+`timer_settime`. In a frozen clock the deadline is never reached, so the wait lasts as long
+in real time as it was asked to in fake time. Translation happens when the call is made, so
+an offset changed while a process is already blocked does not affect that wait, and a
+`timerfd` that was `dup()`ed is not recognised. **`--mode=vdso` does not translate these:** it
+only changes what the process reads, so there the original problem remains. Relative
+timeouts and the monotonic clocks need nothing and behave normally.
 
 The same choice is available from Go, per process, in one `faketime.Session`:
 `WithMode`, `WithModeFilter` and `Session.StartMode`. `WithAutoMode()` makes the common choice for you: preload for a binary that is positively a dynamically linked, non-Go ELF (`preload.CheckStrict`), ptrace for everything else (scripts, Go, static, setuid) and for `Attach`.

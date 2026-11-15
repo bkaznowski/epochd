@@ -32,6 +32,17 @@
  * file writable only to bump it; a process that cannot open it for writing
  * (another uid) falls back to a read-only map and is simply not counted.
  *
+ * Absolute deadlines. A program that computes "now + 5s" from the fake clock
+ * and hands that timestamp to the kernel (pthread_cond_timedwait, sem_timedwait,
+ * clock_nanosleep(TIMER_ABSTIME), timerfd, ...) would wait against the REAL
+ * clock: about a day too long for a +1 day offset, not at all for a negative
+ * one. The functions below translate such deadlines back to real time before the
+ * call. In advancing mode that is deadline - offset. In frozen mode the clock
+ * never reaches the deadline, so the wait is made as long in real time as it
+ * was asked to be in fake time. Translation happens when the call is made: an
+ * offset changed while a process is already blocked does not affect that wait.
+ * Relative timeouts and the monotonic clocks need none and are left alone.
+ *
  * What it cannot affect: statically linked binaries, Go binaries (the Go
  * runtime reads the vDSO directly, not libc), raw syscall(SYS_clock_gettime)
  * calls, and processes started with a scrubbed environment.
@@ -46,13 +57,18 @@
  */
 #define _GNU_SOURCE /* RTLD_NEXT */
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
+#include <semaphore.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/select.h> /* struct timeval; deliberately not <sys/time.h> */
+#include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -263,6 +279,288 @@ time_t time(time_t *out)
     if (out)
         *out = sec;
     return sec;
+}
+
+/* ---- absolute deadlines ------------------------------------------------------
+ *
+ * None of this may reference libpthread or librt directly: the library is linked
+ * with -z now, so an undefined symbol that only a threaded program's libraries
+ * provide would stop it loading into any other program. Everything is reached
+ * through dlsym(RTLD_NEXT), and the tables below are guarded by a spin flag
+ * rather than a mutex. */
+
+#define NEXT(fp, name)                                          \
+    do {                                                        \
+        if (!(fp))                                              \
+            *(void **)&(fp) = dlsym(RTLD_NEXT, name);           \
+    } while (0)
+
+static int is_wall_clock(clockid_t clk)
+{
+    return clk == CLOCK_REALTIME || clk == CLOCK_REALTIME_ALARM;
+}
+
+/* Translate an absolute CLOCK_REALTIME deadline given on the fake clock into the
+ * real clock's terms. Returns in itself (untranslated) when there is nothing to
+ * do or the value is not one the libc would accept anyway, so that it reports
+ * its own error. */
+static const struct timespec *xl(const struct timespec *in, struct timespec *buf)
+{
+    if (!in || in->tv_nsec < 0 || in->tv_nsec >= 1000000000L)
+        return in;
+    Snapshot s;
+    if (!read_state(&s))
+        return in;
+    resolve();
+
+    int64_t sec = in->tv_sec, nsec = in->tv_nsec;
+    if (s.mask & MASK_FROZEN) {
+        /* The fake clock never gets there; wait as long as was asked, really. */
+        struct timespec now;
+        if (real_clock_gettime(CLOCK_REALTIME, &now) != 0)
+            return in;
+        sec  += now.tv_sec - s.sec;
+        nsec += now.tv_nsec - s.nsec;
+    } else {
+        sec  -= s.sec;
+        nsec -= s.nsec;
+    }
+    normalise(&sec, &nsec, 1000000000);
+    buf->tv_sec  = sec;
+    buf->tv_nsec = nsec;
+    return buf;
+}
+
+/* For pthread_cond_timedwait, whose clock is chosen when the condition variable
+ * is created and is not visible from here. A monotonic deadline is a number of
+ * seconds of uptime, which cannot be as large as a wall-clock timestamp (this is
+ * 9.5 years of uptime), so a deadline below it is left alone. */
+static const struct timespec *xl_guess(const struct timespec *in, struct timespec *buf)
+{
+    if (in && in->tv_sec < 300000000)
+        return in;
+    return xl(in, buf);
+}
+
+int sem_timedwait(sem_t *sem, const struct timespec *abs)
+{
+    static int (*real)(sem_t *, const struct timespec *);
+    NEXT(real, "sem_timedwait");
+    struct timespec b;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(sem, xl(abs, &b));
+}
+
+int sem_clockwait(sem_t *sem, clockid_t clk, const struct timespec *abs)
+{
+    static int (*real)(sem_t *, clockid_t, const struct timespec *);
+    NEXT(real, "sem_clockwait");
+    struct timespec b;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(sem, clk, is_wall_clock(clk) ? xl(abs, &b) : abs);
+}
+
+int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *abs)
+{
+    static int (*real)(pthread_mutex_t *, const struct timespec *);
+    NEXT(real, "pthread_mutex_timedlock");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    return real(m, xl(abs, &b));
+}
+
+int pthread_mutex_clocklock(pthread_mutex_t *m, clockid_t clk, const struct timespec *abs)
+{
+    static int (*real)(pthread_mutex_t *, clockid_t, const struct timespec *);
+    NEXT(real, "pthread_mutex_clocklock");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    return real(m, clk, is_wall_clock(clk) ? xl(abs, &b) : abs);
+}
+
+int pthread_rwlock_timedrdlock(pthread_rwlock_t *l, const struct timespec *abs)
+{
+    static int (*real)(pthread_rwlock_t *, const struct timespec *);
+    NEXT(real, "pthread_rwlock_timedrdlock");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    return real(l, xl(abs, &b));
+}
+
+int pthread_rwlock_timedwrlock(pthread_rwlock_t *l, const struct timespec *abs)
+{
+    static int (*real)(pthread_rwlock_t *, const struct timespec *);
+    NEXT(real, "pthread_rwlock_timedwrlock");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    return real(l, xl(abs, &b));
+}
+
+int pthread_rwlock_clockrdlock(pthread_rwlock_t *l, clockid_t clk, const struct timespec *abs)
+{
+    static int (*real)(pthread_rwlock_t *, clockid_t, const struct timespec *);
+    NEXT(real, "pthread_rwlock_clockrdlock");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    return real(l, clk, is_wall_clock(clk) ? xl(abs, &b) : abs);
+}
+
+int pthread_rwlock_clockwrlock(pthread_rwlock_t *l, clockid_t clk, const struct timespec *abs)
+{
+    static int (*real)(pthread_rwlock_t *, clockid_t, const struct timespec *);
+    NEXT(real, "pthread_rwlock_clockwrlock");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    return real(l, clk, is_wall_clock(clk) ? xl(abs, &b) : abs);
+}
+
+/* dlsym(RTLD_NEXT, name) is NOT always the version a program is linked to: glibc
+ * on x86-64 has two pthread_cond_timedwait, and an unversioned lookup returns the
+ * old GLIBC_2.2.5 one, which ignores the clock a condition variable was created
+ * with (a monotonic one then times out at once). Ask for the current version
+ * explicitly. dlvsym is fetched at run time rather than linked, so the library
+ * still loads where it does not exist; musl has one version and ignores the
+ * argument, and other architectures simply do not have this version, in which
+ * case the plain lookup is the right one. */
+static void *next_versioned(const char *name, const char *version)
+{
+    static void *(*vsym)(void *, const char *, const char *);
+    if (!vsym)
+        *(void **)&vsym = dlsym(RTLD_DEFAULT, "dlvsym");
+    void *p = vsym ? vsym(RTLD_NEXT, name, version) : NULL;
+    return p ? p : dlsym(RTLD_NEXT, name);
+}
+
+int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *abs)
+{
+    static int (*real)(pthread_cond_t *, pthread_mutex_t *, const struct timespec *);
+    if (!real)
+        *(void **)&real = next_versioned("pthread_cond_timedwait", "GLIBC_2.3.2");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    return real(c, m, xl_guess(abs, &b));
+}
+
+int pthread_cond_clockwait(pthread_cond_t *c, pthread_mutex_t *m, clockid_t clk, const struct timespec *abs)
+{
+    static int (*real)(pthread_cond_t *, pthread_mutex_t *, clockid_t, const struct timespec *);
+    NEXT(real, "pthread_cond_clockwait");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    return real(c, m, clk, is_wall_clock(clk) ? xl(abs, &b) : abs);
+}
+
+int pthread_timedjoin_np(pthread_t t, void **ret, const struct timespec *abs)
+{
+    static int (*real)(pthread_t, void **, const struct timespec *);
+    NEXT(real, "pthread_timedjoin_np");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    return real(t, ret, xl(abs, &b));
+}
+
+int clock_nanosleep(clockid_t clk, int flags, const struct timespec *req, struct timespec *rem)
+{
+    static int (*real)(clockid_t, int, const struct timespec *, struct timespec *);
+    NEXT(real, "clock_nanosleep");
+    struct timespec b;
+    if (!real) return ENOSYS;
+    if ((flags & TIMER_ABSTIME) && is_wall_clock(clk))
+        req = xl(req, &b);
+    return real(clk, flags, req, rem);
+}
+
+/* A timer's clock is chosen at creation and is not asked for again at arming
+ * time, so it is remembered. A timerfd that was dup()ed, or created some way
+ * that does not pass through here, is not recognised and keeps real deadlines. */
+#define MAX_TRACKED_FDS 4096
+#define MAX_TRACKED_TIMERS 64
+
+static unsigned char fd_is_wall[MAX_TRACKED_FDS];
+
+static struct { timer_t id; int wall; } timers[MAX_TRACKED_TIMERS];
+static unsigned timers_next;
+static char timers_busy;
+
+static void timers_lock(void)
+{
+    while (__atomic_test_and_set(&timers_busy, __ATOMIC_ACQUIRE))
+        sched_yield();
+}
+static void timers_unlock(void) { __atomic_clear(&timers_busy, __ATOMIC_RELEASE); }
+
+/* The new value of an absolute-time timer, with its first expiry translated. A
+ * zero first expiry disarms the timer and is not a time at all. */
+static const struct itimerspec *xl_itimer(const struct itimerspec *in, struct itimerspec *buf)
+{
+    if (!in || (in->it_value.tv_sec == 0 && in->it_value.tv_nsec == 0))
+        return in;
+    struct timespec t;
+    *buf = *in; /* it_interval is a period, not a point in time */
+    buf->it_value = *xl(&in->it_value, &t);
+    return buf;
+}
+
+int timerfd_create(int clk, int flags)
+{
+    static int (*real)(int, int);
+    NEXT(real, "timerfd_create");
+    if (!real) { errno = ENOSYS; return -1; }
+    int fd = real(clk, flags);
+    if (fd >= 0 && fd < MAX_TRACKED_FDS)
+        fd_is_wall[fd] = is_wall_clock((clockid_t)clk);
+    return fd;
+}
+
+int timerfd_settime(int fd, int flags, const struct itimerspec *nw, struct itimerspec *old)
+{
+    static int (*real)(int, int, const struct itimerspec *, struct itimerspec *);
+    NEXT(real, "timerfd_settime");
+    struct itimerspec b;
+    if (!real) { errno = ENOSYS; return -1; }
+    if ((flags & TFD_TIMER_ABSTIME) && fd >= 0 && fd < MAX_TRACKED_FDS && fd_is_wall[fd])
+        nw = xl_itimer(nw, &b);
+    return real(fd, flags, nw, old);
+}
+
+int timer_create(clockid_t clk, struct sigevent *sev, timer_t *id)
+{
+    static int (*real)(clockid_t, struct sigevent *, timer_t *);
+    NEXT(real, "timer_create");
+    if (!real) { errno = ENOSYS; return -1; }
+    int rc = real(clk, sev, id);
+    if (rc == 0 && id) {
+        timers_lock();
+        timers[timers_next % MAX_TRACKED_TIMERS].id   = *id;
+        timers[timers_next % MAX_TRACKED_TIMERS].wall = is_wall_clock(clk);
+        timers_next++;
+        timers_unlock();
+    }
+    return rc;
+}
+
+int timer_settime(timer_t id, int flags, const struct itimerspec *nw, struct itimerspec *old)
+{
+    static int (*real)(timer_t, int, const struct itimerspec *, struct itimerspec *);
+    NEXT(real, "timer_settime");
+    struct itimerspec b;
+    if (!real) { errno = ENOSYS; return -1; }
+    if (flags & TIMER_ABSTIME) {
+        int wall = 0;
+        timers_lock();
+        /* newest first: a timer id can be reused after timer_delete */
+        for (unsigned n = 0; n < MAX_TRACKED_TIMERS && n < timers_next; n++) {
+            unsigned i = (timers_next - 1 - n) % MAX_TRACKED_TIMERS;
+            if (timers[i].id == id) {
+                wall = timers[i].wall;
+                break;
+            }
+        }
+        timers_unlock();
+        if (wall)
+            nw = xl_itimer(nw, &b);
+    }
+    return real(id, flags, nw, old);
 }
 
 __attribute__((constructor)) static void epochd_preload_init(void)

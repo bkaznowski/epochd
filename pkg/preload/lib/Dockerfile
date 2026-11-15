@@ -42,11 +42,17 @@ COPY --from=build /out/libepochd_preload.so /libepochd_preload.so
 
 # --- verification: load the library into real systems ------------------------
 FROM ubuntu:22.04 AS verify-glibc
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/libepochd_preload.so /lib/libepochd_preload.so
-COPY verify_load.sh /verify_load.sh
-RUN sh /verify_load.sh /lib/libepochd_preload.so
+COPY verify_load.sh verify_deadlines.sh deadline_test.c /
+RUN sh /verify_load.sh /lib/libepochd_preload.so \
+ && sh /verify_deadlines.sh /lib/libepochd_preload.so
 
 FROM alpine:3.20 AS verify-musl
+RUN apk add --no-cache gcc musl-dev
 COPY --from=build /out/libepochd_preload.so /lib/libepochd_preload.so
-COPY verify_load.sh /verify_load.sh
-RUN sh /verify_load.sh /lib/libepochd_preload.so
+COPY verify_load.sh verify_deadlines.sh deadline_test.c /
+RUN sh /verify_load.sh /lib/libepochd_preload.so \
+ && sh /verify_deadlines.sh /lib/libepochd_preload.so

@@ -24,11 +24,13 @@
 //   - It works on processes you start, not on ones already running.
 //   - The advancing path calls the real clock_gettime through libc, so it keeps
 //     the vDSO fast path that the trampoline gives up.
-//   - Only the wall clock moves. Timeouts expressed as an absolute CLOCK_REALTIME
-//     deadline (pthread_cond_timedwait, sem_timedwait, ...) are handed to the
-//     kernel unchanged, so a process computing "now + 5s" from the fake clock
-//     waits against the real one. Relative timeouts and the monotonic clocks are
-//     unaffected and behave normally.
+//   - Absolute CLOCK_REALTIME deadlines (pthread_cond_timedwait, sem_timedwait,
+//     clock_nanosleep with TIMER_ABSTIME, timerfd, ...) are translated back to real
+//     time by the library, so "now + 5s" computed from the fake clock waits 5s. In a
+//     frozen clock the wait lasts as long in real time as it was asked to in fake
+//     time. This happens when the call is made: an offset changed while a process is
+//     already blocked does not affect that wait. The vDSO mode does not translate
+//     these. Relative timeouts and the monotonic clocks need nothing.
 //
 // One library file serves glibc and musl systems alike; Attached reports whether
 // it ever loaded into a process, so a command that bypassed it is noticed.
