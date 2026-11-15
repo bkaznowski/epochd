@@ -2,7 +2,7 @@ module github.com/bkaznowski/epochd/pkg/faketime
 
 go 1.26.4
 
-require github.com/bkaznowski/epochd v0.8.0
+require github.com/bkaznowski/epochd v0.8.1
 
 require golang.org/x/sys v0.50.0
 
