@@ -248,6 +248,7 @@ func runWatchLoop(
 		}
 		tr.DetachAll(pids)   //nolint:errcheck
 		tr.InterruptDetach() //nolint:errcheck
+		tr.Close()           // release the tracer's pinned goroutine and OS thread
 	}()
 
 	for {

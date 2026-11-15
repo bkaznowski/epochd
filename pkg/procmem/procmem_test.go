@@ -5,6 +5,7 @@ package procmem
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -43,21 +44,21 @@ func TestTracerBasic(t *testing.T) {
 	cmd := exec.Command(exe, "-test.run=TestHelperBlock", "-test.v")
 	cmd.Env = append(os.Environ(), "EPOCHD_TRACER_HELPER=1")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting helper: %v", err)
+
+	// StartAndFollowChild forks on the Tracer's own pinned thread and collects the
+	// initial SIGTRAP there: no PTRACE_ATTACH required, and the tracer thread is
+	// guaranteed to be the one the kernel recorded as the tracee's tracer. Starting
+	// the child with cmd.Start() on whatever thread the test goroutine happens to
+	// be on works only when the scheduler happens to line the two threads up.
+	tr := NewTracer()
+	pid, err := tr.StartAndFollowChild(cmd)
+	if err != nil {
+		t.Fatalf("StartAndFollowChild: %v", err)
 	}
 	t.Cleanup(func() {
 		cmd.Process.Kill()
 		cmd.Wait()
 	})
-
-	pid := cmd.Process.Pid
-	tr := NewTracer()
-
-	// Collect the initial SIGTRAP — no PTRACE_ATTACH required.
-	if err := tr.FollowChild(pid); err != nil {
-		t.Fatalf("FollowChild: %v", err)
-	}
 	detached := false
 	t.Cleanup(func() {
 		if !detached {
@@ -167,15 +168,13 @@ func TestTracerOps(t *testing.T) {
 		cmd := exec.Command(exe, "-test.run=TestHelperBlock", "-test.v")
 		cmd.Env = append(os.Environ(), "EPOCHD_TRACER_HELPER=1")
 		cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("cmd.Start: %v", err)
+		tr := NewTracer()
+		pid, err := tr.StartAndFollowChild(cmd) // forks on the tracer's own thread
+		if err != nil {
+			t.Fatalf("StartAndFollowChild: %v", err)
 		}
 		t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
-		tr := NewTracer()
-		if err := tr.FollowChild(cmd.Process.Pid); err != nil {
-			t.Fatalf("FollowChild: %v", err)
-		}
-		return cmd.Process.Pid, tr
+		return pid, tr
 	}
 
 	t.Run("SingleStep_Wait", func(t *testing.T) {
@@ -350,4 +349,233 @@ func findMapEntry(pid int, name string) (uintptr, error) {
 		return uintptr(start), nil
 	}
 	return 0, fmt.Errorf("%s not found in /proc/%d/maps", name, pid)
+}
+
+// ---------------------------------------------------------------------------
+// Tracer lifecycle and whole-thread-group stops
+// ---------------------------------------------------------------------------
+
+// A Tracer pins an OS thread for its whole life, so dropping one without Close
+// leaks that thread. Close must give back exactly the thread each tracer held.
+// This tracks the tracers' own thread ids rather than the process's thread
+// count, which moves with whatever else the Go runtime is doing.
+func TestTracerCloseReleasesItsThread(t *testing.T) {
+	const n = 40
+	tids := make([]int, n)
+	tracers := make([]*Tracer, n)
+	for i := range tracers {
+		tracers[i] = NewTracer()
+		tracers[i].run(func() { tids[i] = unix.Gettid() }) // runs on the pinned thread
+	}
+
+	seen := map[int]bool{}
+	for _, tid := range tids {
+		if tid == 0 || seen[tid] {
+			t.Fatalf("tracers did not each pin their own OS thread: %v", tids)
+		}
+		seen[tid] = true
+		if _, err := os.Stat(fmt.Sprintf("/proc/self/task/%d", tid)); err != nil {
+			t.Fatalf("thread %d should be alive while its tracer is open: %v", tid, err)
+		}
+	}
+
+	for _, tr := range tracers {
+		tr.Close()
+		tr.Close() // idempotent
+	}
+	for _, tid := range tids {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(fmt.Sprintf("/proc/self/task/%d", tid)); err != nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("thread %d is still alive 5s after its tracer was closed: the pinned thread was not released", tid)
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+func TestTracerMethodsFailCleanlyAfterClose(t *testing.T) {
+	tr := NewTracer()
+	tr.Close()
+
+	if err := tr.Seize(1); !errors.Is(err, ErrTracerClosed) {
+		t.Errorf("Seize after Close = %v, want ErrTracerClosed", err)
+	}
+	if _, err := tr.GetRegs(); !errors.Is(err, ErrTracerClosed) {
+		t.Errorf("GetRegs after Close = %v, want ErrTracerClosed", err)
+	}
+	if err := tr.Detach(); !errors.Is(err, ErrTracerClosed) {
+		t.Errorf("Detach after Close = %v, want ErrTracerClosed", err)
+	}
+	if got := tr.Threads(); got != nil {
+		t.Errorf("Threads after Close = %v, want nil", got)
+	}
+}
+
+// Only EIO (the tracee was not attached with PTRACE_SEIZE) justifies falling
+// back to SIGSTOP. ESRCH means the process is gone; signalling that pid could
+// stop an unrelated process that has reused it.
+func TestSigstopFallbackOnlyForEIO(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{unix.EIO, true},
+		{fmt.Errorf("wrapped: %w", unix.EIO), true},
+		{unix.ESRCH, false},
+		{unix.EPERM, false},
+		{nil, false},
+	} {
+		if got := needsSigstopFallback(c.err); got != c.want {
+			t.Errorf("needsSigstopFallback(%v) = %v, want %v", c.err, got, c.want)
+		}
+	}
+}
+
+// startBusyChild starts the test binary as an ordinary (non-ptrace) child with
+// several OS threads that are all running, like a real service.
+func startBusyChild(t *testing.T) int {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestHelperBusy", "-test.v")
+	cmd.Env = append(os.Environ(), "EPOCHD_TRACER_HELPER=2")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() }) //nolint:errcheck
+	time.Sleep(200 * time.Millisecond)                   // let the runtime start its threads
+	return cmd.Process.Pid
+}
+
+// TestHelperBusy is a multi-threaded target whose threads are all busy.
+func TestHelperBusy(t *testing.T) {
+	if os.Getenv("EPOCHD_TRACER_HELPER") != "2" {
+		t.Skip()
+	}
+	for i := 0; i < 6; i++ {
+		go func() {
+			for {
+				_ = time.Now()
+			}
+		}()
+	}
+	select {}
+}
+
+// threadState returns the one-letter state of a thread from /proc.
+func threadState(t *testing.T, pid, tid int) string {
+	t.Helper()
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/stat", pid, tid))
+	if err != nil {
+		return "gone"
+	}
+	rest := string(b)[strings.LastIndexByte(string(b), ')')+2:]
+	return rest[:1]
+}
+
+func allThreads(t *testing.T, pid int) []int {
+	t.Helper()
+	tids, err := listThreads(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tids
+}
+
+// Attaching to one thread leaves the others running, free to execute code the
+// caller is about to rewrite. Seize must stop the whole group, and Detach must
+// let it go again.
+func TestSeizeStopsEveryThread(t *testing.T) {
+	pid := startBusyChild(t)
+	if n := len(allThreads(t, pid)); n < 4 {
+		t.Skipf("target only has %d threads; need a multi-threaded process", n)
+	}
+
+	tr := NewTracer()
+	defer tr.Close()
+	if err := tr.Seize(pid); err != nil {
+		if errors.Is(err, unix.EPERM) {
+			t.Skipf("ptrace not permitted here: %v", err)
+		}
+		t.Fatalf("Seize: %v", err)
+	}
+
+	tids := allThreads(t, pid)
+	for _, tid := range tids {
+		if st := threadState(t, pid, tid); st != "t" {
+			t.Errorf("thread %d is %q after Seize, want t (tracing stop)", tid, st)
+		}
+	}
+	if got := tr.Threads(); len(got) != len(tids) || got[0] != pid {
+		t.Errorf("Threads() = %v, want the primary %d first and all %d threads", got, pid, len(tids))
+	}
+
+	if err := tr.Detach(); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	for _, tid := range allThreads(t, pid) {
+		if st := threadState(t, pid, tid); st == "t" || st == "T" {
+			t.Errorf("thread %d is still stopped (%q) after Detach", tid, st)
+		}
+	}
+}
+
+// notInSyscall reports whether a stopped thread is in user code rather than
+// parked inside a system call. Single-stepping a thread that sits on a blocking
+// syscall just re-executes the call and blocks, which is not what the callers
+// of StepOutOf (code in the vDSO) ever meet.
+func notInSyscall(pid, tid int) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/syscall", pid, tid))
+	return err == nil && strings.HasPrefix(string(b), "-1 ")
+}
+
+// StepOutOf moves a thread that is inside a protected range out of it, which is
+// what keeps a thread from being resumed in the middle of rewritten bytes.
+func TestStepOutOfMovesThreadsOutOfRange(t *testing.T) {
+	pid := startBusyChild(t)
+	tr := NewTracer()
+	defer tr.Close()
+	if err := tr.Seize(pid); err != nil {
+		if errors.Is(err, unix.EPERM) {
+			t.Skipf("ptrace not permitted here: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer tr.Detach() //nolint:errcheck
+
+	tid := 0
+	for _, candidate := range tr.Threads() {
+		if notInSyscall(pid, candidate) {
+			tid = candidate
+			break
+		}
+	}
+	if tid == 0 {
+		t.Skip("no thread of the target is running user code right now")
+	}
+
+	regs, err := tr.GetRegsPID(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A one-byte range at the instruction that thread is about to run.
+	r := AddrRange{Start: uintptr(regs.Rip), End: uintptr(regs.Rip) + 1}
+	if err := tr.StepOutOf(r); err != nil {
+		t.Fatalf("StepOutOf: %v", err)
+	}
+	after, err := tr.GetRegsPID(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Rip == regs.Rip {
+		t.Errorf("thread %d is still at 0x%x: it was not stepped out of the range", tid, regs.Rip)
+	}
 }

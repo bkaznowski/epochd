@@ -63,12 +63,21 @@ func (h *Handle) effectiveTime() time.Time {
 	return time.Now().Add(h.offset)
 }
 
+// backend returns the vDSO injection handle currently behind h. Exec
+// re-injection (ChildTracker) swaps it for a fresh one under h.mu, so every
+// reader must go through here rather than touching h.h directly.
+func (h *Handle) backend() *inject.Handle {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.h
+}
+
 // PID returns the OS process ID of the process this Handle controls.
 func (h *Handle) PID() int {
 	if h.pre != nil {
 		return h.pid
 	}
-	return h.h.PID
+	return h.backend().PID
 }
 
 // IsFrozen reports whether the handle is currently in frozen mode.
@@ -207,7 +216,7 @@ func (h *Handle) SetTime(target time.Time) error {
 	if h.pre != nil {
 		err = h.pre.SetTime(target)
 	} else {
-		err = h.h.SetTime(target)
+		err = h.backend().SetTime(target)
 	}
 	if err != nil {
 		return err
@@ -227,7 +236,7 @@ func (h *Handle) Freeze(target time.Time) error {
 	if h.pre != nil {
 		err = h.pre.Freeze(target)
 	} else {
-		err = h.h.Freeze(target)
+		err = h.backend().Freeze(target)
 	}
 	if err != nil {
 		return err
@@ -1304,6 +1313,9 @@ func (c *ChildTracker) cleanup() {
 
 	c.tracer.DetachAll(childPIDs) //nolint:errcheck
 	c.tracer.InterruptDetach()    //nolint:errcheck
+	// Nothing is attached any more; release the tracer's goroutine and the OS
+	// thread it pins, which otherwise live for the rest of the process.
+	c.tracer.Close()
 }
 
 // applyAll calls fn on every handle concurrently and then, if no errors

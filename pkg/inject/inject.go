@@ -6,12 +6,15 @@ package inject
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,20 +24,40 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// ErrUninstalled is returned by a Handle's methods after Uninstall removed its
+// hooks.
+var ErrUninstalled = errors.New("inject: the hooks were uninstalled from this process")
+
+// pageSize is the granule everything here maps, searches and unmaps in.
+const pageSize = uintptr(4096)
+
+// hookLen is how many bytes of a vDSO entry point a hook overwrites with its
+// JMP rel32. patchSpan is how much around an entry no thread may be executing
+// while we rewrite it: the JMP itself, plus the 8-byte word PTRACE_POKETEXT
+// reads and writes back.
+const (
+	hookLen   = 5
+	patchSpan = 8
+)
+
 // Handle represents an active time-offset injection in a target process.
 // Obtain one via InjectAtTime or InjectFrozen; update with SetTime or Freeze.
+// A Handle is safe for concurrent use.
 type Handle struct {
 	PID       int
 	StateAddr uintptr        // address of the trampoline's mutable state struct in the target
 	patched   [3]patchedHook // clock_gettime, gettimeofday, time -- original vDSO bytes before our JMP patch
-	gen       uint32         // monotonically incremented on every SetOffset/SetTime/Freeze call
+
+	mu          sync.Mutex
+	gen         uint32 // monotonically incremented on every SetOffset/SetTime/Freeze call
+	uninstalled bool
 }
 
 // patchedHook records a single vDSO entry point we overwrote with a JMP, so a
 // future uninstall can restore it.
 type patchedHook struct {
 	addr uintptr
-	orig [5]byte
+	orig [hookLen]byte
 }
 
 // InjectAtTime injects the trampoline into pid and sets its clock to target,
@@ -117,29 +140,41 @@ func InjectFrozenKeepTracer(pid int, target time.Time) (*Handle, *procmem.Tracer
 //   - no SIGSTOP is delivered to the thread group (avoids group-stop races in
 //     remoteMmap that would cause it to see SIGSTOP instead of SIGTRAP), and
 //   - PTRACE_INTERRUPT works reliably in InterruptDetach when closing the tracker.
+//
+// Every other thread of the target is stopped for the duration of the injection
+// (see procmem.Tracer.Seize) and released once it is done; only the primary
+// thread stays attached. The caller owns the returned Tracer and must Close it
+// when finished.
 func injectCoreKeepTracer(pid int, sec, nsec int64, mask uint64) (*Handle, *procmem.Tracer, error) {
 	tr := procmem.NewTracer()
 	if err := tr.Seize(pid); err != nil {
+		tr.Close()
 		return nil, nil, fmt.Errorf("inject: Seize pid %d: %w", pid, err)
+	}
+	fail := func(err error) (*Handle, *procmem.Tracer, error) {
+		tr.Detach() //nolint:errcheck
+		tr.Close()
+		return nil, nil, err
 	}
 	// Read maps while the process is ptrace-stopped — address space is stable.
 	info, err := vdso.Locate(pid)
 	if err != nil {
-		tr.Detach() //nolint:errcheck
-		return nil, nil, fmt.Errorf("inject: vdso.Locate: %w", err)
+		return fail(fmt.Errorf("inject: vdso.Locate: %w", err))
 	}
 	h, err := injectWithTracer(tr, pid, info, sec, nsec, mask)
 	if err != nil {
-		tr.Detach() //nolint:errcheck
-		return nil, nil, err
+		return fail(err)
+	}
+	// The patch is in: let every other thread run again, then arm fork/exec
+	// tracing on the primary one and resume it.
+	if err := tr.ReleaseThreads(); err != nil {
+		return fail(fmt.Errorf("inject: ReleaseThreads: %w", err))
 	}
 	if err := tr.SetOptions(unix.PTRACE_O_TRACEFORK | unix.PTRACE_O_TRACEVFORK | unix.PTRACE_O_TRACEEXEC); err != nil {
-		tr.Detach() //nolint:errcheck
-		return nil, nil, fmt.Errorf("inject: SetOptions: %w", err)
+		return fail(fmt.Errorf("inject: SetOptions: %w", err))
 	}
 	if err := tr.Cont(0); err != nil {
-		tr.Detach() //nolint:errcheck
-		return nil, nil, fmt.Errorf("inject: Cont parent: %w", err)
+		return fail(fmt.Errorf("inject: Cont parent: %w", err))
 	}
 	return h, tr, nil
 }
@@ -148,26 +183,28 @@ func injectFollowChildKeepTracer(cmd *exec.Cmd, sec, nsec int64, mask uint64) (*
 	tr := procmem.NewTracer()
 	pid, err := tr.StartAndFollowChild(cmd)
 	if err != nil {
+		tr.Close()
 		return nil, nil, fmt.Errorf("inject: StartAndFollowChild: %w", err)
+	}
+	fail := func(err error) (*Handle, *procmem.Tracer, error) {
+		tr.Detach() //nolint:errcheck
+		tr.Close()
+		return nil, nil, err
 	}
 	info, err := vdso.Locate(pid)
 	if err != nil {
-		tr.Detach() //nolint:errcheck
-		return nil, nil, fmt.Errorf("inject: vdso.Locate: %w", err)
+		return fail(fmt.Errorf("inject: vdso.Locate: %w", err))
 	}
 	h, err := injectWithTracer(tr, pid, info, sec, nsec, mask)
 	if err != nil {
-		tr.Detach() //nolint:errcheck
-		return nil, nil, err
+		return fail(err)
 	}
 	if err := tr.SetOptions(unix.PTRACE_O_TRACEFORK | unix.PTRACE_O_TRACEVFORK | unix.PTRACE_O_TRACEEXEC); err != nil {
-		tr.Detach() //nolint:errcheck
-		return nil, nil, fmt.Errorf("inject: SetOptions: %w", err)
+		return fail(fmt.Errorf("inject: SetOptions: %w", err))
 	}
 	// Resume the parent so it can run and fork.
 	if err := tr.Cont(0); err != nil {
-		tr.Detach() //nolint:errcheck
-		return nil, nil, fmt.Errorf("inject: Cont parent: %w", err)
+		return fail(fmt.Errorf("inject: Cont parent: %w", err))
 	}
 	return h, tr, nil
 }
@@ -214,7 +251,11 @@ func ChildHandle(parent *Handle, childPID int) *Handle {
 
 // Generation returns the current write-generation counter. It is incremented
 // on each SetTime or Freeze call and can be used by callers to confirm a write landed.
-func (h *Handle) Generation() uint32 { return h.gen }
+func (h *Handle) Generation() uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.gen
+}
 
 // SetTime updates the fake time to target in advancing mode. After this call
 // time.Now() in the target process returns target + elapsed_real_time.
@@ -233,9 +274,63 @@ func (h *Handle) Freeze(target time.Time) error {
 	return h.writeState(sec, nsec, trampoline.MaskFrozen)
 }
 
+// Uninstall takes the hooks out of the target: each patched vDSO entry point
+// goes back to exactly the bytes it had before, and the trampoline page is
+// unmapped. After it the process reads the clock through the kernel's own vDSO
+// fast path again, which Reset alone never restores (a reset trampoline still
+// turns every CLOCK_REALTIME read into a real syscall).
+//
+// Every thread of the target is stopped while this runs, and any thread that is
+// inside the trampoline is stepped out of it first. If the process has already
+// exited there is nothing to remove and Uninstall succeeds. The Handle is
+// unusable afterwards: SetTime and Freeze return ErrUninstalled.
+//
+// Only this process is affected. Children that forked while the hooks were
+// installed keep their own copy of them until they exit or are uninstalled
+// through their own Handle.
+func (h *Handle) Uninstall() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.uninstalled {
+		return nil
+	}
+	tr := procmem.NewTracer()
+	defer tr.Close()
+	if err := tr.Seize(h.PID); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			h.uninstalled = true
+			return nil
+		}
+		return fmt.Errorf("inject: uninstall pid %d: %w", h.PID, err)
+	}
+	defer tr.Detach() //nolint:errcheck // runs before tr.Close: LIFO
+
+	page := h.StateAddr - uintptr(trampoline.StateOffset)
+	ranges := []procmem.AddrRange{{Start: page, End: page + pageSize}}
+	for _, ph := range h.patched {
+		ranges = append(ranges, procmem.AddrRange{Start: ph.addr, End: ph.addr + patchSpan})
+	}
+	// No thread may be inside the trampoline or the bytes we are about to
+	// restore when they change under it.
+	if err := tr.StepOutOf(ranges...); err != nil {
+		return fmt.Errorf("inject: uninstall pid %d: %w", h.PID, err)
+	}
+	for _, ph := range h.patched {
+		if err := tr.PokeText(ph.addr, ph.orig[:]); err != nil {
+			return fmt.Errorf("inject: uninstall pid %d: restore vDSO bytes at 0x%x: %w", h.PID, ph.addr, err)
+		}
+	}
+	// Nothing can reach the page now. Unmapping it is tidiness, not safety, so
+	// a failure here leaves a harmless 4 KiB behind rather than failing the call.
+	remoteSyscall(tr, h.PID, h.patched[0].addr, syscall.SYS_MUNMAP, uint64(page), uint64(pageSize)) //nolint:errcheck
+	h.uninstalled = true
+	return nil
+}
+
 // injectFollowChild is the FollowChild variant of the core inject path.
 func injectFollowChild(cmd *exec.Cmd, sec, nsec int64, mask uint64) (*Handle, error) {
 	tr := procmem.NewTracer()
+	defer tr.Close()
 	// Wait for the child's exec-entry SIGTRAP before reading maps. There is a
 	// race between cmd.Start() returning and the child completing execve; reading
 	// /proc/<pid>/maps before the exec-stop may catch the address space mid-
@@ -249,7 +344,7 @@ func injectFollowChild(cmd *exec.Cmd, sec, nsec int64, mask uint64) (*Handle, er
 		tr.Detach() //nolint:errcheck
 		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
 	}
-	defer tr.Detach() //nolint:errcheck
+	defer tr.Detach() //nolint:errcheck // runs before tr.Close: LIFO
 	return injectWithTracer(tr, pid, info, sec, nsec, mask)
 }
 
@@ -257,12 +352,15 @@ func injectFollowChild(cmd *exec.Cmd, sec, nsec int64, mask uint64) (*Handle, er
 // patches the vDSO, and detaches. InjectAtTime and InjectFrozen are the preferred callers.
 // vDSO maps are read after SEIZE+INTERRUPT (process stopped) to avoid a race where
 // the process is still mid-execve and the [vdso] mapping is not yet visible.
+// Every thread of the target is stopped while the patch goes in (see
+// procmem.Tracer.Seize), not just the one whose id is pid.
 func injectCore(pid int, sec, nsec int64, mask uint64) (*Handle, error) {
 	tr := procmem.NewTracer()
+	defer tr.Close()
 	if err := tr.Seize(pid); err != nil {
 		return nil, fmt.Errorf("inject: Seize pid %d: %w", pid, err)
 	}
-	defer tr.Detach() //nolint:errcheck
+	defer tr.Detach() //nolint:errcheck // runs before tr.Close: LIFO
 	info, err := vdso.Locate(pid)
 	if err != nil {
 		return nil, fmt.Errorf("inject: vdso.Locate: %w", err)
@@ -280,20 +378,53 @@ func injectCore(pid int, sec, nsec int64, mask uint64) (*Handle, error) {
 // gettimeofday, not clock_gettime.)
 // Separated from injectCore so tests can supply a FollowChild-based tracer instead of
 // one that required PTRACE_ATTACH.
+//
+// The target is expected to be stopped on every thread that could run the code
+// being patched (Seize does that for a running process; a process stopped at
+// its exec has only one thread). Before any byte is overwritten, every stopped
+// thread whose instruction pointer is inside a patched range is stepped out of
+// it, because a thread resumed in the middle of bytes that changed would decode
+// garbage.
+//
+// Injecting into a process that already carries this package's hooks (a second
+// Inject of the same pid, or an agent re-injecting after a restart) reuses the
+// existing trampoline page and only rewrites its state, instead of mapping and
+// patching a new one on top.
 func injectWithTracer(tr *procmem.Tracer, pid int, info *vdso.VDSOInfo, sec, nsec int64, mask uint64) (*Handle, error) {
+	// Signals suppressed while driving the tracee are re-sent on the way out,
+	// whether or not the injection succeeded.
+	defer tr.RequeueSignals() //nolint:errcheck
+
+	hooks := [3]struct {
+		name        string
+		vdsoAddr    uintptr
+		entryOffset int
+	}{
+		{"clock_gettime", info.ClockGettimeAddr, trampoline.ClockGettimeEntryOffset},
+		{"gettimeofday", info.GettimeofdayAddr, trampoline.GettimeofdayEntryOffset},
+		{"time", info.TimeAddr, trampoline.TimeEntryOffset},
+	}
+
+	if page, ok := existingTrampoline(pid, info); ok {
+		return reuseTrampoline(pid, info, page, sec, nsec, mask)
+	}
+
+	ranges := make([]procmem.AddrRange, len(hooks))
+	for i, hook := range hooks {
+		ranges[i] = procmem.AddrRange{Start: hook.vdsoAddr, End: hook.vdsoAddr + patchSpan}
+	}
+	if err := tr.StepOutOf(ranges...); err != nil {
+		return nil, fmt.Errorf("inject: moving threads out of the vDSO patch range: %w", err)
+	}
+
 	// Find a free page in the target's address space within ±2 GB of the vDSO
 	// entry points. All three hooked functions live within the same few-KB vDSO
 	// mapping, so proximity to one guarantees proximity to all. The process is
 	// ptrace-stopped so /proc/<pid>/maps is stable. We then use
 	// MAP_FIXED_NOREPLACE to guarantee the allocation lands there.
-	fixedAddr, err := findNearbyGap(pid, info.ClockGettimeAddr)
+	newPage, err := mapTrampolinePage(tr, pid, info.ClockGettimeAddr)
 	if err != nil {
-		return nil, fmt.Errorf("inject: findNearbyGap: %w", err)
-	}
-
-	newPage, err := remoteMmap(tr, pid, info.ClockGettimeAddr, fixedAddr)
-	if err != nil {
-		return nil, fmt.Errorf("inject: remoteMmap: %w", err)
+		return nil, err
 	}
 
 	// Build the payload with the initial state values pre-written.
@@ -306,40 +437,38 @@ func injectWithTracer(tr *procmem.Tracer, pid int, info *vdso.VDSOInfo, sec, nse
 		return nil, fmt.Errorf("inject: write payload: %w", err)
 	}
 
-	hooks := [3]struct {
-		name        string
-		vdsoAddr    uintptr
-		entryOffset int
-	}{
-		{"clock_gettime", info.ClockGettimeAddr, trampoline.ClockGettimeEntryOffset},
-		{"gettimeofday", info.GettimeofdayAddr, trampoline.GettimeofdayEntryOffset},
-		{"time", info.TimeAddr, trampoline.TimeEntryOffset},
-	}
-
 	var patched [3]patchedHook
+	rollback := func(upTo int) {
+		for _, ph := range patched[:upTo] {
+			tr.PokeText(ph.addr, ph.orig[:]) //nolint:errcheck
+		}
+	}
 	for i, hook := range hooks {
 		target := newPage + uintptr(hook.entryOffset)
 
 		// Compute the 5-byte JMP rel32 displacement.
 		// E9 <disp32> jumps to RIP+disp, where RIP = vdsoAddr+5 (after the JMP itself).
-		disp := int64(target) - int64(hook.vdsoAddr+5)
+		disp := int64(target) - int64(hook.vdsoAddr+hookLen)
 		if disp != int64(int32(disp)) {
+			rollback(i)
 			return nil, fmt.Errorf("inject: %s: JMP rel32 displacement %d overflows int32 "+
 				"(vDSO 0x%x, trampoline 0x%x are too far apart; try hint-based mmap)",
 				hook.name, disp, hook.vdsoAddr, target)
 		}
 
 		// Save the original 5 bytes at the vDSO entry for future uninstall.
-		var orig [5]byte
+		var orig [hookLen]byte
 		if _, err := procmem.ReadMem(pid, hook.vdsoAddr, orig[:]); err != nil {
+			rollback(i)
 			return nil, fmt.Errorf("inject: %s: save original vDSO bytes: %w", hook.name, err)
 		}
 
 		// Overwrite the vDSO entry with our JMP.
-		var jmp [5]byte
+		var jmp [hookLen]byte
 		jmp[0] = 0xE9
 		binary.LittleEndian.PutUint32(jmp[1:], uint32(int32(disp)))
 		if err := tr.PokeText(hook.vdsoAddr, jmp[:]); err != nil {
+			rollback(i)
 			return nil, fmt.Errorf("inject: %s: PokeText JMP: %w", hook.name, err)
 		}
 
@@ -353,9 +482,98 @@ func injectWithTracer(tr *procmem.Tracer, pid int, info *vdso.VDSOInfo, sec, nse
 	}, nil
 }
 
+// hookTarget returns where the JMP rel32 at addr in pid goes, or ok=false if the
+// bytes there are not a JMP rel32.
+func hookTarget(pid int, addr uintptr) (target uintptr, ok bool) {
+	var b [hookLen]byte
+	if _, err := procmem.ReadMem(pid, addr, b[:]); err != nil || b[0] != 0xE9 {
+		return 0, false
+	}
+	disp := int64(int32(binary.LittleEndian.Uint32(b[1:])))
+	return uintptr(int64(addr) + hookLen + disp), true
+}
+
+// existingTrampoline reports whether all three vDSO entry points of pid already
+// jump into one page that holds this build's trampoline code, and if so where
+// that page starts. The page is recognised by its contents, not by who put it
+// there, so a trampoline installed by an earlier run of the agent counts.
+func existingTrampoline(pid int, info *vdso.VDSOInfo) (page uintptr, ok bool) {
+	for i, hook := range []struct {
+		addr   uintptr
+		offset int
+	}{
+		{info.ClockGettimeAddr, trampoline.ClockGettimeEntryOffset},
+		{info.GettimeofdayAddr, trampoline.GettimeofdayEntryOffset},
+		{info.TimeAddr, trampoline.TimeEntryOffset},
+	} {
+		target, isJmp := hookTarget(pid, hook.addr)
+		if !isJmp {
+			return 0, false
+		}
+		p := target - uintptr(hook.offset)
+		if i == 0 {
+			page = p
+		} else if p != page {
+			return 0, false
+		}
+	}
+	code := make([]byte, trampoline.StateOffset)
+	if _, err := procmem.ReadMem(pid, page, code); err != nil {
+		return 0, false
+	}
+	if !bytes.Equal(code, trampoline.Payload[:trampoline.StateOffset]) {
+		return 0, false
+	}
+	return page, true
+}
+
+// pristineEntry returns the first hookLen bytes of the vDSO function at
+// entryAddr in the target as the kernel ships them. The vDSO image is the same
+// in every process on a boot, so this process's own, never-patched copy is the
+// reference; that is what lets Uninstall restore the right bytes even for a
+// process that was injected by someone else, or injected more than once.
+func pristineEntry(info *vdso.VDSOInfo, entryAddr uintptr) ([hookLen]byte, error) {
+	var b [hookLen]byte
+	own, err := vdso.Locate(os.Getpid())
+	if err != nil {
+		return b, fmt.Errorf("inject: locating this process's vDSO: %w", err)
+	}
+	if own.End-own.Start != info.End-info.Start {
+		return b, fmt.Errorf("inject: the target's vDSO (%d bytes) differs from this process's (%d bytes)",
+			info.End-info.Start, own.End-own.Start)
+	}
+	if _, err := procmem.ReadMem(os.Getpid(), own.Start+(entryAddr-info.Start), b[:]); err != nil {
+		return b, fmt.Errorf("inject: reading this process's vDSO: %w", err)
+	}
+	return b, nil
+}
+
+// reuseTrampoline adopts a trampoline that is already installed in pid: it
+// rewrites the state in place and builds a Handle that knows the original vDSO
+// bytes, without mapping or patching anything.
+func reuseTrampoline(pid int, info *vdso.VDSOInfo, page uintptr, sec, nsec int64, mask uint64) (*Handle, error) {
+	h := &Handle{PID: pid, StateAddr: page + uintptr(trampoline.StateOffset)}
+	for i, addr := range []uintptr{info.ClockGettimeAddr, info.GettimeofdayAddr, info.TimeAddr} {
+		orig, err := pristineEntry(info, addr)
+		if err != nil {
+			return nil, err
+		}
+		h.patched[i] = patchedHook{addr: addr, orig: orig}
+	}
+	if _, err := procmem.WriteMem(pid, h.StateAddr, trampoline.EncodeState(sec, nsec, mask, 0)); err != nil {
+		return nil, fmt.Errorf("inject: rewriting the existing trampoline's state: %w", err)
+	}
+	return h, nil
+}
+
 // writeState writes new trampoline state via process_vm_writev without stopping
 // the target process. mask controls advancing vs freeze mode.
 func (h *Handle) writeState(sec, nsec int64, mask uint64) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.uninstalled {
+		return ErrUninstalled
+	}
 	h.gen++
 	encoded := trampoline.EncodeState(sec, nsec, mask, h.gen)
 	if _, err := procmem.WriteMem(h.PID, h.StateAddr, encoded); err != nil {
@@ -384,15 +602,22 @@ func diffSecNsec(target, base time.Time) (sec, nsec int64) {
 // remoteMmap with MAP_FIXED_NOREPLACE so the trampoline lands in JMP-rel32
 // reach of the vDSO.
 func findNearbyGap(pid int, near uintptr) (uintptr, error) {
-	const (
-		window   = uintptr(1 << 31) // 2 GB search radius
-		pageSize = uintptr(4096)
-	)
+	return findNearbyGapFrom(pid, near, 0)
+}
+
+// findNearbyGapFrom is findNearbyGap restricted to addresses at or above
+// minAddr, so a caller whose first choice turned out to be taken can ask for
+// the next one.
+func findNearbyGapFrom(pid int, near, minAddr uintptr) (uintptr, error) {
+	const window = uintptr(1 << 31) // 2 GB search radius
 
 	// Compute lo/hi with underflow/overflow protection.
 	lo := near - window
 	if lo > near {
 		lo = pageSize // unsigned underflow — clamp near zero
+	}
+	if lo < minAddr {
+		lo = minAddr
 	}
 	hi := near + window
 	if hi < near {
@@ -472,32 +697,38 @@ func parseHexAddr(s string) uintptr {
 }
 
 // ---------------------------------------------------------------------------
-// remoteMmap — phase 3 primitive, kept in this file as it's used only here.
+// remote system calls — run one syscall on the target's own behalf.
 // ---------------------------------------------------------------------------
 
-// remoteMmap makes the target process call mmap on its own behalf and returns
-// the address of the fresh rwx page.  patchAddr (typically ClockGettimeAddr) is
-// temporarily overwritten with a syscall+int3 stub.
-//
-// If fixedAddr is non-zero, MAP_FIXED_NOREPLACE is added to the mmap flags and
-// fixedAddr is used as the target address; the kernel will return EEXIST if
-// that page is already mapped.  Pass fixedAddr=0 to let the kernel choose freely
-// (used by tests that don't need proximity to the vDSO).
-// mmapAttempt describes one mmap variant to try inside remoteMmap.
-type mmapAttempt struct {
-	flags uint64
-	addr  uint64
-}
+// errAddrInUse reports that the page remoteMmap was asked to map at a fixed
+// address was already taken.
+var errAddrInUse = errors.New("inject: address is already mapped in the target")
 
-func remoteMmap(tr *procmem.Tracer, pid int, patchAddr, fixedAddr uintptr) (uintptr, error) {
+// maxMapAttempts bounds how many candidate pages mapTrampolinePage will try.
+const maxMapAttempts = 16
+
+// remoteSyscall makes the tracee run one system call itself and returns the raw
+// result: the value, or a negative errno. patchAddr is temporarily overwritten
+// with a syscall+int3 stub (the vDSO entry point is a convenient executable
+// page), the tracee runs until it hits the int3, and the original bytes and
+// every register are then restored.
+//
+// The tracee's other threads must already be stopped, since the stub is shared
+// code. orig_rax is set to -1 for the call so that, if the tracee was stopped in
+// the middle of a blocking syscall, the kernel does not try to restart that one
+// in place of ours.
+func remoteSyscall(tr *procmem.Tracer, pid int, patchAddr uintptr, nr uint64, args ...uint64) (uint64, error) {
+	if len(args) > 6 {
+		return 0, fmt.Errorf("remoteSyscall: %d arguments, at most 6", len(args))
+	}
 	origRegs, err := tr.GetRegs()
 	if err != nil {
-		return 0, fmt.Errorf("remoteMmap: GetRegs: %w", err)
+		return 0, fmt.Errorf("remoteSyscall: GetRegs: %w", err)
 	}
 
-	origBytes := make([]byte, 8)
+	origBytes := make([]byte, patchSpan)
 	if _, err := procmem.ReadMem(pid, patchAddr, origBytes); err != nil {
-		return 0, fmt.Errorf("remoteMmap: save original bytes: %w", err)
+		return 0, fmt.Errorf("remoteSyscall: save original bytes: %w", err)
 	}
 
 	restored := false
@@ -509,75 +740,122 @@ func remoteMmap(tr *procmem.Tracer, pid int, patchAddr, fixedAddr uintptr) (uint
 	}()
 
 	if err := tr.PokeText(patchAddr, []byte{0x0F, 0x05, 0xCC}); err != nil {
-		return 0, fmt.Errorf("remoteMmap: poke trampoline: %w", err)
+		return 0, fmt.Errorf("remoteSyscall: poke stub: %w", err)
 	}
 
-	// Build the list of flag/addr combinations to try. When fixedAddr is set we
-	// prefer MAP_FIXED_NOREPLACE (detects races), but fall back to MAP_FIXED on
-	// EBADF — observed on WSL2 for exec-stopped processes, likely a mandatory
-	// seccomp restriction that blocks the non-replace variant. MAP_FIXED is safe
-	// here because findNearbyGap already confirmed the address is free and the
-	// process is ptrace-stopped so the address space is stable.
+	regs := *origRegs
+	regs.Rip = uint64(patchAddr)
+	regs.Rax = nr
+	regs.Orig_rax = ^uint64(0)
+	argRegs := []*uint64{&regs.Rdi, &regs.Rsi, &regs.Rdx, &regs.R10, &regs.R8, &regs.R9}
+	for i, a := range args {
+		*argRegs[i] = a
+	}
+	if err := tr.SetRegs(&regs); err != nil {
+		return 0, fmt.Errorf("remoteSyscall: SetRegs: %w", err)
+	}
+	if err := tr.ContUntilTrap(); err != nil {
+		return 0, fmt.Errorf("remoteSyscall: %w", err)
+	}
+	post, err := tr.GetRegs()
+	if err != nil {
+		return 0, fmt.Errorf("remoteSyscall: GetRegs post: %w", err)
+	}
+	result := post.Rax
+
+	if err := tr.PokeText(patchAddr, origBytes); err != nil {
+		return 0, fmt.Errorf("remoteSyscall: restore bytes: %w", err)
+	}
+	if err := tr.SetRegs(origRegs); err != nil {
+		return 0, fmt.Errorf("remoteSyscall: restore regs: %w", err)
+	}
+	restored = true
+	return result, nil
+}
+
+// remoteMmap makes the target process call mmap on its own behalf and returns
+// the address of the fresh rwx page.  patchAddr (typically ClockGettimeAddr) is
+// temporarily overwritten with a syscall+int3 stub.
+//
+// If fixedAddr is non-zero, MAP_FIXED_NOREPLACE is added to the mmap flags and
+// fixedAddr is used as the target address; if that page is already mapped the
+// result is errAddrInUse and nothing is disturbed. Pass fixedAddr=0 to let the
+// kernel choose freely (used by tests that don't need proximity to the vDSO).
+//
+// MAP_FIXED, which silently replaces whatever is mapped there, is used in
+// exactly one case: when the kernel rejects MAP_FIXED_NOREPLACE with EBADF —
+// observed on WSL2 for exec-stopped processes, likely a mandatory seccomp
+// restriction that blocks the non-replace variant. That is safe because
+// findNearbyGap just confirmed the address is free and every thread of the
+// stopped process is stopped, so the address space cannot change. EEXIST is
+// never retried that way: it means the page is taken, and replacing it would
+// destroy someone's memory.
+func remoteMmap(tr *procmem.Tracer, pid int, patchAddr, fixedAddr uintptr) (uintptr, error) {
+	prot := uint64(unix.PROT_READ | unix.PROT_WRITE | unix.PROT_EXEC)
 	base := uint64(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS)
-	var attempts []mmapAttempt
-	if fixedAddr != 0 {
-		attempts = []mmapAttempt{
-			{base | uint64(unix.MAP_FIXED_NOREPLACE), uint64(fixedAddr)},
-			{base | uint64(unix.MAP_FIXED), uint64(fixedAddr)},
-		}
-	} else {
-		attempts = []mmapAttempt{{base, 0}}
+	call := func(flags uint64) (uint64, error) {
+		// fd = -1 is ignored when MAP_ANONYMOUS is set.
+		return remoteSyscall(tr, pid, patchAddr, syscall.SYS_MMAP, uint64(fixedAddr), uint64(pageSize), prot, flags, ^uint64(0), 0)
 	}
 
-	// The syscall+int3 trampoline is already patched at patchAddr; each attempt
-	// just re-sets registers and re-executes without re-patching.
-	for i, att := range attempts {
-		regs := *origRegs
-		regs.Rip = uint64(patchAddr)
-		regs.Rax = uint64(syscall.SYS_MMAP)
-		regs.Rdi = att.addr
-		regs.Rsi = 4096
-		regs.Rdx = uint64(unix.PROT_READ | unix.PROT_WRITE | unix.PROT_EXEC)
-		regs.R10 = att.flags
-		regs.R8 = ^uint64(0) // fd = -1 (ignored when MAP_ANONYMOUS is set)
-		regs.R9 = 0
-		if err := tr.SetRegs(&regs); err != nil {
-			return 0, fmt.Errorf("remoteMmap: SetRegs (attempt %d): %w", i, err)
-		}
-		if err := tr.Cont(0); err != nil {
-			return 0, fmt.Errorf("remoteMmap: Cont (attempt %d): %w", i, err)
-		}
-		ws, err := tr.Wait()
+	if fixedAddr == 0 {
+		res, err := call(base)
 		if err != nil {
-			return 0, fmt.Errorf("remoteMmap: Wait (attempt %d): %w", i, err)
+			return 0, err
 		}
-		if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
-			return 0, fmt.Errorf("remoteMmap: expected SIGTRAP, got 0x%08x (attempt %d)", uint32(ws), i)
+		if int64(res) < 0 {
+			return 0, fmt.Errorf("remoteMmap: mmap failed: %w", syscall.Errno(-int64(res)))
 		}
-
-		postRegs, err := tr.GetRegs()
-		if err != nil {
-			return 0, fmt.Errorf("remoteMmap: GetRegs post (attempt %d): %w", i, err)
-		}
-		result := uintptr(postRegs.Rax)
-		if int64(result) >= 0 {
-			if err := tr.PokeText(patchAddr, origBytes); err != nil {
-				return 0, fmt.Errorf("remoteMmap: restore bytes: %w", err)
-			}
-			if err := tr.SetRegs(origRegs); err != nil {
-				return 0, fmt.Errorf("remoteMmap: restore regs: %w", err)
-			}
-			restored = true
-			return result, nil
-		}
-
-		mmapErr := syscall.Errno(-int64(result))
-		// Retry on EBADF (WSL2 blocks MAP_FIXED_NOREPLACE for exec-stopped processes)
-		// or EEXIST (address is occupied despite findNearbyGap; try MAP_FIXED instead).
-		if i < len(attempts)-1 && (mmapErr == syscall.EBADF || mmapErr == syscall.EEXIST) {
-			continue
-		}
-		return 0, fmt.Errorf("remoteMmap: mmap failed: %w", mmapErr)
+		return uintptr(res), nil
 	}
-	return 0, fmt.Errorf("remoteMmap: all mmap attempts exhausted")
+
+	res, err := call(base | uint64(unix.MAP_FIXED_NOREPLACE))
+	if err != nil {
+		return 0, err
+	}
+	if int64(res) >= 0 {
+		if uintptr(res) != fixedAddr {
+			// A kernel too old to know MAP_FIXED_NOREPLACE treats it as a hint and
+			// may place the page elsewhere, out of the JMP's reach. Give it back.
+			remoteSyscall(tr, pid, patchAddr, syscall.SYS_MUNMAP, res, uint64(pageSize)) //nolint:errcheck
+			return 0, errAddrInUse
+		}
+		return uintptr(res), nil
+	}
+	switch errno := syscall.Errno(-int64(res)); errno {
+	case syscall.EEXIST:
+		return 0, errAddrInUse
+	case syscall.EBADF:
+		res, err = call(base | uint64(unix.MAP_FIXED))
+		if err != nil {
+			return 0, err
+		}
+		if int64(res) < 0 {
+			return 0, fmt.Errorf("remoteMmap: mmap failed: %w", syscall.Errno(-int64(res)))
+		}
+		return uintptr(res), nil
+	default:
+		return 0, fmt.Errorf("remoteMmap: mmap failed: %w", errno)
+	}
+}
+
+// mapTrampolinePage maps one rwx page in the target within JMP rel32 reach of
+// near, trying the next free address if the first choice turns out to be taken.
+func mapTrampolinePage(tr *procmem.Tracer, pid int, near uintptr) (uintptr, error) {
+	var from uintptr
+	for attempt := 0; attempt < maxMapAttempts; attempt++ {
+		fixedAddr, err := findNearbyGapFrom(pid, near, from)
+		if err != nil {
+			return 0, fmt.Errorf("inject: findNearbyGap: %w", err)
+		}
+		page, err := remoteMmap(tr, pid, near, fixedAddr)
+		if err == nil {
+			return page, nil
+		}
+		if !errors.Is(err, errAddrInUse) {
+			return 0, fmt.Errorf("inject: remoteMmap: %w", err)
+		}
+		from = fixedAddr + pageSize
+	}
+	return 0, fmt.Errorf("inject: no free page near the vDSO after %d attempts", maxMapAttempts)
 }
