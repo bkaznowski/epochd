@@ -822,6 +822,7 @@ type ChildTracker struct {
 	parentExitCh chan struct{}   // closed once the parent's exit has been observed; see Wait
 	children     map[int]*Handle // childPID → Handle
 	pendingStop  map[int]bool    // children waiting for their initial ptrace stop
+	strays       map[int]bool    // children (also in children) found by sweepStrays, not ptrace-attached
 	done         chan struct{}
 	wg           sync.WaitGroup
 	loopErr      error
@@ -893,9 +894,11 @@ func (c *ChildTracker) applyAll(fn func(*Handle) error) error {
 	handles := make([]*Handle, 0, 1+len(c.children))
 	handles = append(handles, c.Handle)
 	childPIDs := make([]int, 0, len(c.children))
+	stray := []bool{false} // parallel to handles
 	for pid, h := range c.children {
 		handles = append(handles, h)
 		childPIDs = append(childPIDs, pid)
+		stray = append(stray, c.strays[pid])
 	}
 	c.mu.Unlock()
 
@@ -906,6 +909,16 @@ func (c *ChildTracker) applyAll(fn func(*Handle) error) error {
 		go func(i int, h *Handle) {
 			defer wg.Done()
 			errs[i] = fn(h)
+			// A process the tracker follows can be caught between its exec and
+			// the watch loop re-hooking it, which takes a few milliseconds; the
+			// hooks are verified before every write, so the write is refused
+			// rather than landing in the new program's memory. Try again once
+			// the loop has put the hooks back. A stray is not re-hooked by an
+			// event, so it is dropped below and picked up by the next sweep.
+			for try := 0; try < 10 && !stray[i] && errors.Is(errs[i], inject.ErrHooksLost); try++ {
+				time.Sleep(20 * time.Millisecond)
+				errs[i] = fn(h)
+			}
 		}(i, h)
 	}
 	wg.Wait()
@@ -916,8 +929,16 @@ func (c *ChildTracker) applyAll(fn func(*Handle) error) error {
 		errs[0] = nil
 	}
 	for i, pid := range childPIDs {
-		if errors.Is(errs[i+1], unix.ESRCH) {
+		switch {
+		case errors.Is(errs[i+1], unix.ESRCH):
 			delete(c.children, pid)
+			delete(c.strays, pid)
+			errs[i+1] = nil
+		case errors.Is(errs[i+1], inject.ErrHooksLost) && c.strays[pid]:
+			// A stray that exec'd. It was never ptrace-attached, so nothing
+			// re-hooked it; forget it and let the next sweep inject it afresh.
+			delete(c.children, pid)
+			delete(c.strays, pid)
 			errs[i+1] = nil
 		}
 	}
@@ -1053,6 +1074,7 @@ func newChildTracker(h *Handle, tr *procmem.Tracer, parentPID int) *ChildTracker
 		parentExitCh: make(chan struct{}),
 		children:     make(map[int]*Handle),
 		pendingStop:  make(map[int]bool),
+		strays:       make(map[int]bool),
 		done:         make(chan struct{}),
 	}
 	ct.wg.Add(1)
@@ -1080,11 +1102,24 @@ func (c *ChildTracker) watchLoop() {
 	defer c.wg.Done()
 	defer c.cleanup()
 
+	var nextSweep time.Time
 	for {
 		select {
 		case <-c.done:
 			return
 		default:
+		}
+
+		// Children that forked from a thread the tracer is not attached to
+		// produce no event; find them here (see sweepStrays).
+		if !time.Now().Before(nextSweep) {
+			began := time.Now()
+			c.sweepStrays()
+			wait := 10 * time.Since(began)
+			if wait < strayScanInterval {
+				wait = strayScanInterval
+			}
+			nextSweep = time.Now().Add(wait)
 		}
 
 		pids := c.trackedPIDs()
@@ -1208,6 +1243,7 @@ func (c *ChildTracker) handleEvent(pid int, ws unix.WaitStatus) {
 		c.mu.Lock()
 		c.children[childPID] = childH
 		c.pendingStop[childPID] = true
+		delete(c.strays, childPID) // attached from birth after all
 		c.mu.Unlock()
 
 		c.tracer.ContPID(pid, 0) //nolint:errcheck
@@ -1318,7 +1354,9 @@ func (c *ChildTracker) cleanup() {
 	c.mu.Lock()
 	childPIDs := make([]int, 0, len(c.children))
 	for pid := range c.children {
-		childPIDs = append(childPIDs, pid)
+		if !c.strays[pid] { // strays were never attached
+			childPIDs = append(childPIDs, pid)
+		}
 	}
 	c.mu.Unlock()
 
@@ -1344,6 +1382,7 @@ func (s *Session) applyAll(fn func(*Handle) error, updateState func()) error {
 	s.mu.Unlock()
 
 	all := append(primary, extra...)
+	nPrimary := len(primary)
 	errs := make([]error, len(all))
 	var wg sync.WaitGroup
 	for i, h := range all {
@@ -1351,6 +1390,14 @@ func (s *Session) applyAll(fn func(*Handle) error, updateState func()) error {
 		go func(i int, h *Handle) {
 			defer wg.Done()
 			errs[i] = fn(h)
+			// A tracker child caught between its exec and being re-hooked: give
+			// the tracker's watch loop the few milliseconds it needs (see
+			// ChildTracker.applyAll). For a handle nobody tracks, hooks lost to
+			// an exec are a real error and are reported.
+			for try := 0; try < 10 && i >= nPrimary && errors.Is(errs[i], inject.ErrHooksLost); try++ {
+				time.Sleep(20 * time.Millisecond)
+				errs[i] = fn(h)
+			}
 		}(i, h)
 	}
 	wg.Wait()
@@ -1365,7 +1412,9 @@ func (s *Session) applyAll(fn func(*Handle) error, updateState func()) error {
 		}
 	}
 	for i := range extra {
-		if errors.Is(errs[len(primary)+i], unix.ESRCH) {
+		// A tracker child that has gone, or a stray that exec'd and lost its
+		// hooks, is for the tracker to deal with (see sweepStrays), not an error.
+		if e := errs[len(primary)+i]; errors.Is(e, unix.ESRCH) || errors.Is(e, inject.ErrHooksLost) {
 			errs[len(primary)+i] = nil
 		}
 	}
