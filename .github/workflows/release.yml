@@ -17,6 +17,10 @@ on:
       version:
         description: "Version to release (e.g. v0.8.0)"
         required: true
+      dry_run:
+        description: "Do everything except publish: run every check, build the pkg/faketime bump and both tags locally, ask the remote whether the push would be accepted, and stop"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -121,8 +125,27 @@ jobs:
           git commit -m "chore: bump pkg/faketime dependency to $VERSION"
           git tag -a "pkg/faketime/$VERSION" -m "pkg/faketime $VERSION"
 
+      # `git push --dry-run` talks to the remote and reports what it would accept
+      # (credentials, branch rules, a main that moved) without changing anything.
+      - name: Dry run - what would be published
+        if: steps.state.outputs.resume != 'true' && inputs.dry_run
+        run: |
+          echo "## Dry run for $VERSION" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```'
+            git log --oneline -3
+            git tag -n1 --list "$VERSION" "pkg/faketime/$VERSION"
+            git diff --stat HEAD~1 HEAD
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          git push --dry-run --atomic origin \
+            "HEAD:refs/heads/main" \
+            "refs/tags/$VERSION" \
+            "refs/tags/pkg/faketime/$VERSION"
+          echo "Nothing was pushed (dry run)." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish tags and commit
-        if: steps.state.outputs.resume != 'true'
+        if: steps.state.outputs.resume != 'true' && !inputs.dry_run
         run: |
           git push --atomic origin \
             "HEAD:refs/heads/main" \
@@ -131,6 +154,7 @@ jobs:
 
       # Safe to repeat: a page that exists is left alone.
       - name: Create GitHub releases
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
