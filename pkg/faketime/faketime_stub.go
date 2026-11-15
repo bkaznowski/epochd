@@ -22,6 +22,21 @@ type Session struct{}
 // SessionOption configures a Session.
 type SessionOption func(*Session)
 
+// Mode selects how a Session fakes the clock. On non-Linux platforms it is
+// accepted but has no effect.
+type Mode int
+
+const (
+	// ModeVDSO fakes the clock with ptrace and a patched vDSO (the default).
+	ModeVDSO Mode = iota
+	// ModePreload fakes the clock with an LD_PRELOAD library.
+	ModePreload
+)
+
+// WithMode returns a SessionOption that selects the mode. On non-Linux
+// platforms it is accepted but has no effect.
+func WithMode(_ Mode) SessionOption { return func(*Session) {} }
+
 // TrackingFilter decides whether a process being added to a Session should be
 // started/attached with tracking. On non-Linux platforms it is accepted but
 // never called.
@@ -52,6 +67,13 @@ func (h *Handle) EffectiveTime() time.Time { return time.Time{} }
 
 func Start(_ *exec.Cmd, _ time.Time) (*Handle, error)       { return nil, errNotSupported }
 func StartFrozen(_ *exec.Cmd, _ time.Time) (*Handle, error) { return nil, errNotSupported }
+func StartPreload(_ *exec.Cmd, _ time.Time) (*Handle, error) {
+	return nil, errNotSupported
+}
+func StartFrozenPreload(_ *exec.Cmd, _ time.Time) (*Handle, error) {
+	return nil, errNotSupported
+}
+func (h *Handle) Close() error { return nil }
 func Attach(_ int, _ time.Time) (*Handle, error)            { return nil, errNotSupported }
 func AttachFrozen(_ int, _ time.Time) (*Handle, error)      { return nil, errNotSupported }
 func (h *Handle) SetTime(_ time.Time) error                 { return errNotSupported }

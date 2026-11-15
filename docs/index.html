@@ -1118,6 +1118,14 @@ s.Advance(24 * time.Hour)</code></pre>
       <td>Starts <code>cmd</code> with its clock frozen at <code>target</code>. Every <code>clock_gettime</code>, <code>gettimeofday</code>, or <code>time</code> call in the child returns exactly <code>target</code> until <code>SetTime</code> or <code>Freeze</code> is called.</td>
     </tr>
     <tr>
+      <td><code>StartPreload(cmd *exec.Cmd, target time.Time) (*Handle, error)</code></td>
+      <td>Like <code>Start</code> but fakes the clock with <code>LD_PRELOAD</code> instead of ptrace and a vDSO patch. No ptrace and no elevated permissions, and every descendant that keeps its environment inherits the clock across <code>fork</code> and <code>exec</code>, so no <code>ChildTracker</code> is needed. Works for dynamically linked non-Go binaries only: Go and static binaries are refused with an error wrapping <code>preload.ErrNotInterposable</code>. Call <code>h.Close()</code> after the process tree has exited.</td>
+    </tr>
+    <tr>
+      <td><code>StartFrozenPreload(cmd *exec.Cmd, target time.Time) (*Handle, error)</code></td>
+      <td>Same as <code>StartPreload</code> with the clock frozen at <code>target</code>.</td>
+    </tr>
+    <tr>
       <td><code>Attach(pid int, target time.Time) (*Handle, error)</code></td>
       <td>Injects into an already-running process in advancing mode using <code>PTRACE_ATTACH</code>. Requires <code>CAP_SYS_PTRACE</code> and <code>ptrace_scope ≤ 1</code>.</td>
     </tr>
@@ -1140,6 +1148,10 @@ s.Advance(24 * time.Hour)</code></pre>
     <tr>
       <td><code>h.Reset() error</code></td>
       <td>Snaps the process back to the real clock. Equivalent to <code>h.SetTime(time.Now())</code>. Switches to advancing mode.</td>
+    </tr>
+    <tr>
+      <td><code>h.Close() error</code></td>
+      <td>Releases the shared clock state and temporary library copy behind a preload handle (<code>StartPreload</code>, <code>StartFrozenPreload</code>). Call it after the process and its descendants have exited. No-op for vDSO handles.</td>
     </tr>
     <tr>
       <td><code>h.PID() int</code></td>
@@ -1184,7 +1196,8 @@ if err := s.Reset(); err != nil { ... }</code></pre>
 <table>
   <thead><tr><th>Method</th><th>Description</th></tr></thead>
   <tbody>
-    <tr><td><code>NewSession(target time.Time, opts ...SessionOption) *Session</code></td><td>Creates an empty session in advancing mode with the given initial target. Pass <code>WithTracking()</code> to enable automatic child-process injection.</td></tr>
+    <tr><td><code>NewSession(target time.Time, opts ...SessionOption) *Session</code></td><td>Creates an empty session in advancing mode with the given initial target. Pass <code>WithTracking()</code> to enable automatic child-process injection, or <code>WithMode(ModePreload)</code> to use <code>LD_PRELOAD</code> instead of ptrace.</td></tr>
+    <tr><td><code>WithMode(m Mode) SessionOption</code></td><td>Selects how the session fakes the clock. <code>ModeVDSO</code> (default) uses ptrace and a patched vDSO: works on any binary and on running processes, but needs ptrace. <code>ModePreload</code> uses <code>LD_PRELOAD</code>: no ptrace, descendants inherit the clock so <code>WithTracking</code> is ignored, but only for dynamically linked non-Go binaries that <code>s.Start</code> launches; <code>s.Attach</code> returns an error and Go or static binaries are refused. Each process gets its own clock, so <code>SetTime</code>/<code>Freeze</code>/<code>Advance</code> still apply to all of them.</td></tr>
     <tr><td><code>WithTracking() SessionOption</code></td><td>Session option that enables fork/exec tracking. Each process added via <code>s.Start</code> gets a <code>ChildTracker</code>; <code>SetTime</code>/<code>Freeze</code>/<code>Advance</code> also update all tracked descendants. Call <code>s.Close()</code> to stop the watcher goroutines.</td></tr>
     <tr><td><code>s.Start(cmd *exec.Cmd) error</code></td><td>Starts the command and adds its handle to the session. Respects the session's current mode (advancing or frozen).</td></tr>
     <tr><td><code>s.Attach(pid int) error</code></td><td>Attaches to a running process and adds it to the session. Respects the session's current mode.</td></tr>
@@ -1192,7 +1205,7 @@ if err := s.Reset(); err != nil { ... }</code></pre>
     <tr><td><code>s.Freeze(target time.Time) error</code></td><td>Switches all handles to frozen mode at <code>target</code> concurrently.</td></tr>
     <tr><td><code>s.Advance(d time.Duration) error</code></td><td>Shifts all handles by <code>d</code> concurrently, preserving the current mode.</td></tr>
     <tr><td><code>s.Reset() error</code></td><td>Resets all processes to real time.</td></tr>
-    <tr><td><code>s.Close() error</code></td><td>Stops all <code>ChildTracker</code> watch goroutines started by <code>WithTracking()</code>. No-op if tracking was not enabled. Always call this (or rely on <code>WithSession</code> cleanup) when using <code>WithTracking()</code>.</td></tr>
+    <tr><td><code>s.Close() error</code></td><td>Stops all <code>ChildTracker</code> watch goroutines started by <code>WithTracking()</code>. No-op if tracking was not enabled. Always call this (or rely on <code>WithSession</code> cleanup) when using <code>WithTracking()</code>. For <code>WithMode(ModePreload)</code> sessions it also releases each process's clock state and temporary files, so call it after the processes have exited.</td></tr>
     <tr><td><code>s.IsFrozen() bool</code></td><td>Reports whether the session is currently in frozen mode. Thread-safe.</td></tr>
     <tr><td><code>s.Prune() int</code></td><td>Removes handles for processes that are no longer alive and returns the count removed. For sessions with <code>WithTracking()</code>, trackers whose parent has exited are also closed and removed.</td></tr>
     <tr><td><code>s.PIDs() []int</code></td><td>Returns the process IDs of all handles currently in the session. Useful for debugging and assertions.</td></tr>

@@ -15,14 +15,23 @@ import (
 	"time"
 
 	"github.com/bkaznowski/epochd/pkg/inject"
+	"github.com/bkaznowski/epochd/pkg/preload"
 	"github.com/bkaznowski/epochd/pkg/procmem"
 	"golang.org/x/sys/unix"
 )
 
 // Handle holds an active time injection for a single process.
+//
+// A Handle is backed by one of two mechanisms. The default is a ptrace-injected
+// vDSO trampoline (h is set). Handles from StartPreload, StartFrozenPreload and
+// Sessions created with WithMode(ModePreload) use an LD_PRELOAD library instead
+// (pre is set); the process and every descendant that keeps its environment
+// share that one clock. All the methods below behave the same either way.
 type Handle struct {
-	h  *inject.Handle
-	mu sync.Mutex
+	h   *inject.Handle  // vDSO backend; nil for preload handles
+	pre *preload.Handle // preload backend; nil for vDSO handles
+	pid int             // preload handles only: inject.Handle carries its own PID
+	mu  sync.Mutex
 	// For advancing mode: fake_time = time.Now() + offset.
 	// For frozen mode: fake_time = frozenAt (constant).
 	offset   time.Duration
@@ -38,6 +47,13 @@ func newFrozenHandle(h *inject.Handle, target time.Time) *Handle {
 	return &Handle{h: h, frozenAt: target, frozen: true}
 }
 
+func newPreloadHandle(pre *preload.Handle, pid int, target time.Time, frozen bool) *Handle {
+	if frozen {
+		return &Handle{pre: pre, pid: pid, frozenAt: target, frozen: true}
+	}
+	return &Handle{pre: pre, pid: pid, offset: time.Until(target)}
+}
+
 // effectiveTime returns the fake time the process currently sees.
 // Caller must hold h.mu.
 func (h *Handle) effectiveTime() time.Time {
@@ -48,7 +64,12 @@ func (h *Handle) effectiveTime() time.Time {
 }
 
 // PID returns the OS process ID of the process this Handle controls.
-func (h *Handle) PID() int { return h.h.PID }
+func (h *Handle) PID() int {
+	if h.pre != nil {
+		return h.pid
+	}
+	return h.h.PID
+}
 
 // IsFrozen reports whether the handle is currently in frozen mode.
 func (h *Handle) IsFrozen() bool {
@@ -59,7 +80,7 @@ func (h *Handle) IsFrozen() bool {
 
 // IsAlive reports whether the process is still running. It sends signal 0,
 // which checks for the process's existence without delivering a signal.
-func (h *Handle) IsAlive() bool { return syscall.Kill(h.h.PID, 0) == nil }
+func (h *Handle) IsAlive() bool { return syscall.Kill(h.PID(), 0) == nil }
 
 // EffectiveTime returns the fake time the process currently sees. For advancing
 // mode this is time.Now() plus the stored offset; for frozen mode it is the
@@ -113,6 +134,41 @@ func StartFrozen(cmd *exec.Cmd, target time.Time) (*Handle, error) {
 	return newFrozenHandle(h, target), nil
 }
 
+// StartPreload is like Start but fakes the clock with LD_PRELOAD instead of
+// ptrace and a vDSO patch. No ptrace, no elevated permissions, and every
+// descendant of cmd that keeps its environment inherits the clock across fork
+// and exec, so no ChildTracker is needed.
+//
+// The trade-off is coverage: it only works for dynamically linked non-Go
+// binaries, because the Go runtime reads the vDSO directly and static binaries
+// load no dynamic loader. Such binaries are refused with an error wrapping
+// preload.ErrNotInterposable rather than silently left on real time. A child
+// started with a scrubbed environment also keeps real time.
+//
+// Call Close on the returned Handle after cmd and its descendants have exited.
+func StartPreload(cmd *exec.Cmd, target time.Time) (*Handle, error) {
+	return startPreload(cmd, target, false)
+}
+
+// StartFrozenPreload is like StartPreload with the clock stopped at target.
+func StartFrozenPreload(cmd *exec.Cmd, target time.Time) (*Handle, error) {
+	return startPreload(cmd, target, true)
+}
+
+func startPreload(cmd *exec.Cmd, target time.Time, frozen bool) (*Handle, error) {
+	var pre *preload.Handle
+	var err error
+	if frozen {
+		pre, err = preload.StartFrozen(cmd, target)
+	} else {
+		pre, err = preload.Start(cmd, target)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("faketime: preload: %w", err)
+	}
+	return newPreloadHandle(pre, cmd.Process.Pid, target, frozen), nil
+}
+
 // Attach injects fake time into an already-running process.
 // Requires CAP_SYS_PTRACE and /proc/sys/kernel/yama/ptrace_scope ≤ 1.
 func Attach(pid int, target time.Time) (*Handle, error) {
@@ -133,9 +189,27 @@ func AttachFrozen(pid int, target time.Time) (*Handle, error) {
 	return newFrozenHandle(h, target), nil
 }
 
-// SetTime updates the fake time without stopping the process (process_vm_writev only).
+// Close releases the resources behind a preload Handle (its shared state and
+// the temporary copy of the library). Call it only after the process and all
+// its descendants have exited: children that exec later load the library by
+// path. It is a no-op for vDSO handles, which hold nothing to release.
+func (h *Handle) Close() error {
+	if h.pre == nil {
+		return nil
+	}
+	return h.pre.Close()
+}
+
+// SetTime updates the fake time without stopping the process (process_vm_writev
+// for the vDSO backend, a shared-memory write for the preload backend).
 func (h *Handle) SetTime(target time.Time) error {
-	if err := h.h.SetTime(target); err != nil {
+	var err error
+	if h.pre != nil {
+		err = h.pre.SetTime(target)
+	} else {
+		err = h.h.SetTime(target)
+	}
+	if err != nil {
 		return err
 	}
 	h.mu.Lock()
@@ -149,7 +223,13 @@ func (h *Handle) SetTime(target time.Time) error {
 // Freeze freezes the process's clock at target. Every subsequent call to
 // clock_gettime in the target process returns exactly target.
 func (h *Handle) Freeze(target time.Time) error {
-	if err := h.h.Freeze(target); err != nil {
+	var err error
+	if h.pre != nil {
+		err = h.pre.Freeze(target)
+	} else {
+		err = h.h.Freeze(target)
+	}
+	if err != nil {
 		return err
 	}
 	h.mu.Lock()
@@ -185,6 +265,34 @@ func (h *Handle) Reset() error {
 
 // SessionOption configures a Session.
 type SessionOption func(*Session)
+
+// Mode selects how a Session fakes the clock for the processes it starts.
+type Mode int
+
+const (
+	// ModeVDSO fakes the clock with ptrace and a patched vDSO. It works on any
+	// binary, including Go and statically linked ones, and on processes that are
+	// already running (Session.Attach), but needs ptrace and, to follow
+	// descendants, a tracer kept attached (see WithTracking). This is the
+	// default.
+	ModeVDSO Mode = iota
+
+	// ModePreload fakes the clock with an LD_PRELOAD library. No ptrace and no
+	// elevated permissions; every descendant that keeps its environment inherits
+	// the clock across fork and exec, so WithTracking and WithTrackingFilter have
+	// nothing to do and are ignored. It only works for dynamically linked non-Go
+	// binaries (Session.Start returns an error wrapping preload.ErrNotInterposable
+	// for anything else) and only for processes the session starts, so
+	// Session.Attach returns an error. Call Session.Close after the processes
+	// have exited to release the shared state and temporary files.
+	ModePreload
+)
+
+// WithMode selects how the session fakes the clock; see Mode. Without this
+// option the session uses ModeVDSO, matching prior behaviour.
+func WithMode(m Mode) SessionOption {
+	return func(s *Session) { s.mode = m }
+}
 
 // WithTracking enables automatic fake-time injection into any processes spawned
 // via fork, vfork, or exec while the session is active. When this option is
@@ -272,6 +380,7 @@ type Session struct {
 	tracking       bool
 	trackingFilter TrackingFilter
 	fakeTimeFilter FakeTimeFilter
+	mode           Mode
 	trackers       []*ChildTracker
 	cmdWaiters     map[int]*cmdWaiter // lazily populated by WaitPID, keyed by pid
 }
@@ -290,6 +399,8 @@ type cmdWaiter struct {
 // Pass WithTracking() to enable automatic injection into forked/exec'd
 // children for every process, WithTrackingFilter to decide per process, or
 // WithFakeTimeFilter to decide per process whether it gets fake time at all.
+// Pass WithMode(ModePreload) to fake the clock with LD_PRELOAD instead of
+// ptrace; see Mode for what that changes.
 func NewSession(target time.Time, opts ...SessionOption) *Session {
 	s := &Session{offset: time.Until(target)}
 	for _, o := range opts {
@@ -322,6 +433,7 @@ func (s *Session) Start(cmd *exec.Cmd) error {
 	tracking := s.tracking
 	trackingFilter := s.trackingFilter
 	fakeTimeFilter := s.fakeTimeFilter
+	mode := s.mode
 	s.mu.Unlock()
 
 	if fakeTimeFilter != nil && !fakeTimeFilter(cmd.Path) {
@@ -329,6 +441,20 @@ func (s *Session) Start(cmd *exec.Cmd) error {
 			return fmt.Errorf("faketime: Session.Start: %w", err)
 		}
 		s.mu.Lock()
+		s.cmds = append(s.cmds, cmd)
+		s.mu.Unlock()
+		return nil
+	}
+
+	// Preload mode needs no tracer: descendants inherit the clock through the
+	// environment, so the tracking switch and filter are irrelevant here.
+	if mode == ModePreload {
+		h, err := startPreload(cmd, target, frozen)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.handles = append(s.handles, h)
 		s.cmds = append(s.cmds, cmd)
 		s.mu.Unlock()
 		return nil
@@ -389,6 +515,7 @@ func (s *Session) Attach(pid int) error {
 	tracking := s.tracking
 	trackingFilter := s.trackingFilter
 	fakeTimeFilter := s.fakeTimeFilter
+	mode := s.mode
 	s.mu.Unlock()
 
 	var path string
@@ -398,6 +525,12 @@ func (s *Session) Attach(pid int) error {
 
 	if fakeTimeFilter != nil && !fakeTimeFilter(path) {
 		return nil
+	}
+
+	// LD_PRELOAD is read by the dynamic loader at exec, so a process that is
+	// already running cannot be given the library.
+	if mode == ModePreload {
+		return fmt.Errorf("faketime: Session.Attach pid %d: ModePreload cannot attach to a running process; use the default ModeVDSO", pid)
 	}
 
 	if trackingFilter != nil {
@@ -507,14 +640,30 @@ func (s *Session) Len() int {
 // required when the session was created with WithTracking; for non-tracking
 // sessions it is a no-op. The parent processes continue running after Close —
 // call Reset before Close if you want to snap them back to the real clock.
+//
+// For a session created with WithMode(ModePreload) it also releases each
+// process's shared clock state and temporary library copy, and is required for
+// that reason. Call it after the processes (and their descendants) have exited;
+// the fake clock is gone once it returns, so call Reset first if you still want
+// the processes on real time.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	trackers := make([]*ChildTracker, len(s.trackers))
 	copy(trackers, s.trackers)
+	var preloaded []*Handle
+	for _, h := range s.handles {
+		if h.pre != nil {
+			preloaded = append(preloaded, h)
+		}
+	}
 	s.mu.Unlock()
 
+	var preErrs []error
+	for _, h := range preloaded {
+		preErrs = append(preErrs, h.Close())
+	}
 	if len(trackers) == 0 {
-		return nil
+		return errors.Join(preErrs...)
 	}
 	errs := make([]error, len(trackers))
 	var wg sync.WaitGroup
@@ -526,7 +675,7 @@ func (s *Session) Close() error {
 		}(i, ct)
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	return errors.Join(append(errs, preErrs...)...)
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,6 +1302,7 @@ func (s *Session) Prune() int {
 	}
 
 	n := len(deadTrackers)
+	var deadPreload []*Handle
 	live := make([]*Handle, 0, len(s.handles))
 	for _, h := range s.handles {
 		switch {
@@ -1164,10 +1314,19 @@ func (s *Session) Prune() int {
 			live = append(live, h)
 		default:
 			n++ // dead standalone handle
+			if h.pre != nil {
+				deadPreload = append(deadPreload, h)
+			}
 		}
 	}
 	s.handles = live
 	s.mu.Unlock()
+
+	// A pruned preload handle would otherwise leak its temp dir until process
+	// exit, since Session.Close only sees handles still in the session.
+	for _, h := range deadPreload {
+		h.Close() //nolint:errcheck
+	}
 
 	// Close dead trackers outside the lock — Close waits for the watchLoop goroutine.
 	for _, ct := range deadTrackers {
