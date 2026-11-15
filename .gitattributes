@@ -1,16 +1,13 @@
-# Files that run on Linux (shell, Docker, make) or get built there must keep LF
-# endings even in a Windows checkout with core.autocrlf=true: a CRLF build.sh
-# fails with "\r: command not found" and a CRLF Dockerfile bakes the \r into
-# RUN lines.
-*.sh        text eol=lf
-Dockerfile* text eol=lf
-Makefile    text eol=lf
-*.c         text eol=lf
-*.ld        text eol=lf
-*.asm       text eol=lf
+# Every text file is checked out with LF, whatever the platform or the user's
+# core.autocrlf. With autocrlf=true on Windows, git otherwise rewrites the
+# working tree to CRLF, which breaks shell scripts ("\r: command not found"),
+# bakes \r into Dockerfile RUN lines, and makes gofmt flag every Go file. The
+# stored blobs are already LF, so this changes checkouts only.
+* text=auto eol=lf
 
 # Committed build artifacts embedded with go:embed (pkg/trampoline/trampoline.bin,
-# pkg/preload/libepochd_preload.so); never touch their bytes.
-*.so        binary
-*.bin       binary
-*.elf       binary
+# pkg/preload/libepochd_preload.so). Never touch their bytes; do not rely on
+# git's content sniffing to leave them alone.
+*.so  binary
+*.bin binary
+*.elf binary
